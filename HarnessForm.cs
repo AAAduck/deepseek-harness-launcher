@@ -26,7 +26,6 @@ internal sealed class HarnessForm : Form
     private readonly Label status = new();
     private readonly Label info = new();
     private readonly LinkLabel link = new();
-    private readonly Label tip = new();
     private readonly Button startButton;
     private readonly Button restartButton;
     private readonly Button stopButton;
@@ -46,9 +45,9 @@ internal sealed class HarnessForm : Form
     internal HarnessForm()
     {
         Text = "DeepSeek Harness 控制台";
-        ClientSize = new Size(520, 290);
-        MinimumSize = new Size(520, 290);
-        MaximumSize = new Size(520, 290);
+        ClientSize = new Size(520, 220);
+        MinimumSize = new Size(520, 220);
+        MaximumSize = new Size(520, 220);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -89,12 +88,6 @@ internal sealed class HarnessForm : Form
         stopButton = NewButton("停止", 264, Color.FromArgb(224, 69, 62));
         var refreshButton = NewButton("刷新", 385, Color.FromArgb(58, 124, 240));
         Controls.AddRange(new Control[] { startButton, restartButton, stopButton, refreshButton });
-
-        tip.Text = "来源: DSH web profile  ·  自动定位 Node / npx  ·  认证链接自动保存";
-        tip.Location = new Point(24, 196);
-        tip.Size = new Size(470, 22);
-        tip.ForeColor = Color.FromArgb(140, 146, 158);
-        Controls.Add(tip);
 
         startButton.Click += async (_, _) => await StartClickedAsync();
         restartButton.Click += async (_, _) => await RestartClickedAsync();
