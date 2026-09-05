@@ -45,9 +45,9 @@ internal sealed class HarnessForm : Form
     internal HarnessForm()
     {
         Text = "DeepSeek Harness 控制台";
-        ClientSize = new Size(520, 220);
-        MinimumSize = new Size(520, 220);
-        MaximumSize = new Size(520, 220);
+        ClientSize = new Size(468, 245);
+        MinimumSize = new Size(468, 245);
+        MaximumSize = new Size(468, 245);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -57,7 +57,7 @@ internal sealed class HarnessForm : Form
         var panel = new Panel
         {
             Location = new Point(22, 20),
-            Size = new Size(476, 118),
+            Size = new Size(424, 118),
             BackColor = Color.FromArgb(246, 248, 252)
         };
         Controls.Add(panel);
@@ -68,25 +68,26 @@ internal sealed class HarnessForm : Form
         panel.Controls.Add(lamp);
 
         status.Location = new Point(82, 21);
-        status.Size = new Size(370, 30);
+        status.Size = new Size(320, 30);
         status.Font = new Font("Microsoft YaHei UI", 14f, FontStyle.Bold);
         status.Text = "检测中";
         panel.Controls.Add(status);
 
         info.Location = new Point(84, 55);
-        info.Size = new Size(370, 22);
+        info.Size = new Size(320, 22);
         info.ForeColor = Color.FromArgb(108, 114, 126);
         panel.Controls.Add(info);
 
         link.Location = new Point(83, 80);
-        link.Size = new Size(370, 25);
+        link.Size = new Size(320, 25);
+        link.AutoEllipsis = true;
         link.LinkClicked += (_, _) => OpenKnownUrl();
         panel.Controls.Add(link);
 
         startButton = NewButton("开始", 22, Color.FromArgb(34, 170, 85));
-        restartButton = NewButton("重启", 143, Color.FromArgb(238, 148, 32));
-        stopButton = NewButton("停止", 264, Color.FromArgb(224, 69, 62));
-        var refreshButton = NewButton("刷新", 385, Color.FromArgb(58, 124, 240));
+        restartButton = NewButton("重启", 124, Color.FromArgb(238, 148, 32));
+        stopButton = NewButton("停止", 226, Color.FromArgb(224, 69, 62));
+        var refreshButton = NewButton("刷新", 328, Color.FromArgb(58, 124, 240));
         Controls.AddRange(new Control[] { startButton, restartButton, stopButton, refreshButton });
 
         startButton.Click += async (_, _) => await StartClickedAsync();
@@ -145,7 +146,7 @@ internal sealed class HarnessForm : Form
         {
             Text = text,
             Location = new Point(x, 148),
-            Size = new Size(113, 46),
+            Size = new Size(94, 46),
             FlatStyle = FlatStyle.Flat,
             BackColor = backColor,
             ForeColor = Color.White,
@@ -294,7 +295,7 @@ internal sealed class HarnessForm : Form
             File.WriteAllText(urlFile, authenticatedUrl, new UTF8Encoding(false));
             BeginInvoke(() =>
             {
-                link.Text = $"{authenticatedUrl}   (点击打开控制台)";
+                link.Text = "打开 DeepSeek Harness 控制台";
                 UpdateButtons();
                 OpenBrowser(authenticatedUrl);
             });
@@ -356,7 +357,7 @@ internal sealed class HarnessForm : Form
                 status.Text = "运行中";
                 status.ForeColor = Color.FromArgb(34, 170, 85);
                 info.Text = $"端口: {lastPort}    已获取认证链接";
-                link.Text = $"{authenticatedUrl}   (点击打开控制台)";
+                link.Text = "打开 DeepSeek Harness 控制台";
             }
             else if (serverOn)
             {
@@ -377,7 +378,7 @@ internal sealed class HarnessForm : Form
                 status.Text = "未运行";
                 status.ForeColor = Color.FromArgb(88, 94, 104);
                 info.Text = "web profile 已就绪，点击“开始”启动";
-                link.Text = "http://127.0.0.1:3080 (启动后需使用认证链接)";
+                link.Text = "启动后自动打开认证链接";
             }
             lamp.Invalidate();
             UpdateButtons();
