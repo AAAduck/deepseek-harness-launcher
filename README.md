@@ -1,5 +1,8 @@
 # DeepSeek Harness 启动器
 
+> **非官方项目**：本项目为第三方个人作品，与 DeepSeek 官方无隶属、赞助或背书关系。
+> 启动器仅在你本机调用官方发布的 npm 包 `@deepseek-ai/dsh`，不捆绑、不修改其代码。
+
 这是一个 Windows 启动器项目，用于启动本机 DeepSeek Harness 的 `web` profile。
 
 ## 文件说明
