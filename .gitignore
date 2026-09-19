@@ -3,3 +3,5 @@ obj/
 .vs/
 *.user
 *.suo
+# 构建产物：README 中 dotnet publish 可重建，不入库
+DeepSeekHarness.exe
