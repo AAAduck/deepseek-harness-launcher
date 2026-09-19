@@ -16,14 +16,13 @@
 
 1. **Windows 10/11 x64**
 2. **Node.js ≥ 18**（含 npx）—— 安装后 npx 会自动出现在 `%APPDATA%\npm`，启动器优先找 `D:\yule\node\npx.cmd`（本机路径），找不到会自动回退 `%APPDATA%\npm` 与 PATH
-3. **pnpm**（可选，推荐）：`npm install -g pnpm`。不装也能运行，只是跳过插件更新
+3. **pnpm**（可选，推荐）。两种装法：
+   - `npm install -g pnpm`（推荐）
+   - `corepack enable pnpm`（Node ≥ 16.9 自带 corepack，无需额外安装）
+   不装也能运行，只是跳过插件更新
 4. 首次运行在打开的 Web 界面「设置 → 模型」中配置自己的 **DeepSeek API Key**
 
-> ⚠️ 首次运行前需要先初始化 profile（只做一次）：
-> ```powershell
-> npx --yes @deepseek-ai/dsh web
-> ```
-> 看到端口监听后 Ctrl+C 关闭，再打开启动器。这是当前版本的已知限制，后续版本会改为自动初始化。
+> 启动器窗口右下角有「环境」按钮，点开即可一键检测本机 Node / npx / pnpm / profile 是否就绪，并给出缺失项的修复命令。
 
 ## 默认环境
 

@@ -57,9 +57,9 @@ internal sealed class HarnessForm : Form
     internal HarnessForm()
     {
         Text = "DeepSeek Harness 控制台";
-        ClientSize = new Size(468, 265);
-        MinimumSize = new Size(468, 265);
-        MaximumSize = new Size(468, 265);
+        ClientSize = new Size(560, 265);
+        MinimumSize = new Size(560, 265);
+        MaximumSize = new Size(560, 265);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -109,12 +109,14 @@ internal sealed class HarnessForm : Form
         restartButton = NewButton("重启", 124, Color.FromArgb(238, 148, 32));
         stopButton = NewButton("停止", 226, Color.FromArgb(224, 69, 62));
         var refreshButton = NewButton("刷新", 328, Color.FromArgb(58, 124, 240));
-        Controls.AddRange(new Control[] { startButton, restartButton, stopButton, refreshButton });
+        var envButton = NewButton("环境", 430, Color.FromArgb(114, 122, 143));
+        Controls.AddRange(new Control[] { startButton, restartButton, stopButton, refreshButton, envButton });
 
         startButton.Click += async (_, _) => await RunStartAsync(startButton, "启动中", reuseExisting: true);
         restartButton.Click += async (_, _) => await RunStartAsync(restartButton, "重启中", reuseExisting: false);
         stopButton.Click += async (_, _) => await StopClickedAsync();
         refreshButton.Click += async (_, _) => await RefreshStatusAsync();
+        envButton.Click += async (_, _) => await RunEnvCheckAsync();
         refreshTimer.Tick += async (_, _) => await RefreshStatusAsync();
         Shown += async (_, _) =>
         {
@@ -220,14 +222,20 @@ internal sealed class HarnessForm : Form
     {
         var npx = ResolveNpxPath();
         var profile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
-        if (!Directory.Exists(profile))
-            throw new InvalidOperationException($"找不到 web profile:\n{profile}");
+        // dsh 首次运行会自动初始化缺失的 profile（loadProfile 对无 package.json 的
+        // 内置 profile 执行 initProfile）；这里只保证 WorkingDirectory 存在即可。
+        var profileReady = File.Exists(Path.Combine(profile, "package.json"));
+        var workDir = profileReady
+            ? profile
+            : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!profileReady)
+            SetInfo("首次运行：正在初始化 profile（需联网），请稍候...");
 
         var psi = new ProcessStartInfo
         {
             FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
             Arguments = $"/d /s /c \"\"{npx}\" --yes @deepseek-ai/dsh@latest web --no-open --host 127.0.0.1 --port {DefaultPort}\"",
-            WorkingDirectory = profile,
+            WorkingDirectory = workDir,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -703,6 +711,133 @@ internal sealed class HarnessForm : Form
     {
         if (closing || IsDisposed) return;
         try { BeginInvoke(() => { if (!closing && !IsDisposed) info.Text = text; }); } catch { }
+    }
+
+    // ---- 环境检测 -----------------------------------------------------------
+
+    private async Task RunEnvCheckAsync()
+    {
+        if (closing || IsDisposed) return;
+        status.Text = "检测中";
+        status.ForeColor = WarnColor;
+        SetInfo("正在检测环境...");
+        lamp.Invalidate();
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("【环境检测报告】");
+            sb.AppendLine();
+
+            sb.AppendLine(Environment.Is64BitOperatingSystem
+                ? "✓ 系统：Windows 10/11 x64（符合要求）"
+                : "✗ 系统：32 位 Windows（不支持，请换 64 位系统）");
+
+            var nodeExe = TryFindNodeExe();
+            if (nodeExe is null)
+            {
+                sb.AppendLine("✗ Node.js：未找到");
+                sb.AppendLine("    解决：到 https://nodejs.org 下载安装 LTS（≥ 18）");
+            }
+            else
+            {
+                var v = await GetToolVersionAsync(nodeExe, "--version");
+                sb.AppendLine($"✓ Node.js：{v?.Trim() ?? "未知"}（{Path.GetDirectoryName(nodeExe)}）");
+            }
+
+            string? npxPath = null;
+            try { npxPath = ResolveNpxPath(); } catch { }
+            if (npxPath is null)
+            {
+                sb.AppendLine("✗ npx：未找到（随 Node.js 安装，重装 Node 即可）");
+            }
+            else
+            {
+                var v = await GetToolVersionAsync(npxPath, "--version");
+                sb.AppendLine($"✓ npx：{v?.Trim() ?? "?"}（{npxPath}）");
+            }
+
+            var pnpm = ResolvePnpmPath();
+            if (pnpm is null)
+            {
+                var corepack = ResolveCorepackPath();
+                sb.AppendLine("✗ pnpm：未找到（可选，仅影响插件更新）");
+                sb.AppendLine(corepack is null
+                    ? "    解决：npm install -g pnpm"
+                    : "    解决：corepack enable pnpm（已检测到 corepack）");
+            }
+            else
+            {
+                var v = await GetToolVersionAsync(pnpm, "--version");
+                sb.AppendLine($"✓ pnpm：{v?.Trim() ?? "?"}（{pnpm}）");
+            }
+
+            var profile = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".dsh", "profiles", "web");
+            sb.AppendLine(File.Exists(Path.Combine(profile, "package.json"))
+                ? "✓ profile：已初始化"
+                : "✗ profile：未初始化（首次点击「开始」会自动初始化）");
+
+            if (IsPortListening(DefaultPort))
+                sb.AppendLine($"⚠ 端口 {DefaultPort} 已被占用，可能已有 DSH 在运行");
+
+            MessageBox.Show(sb.ToString(), "环境检测", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            ShowError("环境检测失败", ex.Message);
+        }
+        finally
+        {
+            if (!closing && !IsDisposed) await RefreshStatusAsync();
+        }
+    }
+
+    private static string? TryFindNodeExe()
+    {
+        string? npx = null;
+        try { npx = ResolveNpxPath(); } catch { }
+        if (npx is not null)
+        {
+            var dir = Path.GetDirectoryName(npx);
+            if (dir is not null)
+            {
+                var exe = Path.Combine(dir, "node.exe");
+                if (File.Exists(exe)) return exe;
+            }
+        }
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        return path.Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(d => Path.Combine(d.Trim('"'), "node.exe"))
+            .FirstOrDefault(File.Exists);
+    }
+
+    private static async Task<string?> GetToolVersionAsync(string exe, string args)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = args,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+            using var proc = new Process { StartInfo = psi };
+            if (!proc.Start()) return null;
+            var outTask = proc.StandardOutput.ReadToEndAsync();
+            var errTask = proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync(cts.Token);
+            var text = (await outTask) + (await errTask);
+            var first = text.Split('\n').FirstOrDefault();
+            return string.IsNullOrWhiteSpace(first) ? null : first.Trim();
+        }
+        catch { return null; }
     }
 
     private static void ConfigureOptionalProxy(ProcessStartInfo psi)
