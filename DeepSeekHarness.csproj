@@ -8,8 +8,32 @@
     <AssemblyName>DeepSeekHarness</AssemblyName>
     <RootNamespace>DeepSeekHarness</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- 应用清单：asInvoker（不弹 UAC）、supportedOS 声明、DPI 模式、长路径感知。
+         缺清单时 Windows 会把程序当旧版本对待，DPI 与长路径行为都不确定。 -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <PlatformTarget>x64</PlatformTarget>
     <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- 发布设置内置：这样 `dotnet publish -c Release` 一条命令就能产出可直接分发的
+         单文件自包含 exe（同学无需安装 .NET 运行时）。不写在这里的话，
+         参数只存在于发布者的命令行里，别人 clone 下来重建会得到一个需要 .NET 的版本。 -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- 必须是 true：设成 false 后发布不再产出单个 exe，而是 exe + 6 个散落的原生库
+         （实测：D3DCompiler_47_cor3.dll / PenImc_cor3.dll / PresentationNative_cor3.dll /
+         vcruntime140_cor3.dll / wpfgfx_cor3.dll …）。那会直接推翻 README 里
+         "自包含单文件、直接分发给同学即可" 的承诺——同学只拷 exe 就会启动失败。
+         实测窗口出现时间 3.74 秒，收益也不足以抵掉这个分发风险。 -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- exe 属性（右键→属性 里能看到），分发给同学时便于确认版本 -->
+    <Version>1.1.0</Version>
+    <AssemblyTitle>DeepSeek Harness 控制台</AssemblyTitle>
+    <Product>DeepSeek Harness Launcher</Product>
+    <Company>DeepSeek Harness Launcher</Company>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
