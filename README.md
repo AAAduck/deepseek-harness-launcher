@@ -48,6 +48,18 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
 
 **引擎装在哪、会不会自动更新？** 引擎装在固定目录，启动时直接运行 `node_modules\@deepseek-ai\dsh\lib\bin.js web`，不走 npx、不查版本、不联网重装。所以它**不会**自动跟进新版，想升级就点「升级引擎」。
 
+装引擎用的是与 `npx` 内部相同的标准做法：在私有目录里跑一次 `npm install` 再直接执行 `bin.js`。
+区别在于版本是**钉死的**：安装时先查精确版本号，配合 `npm install --save-exact`，所以
+`engine/package.json` 与 `engine/package-lock.json` 记录的版本始终一致，同一份 manifest
+在任何日子重装都得到同一个版本（直接写 `"latest"` 会绕过锁文件、抓到当天最新版，无法复现）。
+
+**npm 源跟随你的配置。** 引擎的安装与「升级引擎」的版本查询都会先读
+`npm config get registry` 并显式使用它，所以 `npm config set registry https://registry.npmmirror.com`
+对启动器**同样生效**。没配过才回落到官方源 `https://registry.npmjs.org/`。
+读取到的源会做参数校验，含引号或空白的值不采用。
+
+首次安装参考耗时：实测本机 537 个包约 **67 秒**（不含版本查询），视网络而定。
+
 ## 默认环境一览
 
 | 项 | 位置 |

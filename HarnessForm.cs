@@ -26,6 +26,8 @@ internal sealed class HarnessForm : Form
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "DeepSeekHarness");
     private static readonly string EnginePackageName = "@deepseek-ai/dsh";
+    /// <summary>npm 官方源。用户改过 npm 配置时以用户配置为准（见 ResolveNpmRegistry）。</summary>
+    private const string DefaultRegistry = "https://registry.npmjs.org/";
     private static readonly Color OkColor = Color.FromArgb(34, 170, 85);
     private static readonly Color WarnColor = Color.FromArgb(238, 148, 32);
     private static readonly Color IdleColor = Color.FromArgb(88, 94, 104);
@@ -1028,7 +1030,21 @@ internal sealed class HarnessForm : Form
         if (File.Exists(EngineEntryScript) && ReadEngineVersion(engineDir) is not null) return;
 
         SetInfo("首次运行：正在把 DSH 引擎装到固定目录（只此一次，之后启动不再联网）");
-        await InstallEngineAsync(node, "latest", ct);
+        // 先查一次精确版本号再装。原因：写 "latest" 的话重装会忽略锁文件、抓当天最新版，
+        // 同一份 manifest 在不同日子装出不同版本，出了问题无法复现。
+        // 查询用独立的短超时（20 秒）——实测安装本身要 67 秒，不能在查询上再赔 60 秒；
+        // 查不到只是退回 latest，不影响安装成功。
+        string? latest = null;
+        try
+        {
+            using var queryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            queryCts.CancelAfter(TimeSpan.FromSeconds(20));
+            latest = await GetLatestEngineVersionAsync(node, queryCts.Token);
+        }
+        catch (OperationCanceledException) { }
+        if (ct.IsCancellationRequested) return;
+        if (latest is null) SetInfo("查不到版本号，按 latest 安装（网络受限时的降级路径）");
+        await InstallEngineAsync(node, latest ?? "latest", ResolveNpmRegistry(node, ct), ct);
     }
 
     /// <summary>
@@ -1051,7 +1067,7 @@ internal sealed class HarnessForm : Form
     /// （npx 那条路做不到——半成品残骸原地修不好，只能整体删掉重下）。
     /// 替换用"旧目录先改名、staging 顶上、再删旧目录"三步，任一步失败都能恢复。
     /// </summary>
-    private async Task InstallEngineAsync(string node, string versionSpec, CancellationToken ct)
+    private async Task InstallEngineAsync(string node, string versionSpec, string registry, CancellationToken ct)
     {
         var npm = ResolveNpmPath(node);
         ForceDeleteDirectory(engineStageDir);
@@ -1059,6 +1075,8 @@ internal sealed class HarnessForm : Form
 
         // 预置最小 package.json：npm 在清单齐全的目录里会写 package-lock.json，
         // 配合 --prefer-offline 命中本地 cacache，重装基本不重新下载。
+        // 这里写的 spec 就是最终 spec（调用方传精确版本号，不是 latest/caret），
+        // 再配合下面的 --save-exact，manifest 与 lock 才会真正一致 → 装出来的版本可复现。
         File.WriteAllText(
             Path.Combine(engineStageDir, "package.json"),
             "{\n  \"name\": \"dsh-engine\",\n  \"private\": true,\n  \"version\": \"0.0.0\",\n  \"dependencies\": {\n    \"" +
@@ -1068,7 +1086,7 @@ internal sealed class HarnessForm : Form
         var psi = new ProcessStartInfo
         {
             FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
-            Arguments = $"/d /s /c \"\"{npm}\" install --prefer-offline --no-audit --no-fund --loglevel=http\"",
+            Arguments = $"/d /s /c \"\"{npm}\" install --prefer-offline --no-audit --no-fund --save-exact --registry {registry} --loglevel=http\"",
             WorkingDirectory = engineStageDir,
             UseShellExecute = false,
             CreateNoWindow = true,
@@ -1144,6 +1162,59 @@ internal sealed class HarnessForm : Form
         SetInfo(text.Length > 96 ? text[..96] + "…" : text);
     }
 
+    /// <summary>
+    /// 引擎安装/查询用哪个 registry。
+    /// 之前完全依赖 npm 自己的默认值，于是国内用户即使系统里已经配了镜像
+    /// （npm config set registry https://registry.npmmirror.com），
+    /// 安装与「升级引擎」的版本查询仍可能走 registry.npmjs.org，
+    /// 实测查询会打满 EngineQueryTimeoutSeconds（60 秒）才失败。
+    /// 这里读出用户的实际配置并显式传给 npm，让"配了镜像就真的生效"。
+    /// </summary>
+    private static string? effectiveRegistry;
+
+    private static string ResolveNpmRegistry(string node, CancellationToken ct)
+    {
+        if (effectiveRegistry is not null) return effectiveRegistry;
+        try
+        {
+            var npm = ResolveNpmPath(node);
+            var psi = new ProcessStartInfo
+            {
+                FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+                Arguments = $"/d /s /c \"\"{npm}\" config get registry\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8
+            };
+            using var proc = Process.Start(psi);
+            if (proc is not null)
+            {
+                var text = proc.StandardOutput.ReadToEnd();
+                if (proc.WaitForExit(5000))
+                {
+                    var value = text.Trim().Split('\n').Last().Trim();
+                    if (IsSafeNpmValue(value)) effectiveRegistry = value;
+                }
+                else
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                }
+            }
+        }
+        catch { }
+        return effectiveRegistry ?? DefaultRegistry;
+    }
+
+    /// <summary>
+    /// 需要拼进 cmd 命令行的值必须校验：含引号/空白/换行都可能把命令行拆坏。
+    /// registry 是用户可改的 npm 配置，不能无条件信任。
+    /// </summary>
+    private static bool IsSafeNpmValue(string value) =>
+        value.Length is > 0 and < 512 &&
+        !value.Any(ch => char.IsWhiteSpace(ch) || ch is '"' or '\'' or '&' or '|' or '<' or '>' or '^' or '%');
+
     private static async Task<string?> GetLatestEngineVersionAsync(string node, CancellationToken ct)
     {
         try
@@ -1155,7 +1226,7 @@ internal sealed class HarnessForm : Form
             var psi = new ProcessStartInfo
             {
                 FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
-                Arguments = $"/d /s /c \"\"{npm}\" view {EnginePackageName} version\"",
+                Arguments = $"/d /s /c \"\"{npm}\" view {EnginePackageName} version --registry {ResolveNpmRegistry(node, ct)}\"",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
@@ -1217,7 +1288,7 @@ internal sealed class HarnessForm : Form
             if (cts.IsCancellationRequested) return;
 
             SetInfo($"正在安装引擎 {latest}（先装临时目录，成功后替换）…");
-            await InstallEngineAsync(node, latest, cts.Token);
+            await InstallEngineAsync(node, latest, ResolveNpmRegistry(node, cts.Token), cts.Token);
             if (cts.IsCancellationRequested) return;
 
             SetInfo($"引擎已升级到 {ReadEngineVersion(engineDir) ?? latest}，正在重启…");
