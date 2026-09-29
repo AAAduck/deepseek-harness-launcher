@@ -76,8 +76,11 @@ internal sealed class HarnessForm : Form
     /// 升级只在你点「升级引擎」时发生，且先装到 engine.tmp，成功才替换正式目录。
     /// </summary>
     private static readonly string engineDir = Path.Combine(LocalAppDir, "engine");
-    private readonly string engineStageDir = Path.Combine(LocalAppDir, "engine.tmp");
-    private readonly string engineOldDir = Path.Combine(LocalAppDir, "engine.old");
+    private static readonly string engineStageDir = Path.Combine(LocalAppDir, "engine.tmp");
+    private static readonly string engineOldDir = Path.Combine(LocalAppDir, "engine.old");
+    /// <summary>web profile 目录。此前这个路径在多处各写了一遍，容易写歪，统一到这里。</summary>
+    private static readonly string webProfileDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
 
     private Process? dshProcess;
     private CancellationTokenSource? startCts;
@@ -366,7 +369,7 @@ internal sealed class HarnessForm : Form
         await EnsureEngineAsync(node, ct);
         if (ct.IsCancellationRequested) return;
 
-        var profile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
+        var profile = webProfileDir;
         // dsh 首次运行会自动初始化缺失的 profile（loadProfile 对无 package.json 的
         // 内置 profile 执行 initProfile）；这里只保证 WorkingDirectory 存在即可。
         var profileReady = File.Exists(Path.Combine(profile, "package.json"));
@@ -1030,7 +1033,18 @@ internal sealed class HarnessForm : Form
         if (File.Exists(EngineEntryScript) && ReadEngineVersion(engineDir) is not null) return;
 
         SetInfo("首次运行：正在把 DSH 引擎装到固定目录（只此一次，之后启动不再联网）");
-        // 先查一次精确版本号再装。原因：写 "latest" 的话重装会忽略锁文件、抓当天最新版，
+
+        // 版本锁优先：写了 engine-version.txt 就只装那个版本，永不跟随最新版。
+        // 这是"以插件为主"的开关——插件只在某个引擎版本上验证过时，把它钉住。
+        var pinned = ReadPinnedEngineVersion();
+        if (pinned is not null)
+        {
+            SetInfo($"检测到引擎版本锁，安装指定版本 {pinned}");
+            await InstallEngineAsync(node, pinned, ResolveNpmRegistry(node, ct), ct);
+            return;
+        }
+
+        // 否则先查一次精确版本号再装。原因：写 "latest" 的话重装会忽略锁文件、抓当天最新版，
         // 同一份 manifest 在不同日子装出不同版本，出了问题无法复现。
         // 查询用独立的短超时（20 秒）——实测安装本身要 67 秒，不能在查询上再赔 60 秒；
         // 查不到只是退回 latest，不影响安装成功。
@@ -1125,12 +1139,14 @@ internal sealed class HarnessForm : Form
                 throw new InvalidOperationException(
                     "安装结束但引擎清单不可读，已放弃替换（当前引擎未受影响）。\n" + RecentOutputSummary());
 
-            // 替换三步：清掉上次的 engine.old → 现行目录改名 → staging 顶上 → 删旧目录。
+            // 替换三步：清掉上上次的 engine.old → 现行目录改名 → staging 顶上。
+            // 刻意**不删**换下来的 engine.old：升级后发现插件不兼容时，
+            // 把 engine 删掉、engine.old 改名回来即可完整回退到上一个能用的版本。
+            // 代价是引擎目录占双份（实测每份约 214 MB），换来的是可回退。
             ForceDeleteDirectory(engineOldDir);
             if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineOldDir);
             Directory.Move(engineStageDir, engineDir);
-            ForceDeleteDirectory(engineOldDir);
-            SetInfo($"引擎已就绪：{staged}");
+            SetInfo($"引擎已就绪：{staged}（上一版本保留在 engine.old，可回退）");
         }
         catch (OperationCanceledException)
         {
@@ -1215,6 +1231,212 @@ internal sealed class HarnessForm : Form
         value.Length is > 0 and < 512 &&
         !value.Any(ch => char.IsWhiteSpace(ch) || ch is '"' or '\'' or '&' or '|' or '<' or '>' or '^' or '%');
 
+    /// <summary>
+    /// 引擎版本锁。写了这个文件，启动器就只装/只用该版本，永不自动跟进新版——
+    /// 对应"以插件为主、软件迁就插件"的需求：插件只在某个引擎版本上验证过时，
+    /// 把该版本写进去即可把软件钉死。清空该文件即恢复跟随最新版。
+    /// </summary>
+    private static readonly string engineVersionPinFile = Path.Combine(LocalAppDir, "engine-version.txt");
+
+    private static string? ReadPinnedEngineVersion()
+    {
+        try
+        {
+            if (!File.Exists(engineVersionPinFile)) return null;
+            var value = File.ReadAllText(engineVersionPinFile).Trim();
+            return value.Length > 0 ? value : null;
+        }
+        catch { return null; }
+    }
+
+    // ---- 引擎升级前的插件兼容性检查 ----------------------------------------
+    //
+    // 背景（实测本机）：profile 只声明 6 个插件依赖，@deepseek-ai/* 一个都不声明，
+    // 全部由引擎提供。所以升级引擎不会动插件文件，但插件声明的 peer 要求
+    // 是针对特定引擎版本写的——例如皮肤插件要求 @deepseek-ai/dsh >=0.1.7-rc.1，
+    // 而当时引擎是 0.1.5-rc.2，属于"能跑但插件不被满足"的状态。
+    // 升级前把这类不满足列出来，用户才知道点下去会不会让插件失效。
+
+    /// <summary>某插件对某个 DSH 包的版本要求；没有声明则为 null。</summary>
+    private sealed record PluginRequirement(string Plugin, string Package, string Range);
+
+    private static List<PluginRequirement> CollectPluginRequirements(string profileDir)
+    {
+        var found = new List<PluginRequirement>();
+        var modules = Path.Combine(profileDir, "node_modules");
+        var scopes = new[] { "@deepseek-ai", "@dsh-external", "" };
+        foreach (var scope in scopes)
+        {
+            var dir = scope.Length == 0 ? modules : Path.Combine(modules, scope);
+            if (!Directory.Exists(dir)) continue;
+            IEnumerable<string> entries;
+            try
+            {
+                entries = scope.Length == 0
+                    ? Directory.GetDirectories(dir).Where(d => Path.GetFileName(d).StartsWith("dsh-", StringComparison.OrdinalIgnoreCase))
+                    : Directory.GetDirectories(dir);
+            }
+            catch { continue; }
+
+            foreach (var entry in entries)
+            {
+                var manifest = Path.Combine(entry, "package.json");
+                if (!File.Exists(manifest)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+                    if (!doc.RootElement.TryGetProperty("peerDependencies", out var peers)) continue;
+                    var fallbackName = Path.GetFileName(entry);
+                    foreach (var peer in peers.EnumerateObject())
+                    {
+                        // 只看"由引擎提供"的那批包：@deepseek-ai/* 以及 React 这类外部 peer 不算。
+                        if (!peer.Name.StartsWith("@deepseek-ai/", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (peer.Value.ValueKind != JsonValueKind.String) continue;
+                        var range = peer.Value.GetString();
+                        if (string.IsNullOrWhiteSpace(range)) continue;
+                        var pluginName = doc.RootElement.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String
+                            ? n.GetString() ?? fallbackName
+                            : fallbackName;
+                        found.Add(new PluginRequirement(pluginName, peer.Name, range));
+                    }
+                }
+                catch { }
+            }
+        }
+        return found;
+    }
+
+    /// <summary>把 "0.2.0-rc.2" 解析成可比较的四段版本；解析不了返回 null。</summary>
+    private static Version? ParseVersion(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var core = text.Trim().TrimStart('v', 'V');
+        var cut = core.IndexOfAny(new[] { '-', '+' });
+        if (cut >= 0) core = core[..cut];
+        var parts = core.Split('.');
+        if (parts.Length is < 3 or > 4) return null;
+        var nums = new int[4];
+        for (var i = 0; i < parts.Length; i++)
+            if (!int.TryParse(parts[i], out nums[i])) return null;
+        return new Version(nums[0], nums[1], nums[2], nums.Length > 3 ? nums[3] : 0);
+    }
+
+    /// <summary>S1 &gt; S2 → 1；相等 → 0；S1 &lt; S2 → -1；无法比较 → null。</summary>
+    private static int? CompareVersionStrings(string a, string b)
+    {
+        var va = ParseVersion(a);
+        var vb = ParseVersion(b);
+        if (va is null || vb is null) return null;
+
+        // 先比数字段。只有数字段完全相同、才需要看预发布标识——
+        // semver 里预发布只影响"数字段相同"时的排序（0.1.5-rc.2 < 0.1.7-rc.1 就是因为 5 < 7，
+        // 与 rc 无关）。之前把预发布比较写成了无条件分支，导致只要两边预发布标识不同
+        // 就返回"无法判定"，于是 >=0.1.7-rc.1 这类判断全部落空、兼容性检查会漏报。
+        var core = va.CompareTo(vb);
+        if (core != 0) return Math.Sign(core);
+
+        // 数字段相同：正式版 > 预发布版；两边都是预发布且标识不同时，返回 null。
+        // 预发布标识符的逐段比较（rc.1 vs rc.2 vs beta）规则繁琐且本工具用不上，
+        // 拿不准就说拿不准，返回 null 让调用方按"未知"处理，绝不猜。
+        static string? Pre(string s)
+        {
+            var i = s.IndexOf('-');
+            if (i < 0) return null;
+            var rest = s[(i + 1)..];
+            var plus = rest.IndexOf('+');
+            return plus < 0 ? rest : rest[..plus];
+        }
+
+        var pa = Pre(a.Trim());
+        var pb = Pre(b.Trim());
+        if (pa is null && pb is null) return 0;
+        if (pa is null) return 1;
+        if (pb is null) return -1;
+        return string.Equals(pa, pb, StringComparison.OrdinalIgnoreCase) ? 0 : null;
+    }
+
+    /// <summary>
+    /// 判定 candidateVersion 是否满足声明的范围。支持的形式：
+    /// ">=0.1.7-rc.1"、"&gt;=0.1.7-rc.1 &lt;0.3.0-0"、"^4.0.1"、"A || B"。
+    /// 三态返回：true 满足 / false 明确不满足 / null 无法判定。
+    ///
+    /// 这里必须把"明确不满足"和"无法判定"分开：之前只要有一个 token 判定不出来
+    /// 就整体返回 null，导致"已知不兼容"被降级成"未知"，护栏会漏报。
+    /// 规则：某个候选项的全部 token 都满足 → true；某个候选项里有 token 明确不满足
+    /// （且没有无法判定的 token 挡在前面）→ 这个候选项为 false；所有候选项都为 false → false；
+    /// 否则（存在无法判定的部分）→ null。
+    /// </summary>
+    private static bool? SatisfiesRange(string candidate, string range)
+    {
+        var anyAlternativeFailed = false;
+        foreach (var alternative in range.Split("||", StringSplitOptions.RemoveEmptyEntries))
+        {
+            var allSatisfied = true;   // 目前为止每个 token 都满足
+            var anyUnknown = false;    // 出现过无法判定的 token
+            foreach (var token in alternative.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var verdict = SatisfiesSingle(candidate, token);
+                if (verdict is null) { anyUnknown = true; break; }
+                if (verdict.Value) continue;
+                allSatisfied = false;
+                break;
+            }
+            if (allSatisfied && !anyUnknown) return true;   // 该候选项确定满足
+            if (!anyUnknown && !allSatisfied) anyAlternativeFailed = true;
+        }
+        return anyAlternativeFailed ? false : null;
+    }
+
+    private static bool? SatisfiesSingle(string candidate, string token)
+    {
+        token = token.Trim();
+        if (token.Length == 0) return null;
+
+        foreach (var (prefix, op) in new[] { (">=", 1), ("<=", 2), (">", 3), ("<", 4), ("=", 0) })
+        {
+            if (!token.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            var cmp = CompareVersionStrings(candidate, token[prefix.Length..].Trim());
+            if (cmp is null) return null;
+            return op switch { 1 => cmp >= 0, 2 => cmp <= 0, 3 => cmp > 0, 4 => cmp < 0, _ => cmp == 0 };
+        }
+
+        if (token.StartsWith('^'))
+        {
+            // caret：>= 基准，且不改变最左非零位以上的部分。预发布版一律按"无法判定"处理。
+            var basis = token[1..].Trim();
+            var cmp = CompareVersionStrings(candidate, basis);
+            if (cmp is null || cmp < 0) return cmp is null ? null : false;
+            if (basis.Contains('-')) return null;
+            var v = ParseVersion(basis);
+            var c = ParseVersion(candidate);
+            if (v is null || c is null) return null;
+            var majorMatters = v.Major > 0;
+            var minorMatters = !majorMatters && v.Minor > 0;
+            if (majorMatters) return c.Major == v.Major;
+            if (minorMatters) return c.Major == 0 && c.Minor == v.Minor;
+            return c.Major == 0 && c.Minor == 0 && c.Build == v.Build;
+        }
+
+        // 裸版本号：当作"至少这个版本"，semver 范围里的常见宽松写法
+        var bare = CompareVersionStrings(candidate, token);
+        return bare is null ? null : bare >= 0;
+    }
+
+    /// <summary>返回 (无法判定的条数, 明确不满足的明细)。</summary>
+    private static (int Unknown, List<string> Violations) CheckPluginCompatibility(string candidateVersion, string profileDir)
+    {
+        var violations = new List<string>();
+        var unknown = 0;
+        foreach (var req in CollectPluginRequirements(profileDir))
+        {
+            // 子包（dsh-llm 等）与主包同一次发布、版本号一致，所以统一用候选主版本比对。
+            var verdict = SatisfiesRange(candidateVersion, req.Range);
+            if (verdict is null) { unknown++; continue; }
+            if (!verdict.Value) violations.Add($"{req.Plugin} 要求 {req.Package} {req.Range}");
+        }
+        return (unknown, violations);
+    }
+
     private static async Task<string?> GetLatestEngineVersionAsync(string node, CancellationToken ct)
     {
         try
@@ -1266,6 +1488,22 @@ internal sealed class HarnessForm : Form
         {
             var node = await ResolveNodeAsync(cts.Token);
             var current = ReadEngineVersion(engineDir);
+
+            // 版本锁优先于「升级」：钉住的版本可能正是插件唯一验证过的那个，
+            // 按钮不该把它顶掉。想升级先清空 engine-version.txt。
+            var pinned = ReadPinnedEngineVersion();
+            if (pinned is not null)
+            {
+                SetInfo($"已锁定引擎版本 {pinned}，升级被跳过（清空 engine-version.txt 可解除）");
+                if (!closing && !IsDisposed)
+                    MessageBox.Show(
+                        $"引擎版本已锁定为 {pinned}，不会升级。\n\n" +
+                        "这是为了避免新版引擎让你的插件失效。\n" +
+                        $"要升级请先删除或清空：\n{engineVersionPinFile}",
+                        "引擎已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             SetInfo($"正在查询最新版本…（当前 {current ?? "未安装"}）");
 
             var latest = await GetLatestEngineVersionAsync(node, cts.Token);
@@ -1279,6 +1517,38 @@ internal sealed class HarnessForm : Form
             {
                 SetInfo($"引擎已是最新（{latest}），无需升级");
                 return;
+            }
+
+            // 兼容性护栏：升级前先拿新版本对一遍 profile 里插件的 peer 要求。
+            // 实测本机 profile 只声明 6 个插件依赖、@deepseek-ai/* 全部由引擎提供，
+            // 所以升级不会动插件文件，但插件声明的范围可能不覆盖新引擎——
+            // 那种情况下升级会让插件失效，必须先让用户知情再决定。
+            var (unknownCount, violations) = CheckPluginCompatibility(latest, webProfileDir);
+            if (violations.Count > 0 || unknownCount > 0)
+            {
+                var lines = new StringBuilder();
+                lines.AppendLine($"即将把引擎从 {current ?? "未安装"} 升级到 {latest}。");
+                lines.AppendLine();
+                if (violations.Count > 0)
+                {
+                    lines.AppendLine($"⚠ 有 {violations.Count} 项插件要求不满足新版本：");
+                    foreach (var v in violations.Take(8)) lines.AppendLine("  · " + v);
+                    if (violations.Count > 8) lines.AppendLine($"  …另有 {violations.Count - 8} 项");
+                    lines.AppendLine();
+                    lines.AppendLine("升级后这些插件可能无法正常工作。");
+                }
+                if (unknownCount > 0)
+                    lines.AppendLine($"（另有 {unknownCount} 项要求无法自动判定，需你自行确认。）");
+                lines.AppendLine();
+                lines.AppendLine("选择「否」保持当前引擎不变（插件的现有状态完全不受影响）。");
+
+                var go = MessageBox.Show(lines.ToString(), "升级可能影响插件",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (go != DialogResult.Yes)
+                {
+                    SetInfo($"已取消升级，保持引擎 {current ?? "未安装"}（插件优先）");
+                    return;
+                }
             }
 
             // 运行中的实例占着引擎文件，先停干净再换目录。
@@ -1420,9 +1690,7 @@ internal sealed class HarnessForm : Form
 
     private async Task UpdatePluginsAsync(CancellationToken ct)
     {
-        var profile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dsh", "profiles", "web");
+        var profile = webProfileDir;
         if (!Directory.Exists(profile))
         {
             SetInfo("web profile 不存在，跳过插件更新");
@@ -1679,6 +1947,29 @@ internal sealed class HarnessForm : Form
                 sb.AppendLine($"    位置：{engineDir}");
                 sb.AppendLine("    升级：面板里的「升级引擎」按钮（不会自动跟随新版）");
             }
+
+            // 版本锁与回滚：这两项直接对应"以插件为主"的取舍，必须能一眼看到。
+            var pinnedNow = ReadPinnedEngineVersion();
+            sb.AppendLine(pinnedNow is not null
+                ? $"🔒 引擎版本已锁定：{pinnedNow}（升级被禁用；清空 engine-version.txt 解除）"
+                : $"○ 引擎未锁定（升级时跟随最新版）。想钉住版本就把版本号写进：{engineVersionPinFile}");
+
+            var oldEngine = ReadEngineVersion(engineOldDir);
+            if (oldEngine is not null)
+                sb.AppendLine($"↩ 可回退的上一个引擎：{oldEngine}（在 engine.old；插件不兼容时可换回）");
+
+            // 插件对引擎版本的要求，与实际引擎对不对得上——这正是"升级后插件还能不能用"的判据。
+            var reqs = CollectPluginRequirements(webProfileDir);
+            if (reqs.Count > 0 && engine is not null)
+            {
+                var (unknown, bad) = CheckPluginCompatibility(engine, webProfileDir);
+                sb.AppendLine(bad.Count == 0
+                    ? $"✓ 插件兼容性：{reqs.Count} 项要求对当前引擎 {engine} 均满足" +
+                      (unknown > 0 ? $"（{unknown} 项无法判定）" : string.Empty)
+                    : $"⚠ 插件兼容性：{bad.Count} 项要求不满足当前引擎 {engine}");
+                foreach (var b in bad.Take(6)) sb.AppendLine("    · " + b);
+                if (bad.Count > 6) sb.AppendLine($"    …另有 {bad.Count - 6} 项");
+            }
             if (Directory.Exists(engineStageDir))
                 sb.AppendLine("⚠ 存在未完成的安装残留：engine.tmp（下次安装会自动清掉）");
 
@@ -1697,9 +1988,7 @@ internal sealed class HarnessForm : Form
                 sb.AppendLine($"✓ pnpm：{v?.Trim() ?? "?"}（{pnpm}）");
             }
 
-            var profile = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".dsh", "profiles", "web");
+            var profile = webProfileDir;
             sb.AppendLine(File.Exists(Path.Combine(profile, "package.json"))
                 ? "✓ profile：已初始化"
                 : "✗ profile：未初始化（首次点击「开始」会自动初始化）");
