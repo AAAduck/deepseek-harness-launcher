@@ -441,9 +441,25 @@ internal sealed class HarnessForm : Form
             if (authenticatedUrl is not null) return;
 
             if (ProcessHasExited(process))
+            {
+                // 进程刚退出的瞬间，stderr/stdout 的异步读取常常还没送达，
+                // 直接取摘要会得到"未输出任何日志"——把真正有用的报错丢掉。
+                // 这里等一小会儿让管道排空，同时把"我们自己的进程被释放了"这种情况
+                // 与"引擎真的崩了"区分开。
+                try { await Task.Delay(300, ct); } catch (OperationCanceledException) { }
+                var code = SafeExitCode(process);
+                var codeText = code >= 0
+                    ? $"代码 {code}"
+                    : "未知（进程句柄已被释放——通常是启动器自身在清理该进程，而不是引擎崩溃）";
+                var summary = RecentOutputSummary();
+                if (summary.Contains("未输出任何日志"))
+                {
+                    summary += "\n（提示：若引擎是被杀掉的，它来不及输出；可点「环境」查看引擎与 Node 状态，" +
+                              $"或手动执行 node \"{EngineEntryScript}\" web --no-open --port {DefaultPort} 复现）";
+                }
                 throw new InvalidOperationException(
-                    $"DeepSeek Harness 立即退出（代码 {SafeExitCode(process)}）。\n" +
-                    $"{RecentOutputSummary()}\n请检查 Node 与引擎安装（可点「环境」自检）。");
+                    $"DeepSeek Harness 立即退出（{codeText}）。\n{summary}\n请检查 Node 与引擎安装（可点「环境」自检）。");
+            }
 
             if (!portAppeared && IsPortListening(DefaultPort)) portAppeared = true;
 
@@ -1422,17 +1438,91 @@ internal sealed class HarnessForm : Form
         return bare is null ? null : bare >= 0;
     }
 
-    /// <summary>返回 (无法判定的条数, 明确不满足的明细)。</summary>
+    /// <summary>
+    /// 候选引擎版本 与 需求 是否能比较。
+    /// 只有 DSH 自身那一族（"@deepseek-ai/dsh" 与 "@deepseek-ai/dsh-*"）与引擎同版本发布。
+    /// 别的一律不是：实测本机引擎里 cordis=4.0.2、schemastery=3.18.2、cosmokit=1.8.3、
+    /// node-addon-system=0.1.2，各有自己的版本号。把引擎版本 0.2.0-rc.2 拿去比
+    /// "^4.0.1"（cordis）永远不成立——那正是早期版本会误报"4 项不满足"的原因。
+    /// </summary>
+    private static bool IsDshVersionedPackage(string packageName)
+    {
+        const string prefix = "@deepseek-ai/dsh";
+        if (!packageName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        // "@deepseek-ai/dsh" 本身，或 "@deepseek-ai/dsh-xxx"
+        return packageName.Length == prefix.Length || packageName[prefix.Length] == '-';
+    }
+
+    /// <summary>
+    /// profile 里某个 @deepseek-ai/* 包实际解析到的版本（含 pnpm 的 .pnpm 存放区）。
+    /// 找不到返回 null。
+    /// </summary>
+    private static string? ResolveInstalledPackageVersion(string profileDir, string packageName)
+    {
+        try
+        {
+            var modules = Path.Combine(profileDir, "node_modules");
+            // ① 直接可见的位置
+            var direct = Path.Combine(modules, packageName.Replace('/', Path.DirectorySeparatorChar), "package.json");
+            if (File.Exists(direct))
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(direct));
+                if (doc.RootElement.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.String)
+                    return v.GetString();
+            }
+            // ② pnpm 的 .pnpm/<name>@<version>/node_modules/<name>（版本号就在目录名里）
+            var pnpmDir = Path.Combine(modules, ".pnpm");
+            if (!Directory.Exists(pnpmDir)) return null;
+            var leaf = packageName.Split('/').Last();
+            foreach (var dir in Directory.GetDirectories(pnpmDir, leaf + "@*"))
+            {
+                var name = Path.GetFileName(dir);
+                var at = name.LastIndexOf('@');
+                if (at <= 0 || at == name.Length - 1) continue;
+                var version = name[(at + 1)..];
+                // 目录名可能是 1.2.3 或 1.2.3_<peer-hash> 形式
+                var underscore = version.IndexOf('(');
+                if (underscore >= 0) version = version[..underscore];
+                if (version.Length > 0) return version;
+            }
+            return null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// 返回 (无法判定的条数, 明确不满足的明细)。
+    /// dsh 那一族与候选引擎版本比较；其余包与"当前实际装着的版本"比较——
+    /// 那些包不随引擎升级而变，所以"现在满足、升级后照样满足；现在不满足也不是升级造成的"。
+    /// </summary>
     private static (int Unknown, List<string> Violations) CheckPluginCompatibility(string candidateVersion, string profileDir)
     {
         var violations = new List<string>();
         var unknown = 0;
         foreach (var req in CollectPluginRequirements(profileDir))
         {
-            // 子包（dsh-llm 等）与主包同一次发布、版本号一致，所以统一用候选主版本比对。
-            var verdict = SatisfiesRange(candidateVersion, req.Range);
+            bool? verdict;
+            string basis;
+            if (IsDshVersionedPackage(req.Package))
+            {
+                verdict = SatisfiesRange(candidateVersion, req.Range);
+                basis = $"引擎 {candidateVersion}";
+            }
+            else
+            {
+                var installed = ResolveInstalledPackageVersion(profileDir, req.Package);
+                if (installed is null)
+                {
+                    // 这个包既不由引擎随版本提供、也不在 profile 里，无从判断。
+                    unknown++;
+                    continue;
+                }
+                verdict = SatisfiesRange(installed, req.Range);
+                basis = $"当前 {installed}";
+            }
+
             if (verdict is null) { unknown++; continue; }
-            if (!verdict.Value) violations.Add($"{req.Plugin} 要求 {req.Package} {req.Range}");
+            if (!verdict.Value) violations.Add($"{req.Plugin} 要求 {req.Package} {req.Range}（{basis}）");
         }
         return (unknown, violations);
     }
@@ -1524,21 +1614,19 @@ internal sealed class HarnessForm : Form
             // 所以升级不会动插件文件，但插件声明的范围可能不覆盖新引擎——
             // 那种情况下升级会让插件失效，必须先让用户知情再决定。
             var (unknownCount, violations) = CheckPluginCompatibility(latest, webProfileDir);
-            if (violations.Count > 0 || unknownCount > 0)
+            if (violations.Count > 0)
             {
                 var lines = new StringBuilder();
                 lines.AppendLine($"即将把引擎从 {current ?? "未安装"} 升级到 {latest}。");
                 lines.AppendLine();
-                if (violations.Count > 0)
-                {
-                    lines.AppendLine($"⚠ 有 {violations.Count} 项插件要求不满足新版本：");
-                    foreach (var v in violations.Take(8)) lines.AppendLine("  · " + v);
-                    if (violations.Count > 8) lines.AppendLine($"  …另有 {violations.Count - 8} 项");
-                    lines.AppendLine();
-                    lines.AppendLine("升级后这些插件可能无法正常工作。");
-                }
+                lines.AppendLine($"⚠ 有 {violations.Count} 项插件要求无法满足：");
+                foreach (var v in violations.Take(8)) lines.AppendLine("  · " + v);
+                if (violations.Count > 8) lines.AppendLine($"  …另有 {violations.Count - 8} 项");
+                lines.AppendLine();
+                lines.AppendLine("标「引擎 x.y.z」的项与这次升级有关；标「当前 …」的项是那些包");
+                lines.AppendLine("本来就不随引擎版本变动，升级不会改善它们。");
                 if (unknownCount > 0)
-                    lines.AppendLine($"（另有 {unknownCount} 项要求无法自动判定，需你自行确认。）");
+                    lines.AppendLine($"另有 {unknownCount} 项因版本范围无法解析（多为预发布三选一）未能判定。");
                 lines.AppendLine();
                 lines.AppendLine("选择「否」保持当前引擎不变（插件的现有状态完全不受影响）。");
 
@@ -1959,16 +2047,19 @@ internal sealed class HarnessForm : Form
                 sb.AppendLine($"↩ 可回退的上一个引擎：{oldEngine}（在 engine.old；插件不兼容时可换回）");
 
             // 插件对引擎版本的要求，与实际引擎对不对得上——这正是"升级后插件还能不能用"的判据。
+            // 注意只有 dsh 那一族随引擎版本走，cordis/schemastery 等有自己的版本号，
+            // 那些项是按"当前已装版本"判定的，与升级无关。
             var reqs = CollectPluginRequirements(webProfileDir);
             if (reqs.Count > 0 && engine is not null)
             {
                 var (unknown, bad) = CheckPluginCompatibility(engine, webProfileDir);
-                sb.AppendLine(bad.Count == 0
-                    ? $"✓ 插件兼容性：{reqs.Count} 项要求对当前引擎 {engine} 均满足" +
-                      (unknown > 0 ? $"（{unknown} 项无法判定）" : string.Empty)
-                    : $"⚠ 插件兼容性：{bad.Count} 项要求不满足当前引擎 {engine}");
-                foreach (var b in bad.Take(6)) sb.AppendLine("    · " + b);
-                if (bad.Count > 6) sb.AppendLine($"    …另有 {bad.Count - 6} 项");
+                if (bad.Count == 0)
+                    sb.AppendLine($"✓ 插件兼容性：{reqs.Count} 项要求均满足" +
+                                  (unknown > 0 ? $"（{unknown} 项无法判定）" : string.Empty));
+                else
+                    sb.AppendLine($"⚠ 插件兼容性：{bad.Count} 项不满足（共 {reqs.Count} 项要求）");
+                foreach (var b in bad.Take(8)) sb.AppendLine("    · " + b);
+                if (bad.Count > 8) sb.AppendLine($"    …另有 {bad.Count - 8} 项");
             }
             if (Directory.Exists(engineStageDir))
                 sb.AppendLine("⚠ 存在未完成的安装残留：engine.tmp（下次安装会自动清掉）");
