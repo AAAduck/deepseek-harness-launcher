@@ -233,6 +233,12 @@ internal sealed class HarnessForm : Form
         startCts = cts;
         EnterBusy(active, busyText);
 
+        // 在动任何东西之前先给配置拍一份快照。实测 DSH 的 settings 迁移会丢掉
+        // 不匹配 profile 条目 id 的配置段（jet-hub 账号、llm-pi-ai 供应商都中过招），
+        // 备份必须发生在"可能被改写"之前，事后再备份就晚了。
+        // 内容没变化时不会重复生成，所以正常启动几乎零成本。
+        ConfigBackup.CreateSnapshot(reuseExisting ? "启动前" : "重启前");
+
         try
         {
             if (reuseExisting)
@@ -1077,9 +1083,171 @@ internal sealed class HarnessForm : Form
         await InstallEngineAsync(node, latest ?? "latest", ResolveNpmRegistry(node, ct), ct);
     }
 
+    private async Task<string?> ActivateEngineVersionAsync(string version)
+    {
+        try
+        {
+            var slot = EngineSlotDirFor(version);
+            if (!Directory.Exists(slot))
+                return $"找不到版本 {version} 的目录：\n{slot}";
+            if (!File.Exists(Path.Combine(slot, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")))
+                return $"版本 {version} 的目录不完整（缺少 bin.js），无法切换。\n{slot}";
+
+            var active = ReadEngineVersion(engineDir);
+            if (string.Equals(active, version, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            // 运行中的实例占着引擎文件，先停干净再改名。
+            await StopHarnessProcessesAsync();
+            await WaitForPortToCloseAsync(DefaultPort, TimeSpan.FromSeconds(8), CancellationToken.None);
+
+            ForceDeleteDirectory(engineStageDir);
+            if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineStageDir);
+            Directory.Move(slot, engineDir);
+            // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
+            try
+            {
+                if (active is not null) Directory.Move(engineStageDir, EngineSlotDirFor(active));
+            }
+            catch (Exception ex)
+            {
+                AppendStartupLog($"切换后归档旧版本失败（{active}）：{ex.Message}");
+                ForceDeleteDirectory(engineStageDir);
+            }
+            AppendStartupLog($"引擎版本已切换到 {version}");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            AppendStartupLog($"切换引擎版本失败：{ex.Message}");
+            return "切换失败：" + ex.Message;
+        }
+    }
+
+    private void DeleteEngineVersion(string version)
+    {
+        try
+        {
+            var active = ReadEngineVersion(engineDir);
+            if (string.Equals(active, version, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show("不能删除正在使用的版本。请先切换到其他版本。",
+                    "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var slot = EngineSlotDirFor(version);
+            if (!Directory.Exists(slot)) return;
+            SetInfo($"正在删除引擎 {version}…");
+            ForceDeleteDirectory(slot);
+            AppendStartupLog($"已删除引擎版本 {version}");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("删除失败：" + ex.Message, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    // ---- 引擎版本槽 ---------------------------------------------------------
+
+    private const string EngineSlotPrefix = "engine.";
+
+    private static string EngineSlotDirFor(string version) => Path.Combine(LocalAppDir, EngineSlotPrefix + version);
+
+    /// <summary>目录占用，MB 粒度。用 EnumerateFiles 避免一次性把所有 FileInfo 建出来。</summary>
+    private static long DirectorySizeBytes(string dir)
+    {
+        try
+        {
+            long total = 0;
+            foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                try { total += new FileInfo(file).Length; } catch { }
+            }
+            return total;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>
+    /// 把升级后留下的 engine.old 提升为一个正式的版本槽。
+    /// 升级流程仍然用 engine.old 作中转（改名失败可以靠它恢复），
+    /// 这里在下次启动时把它归档成 engine.&lt;版本号&gt;，于是旧版本不会被动丢掉了。
+    /// </summary>
+    private static void MigrateEngineOldToSlot()
+    {
+        try
+        {
+            if (!Directory.Exists(engineOldDir)) return;
+            // 活动版本缺失时这本该由 RecoverEngineSwap 处理，别在这里抢着归档。
+            if (!Directory.Exists(engineDir)) return;
+
+            var oldVersion = ReadEngineVersion(engineOldDir);
+            if (oldVersion is null)
+            {
+                // 读不出版本（装了一半）：不能确定它属于哪个槽，保守地留着让用户自己决定。
+                AppendStartupLog("engine.old 无法读出引擎版本，保留原样未归档");
+                return;
+            }
+
+            if (string.Equals(ReadEngineVersion(engineDir), oldVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                // 与活动版本同一个版本号，留两份纯属浪费磁盘。
+                ForceDeleteDirectory(engineOldDir);
+                return;
+            }
+
+            var slot = EngineSlotDirFor(oldVersion);
+            ForceDeleteDirectory(slot);
+            Directory.Move(engineOldDir, slot);
+            AppendStartupLog($"已把上一版本 {oldVersion} 归档为可切换版本");
+        }
+        catch (Exception ex)
+        {
+            AppendStartupLog("归档 engine.old 失败：" + ex.Message);
+        }
+    }
+
+    internal IReadOnlyList<EngineVersionEntry> GetInstalledEngineVersions()
+    {
+        MigrateEngineOldToSlot();
+        var result = new List<EngineVersionEntry>();
+
+        var activeVersion = ReadEngineVersion(engineDir);
+        if (activeVersion is not null)
+        {
+            result.Add(new EngineVersionEntry(
+                activeVersion, engineDir, true,
+                DirectorySizeBytes(engineDir),
+                Directory.GetCreationTime(engineDir)));
+        }
+
+        try
+        {
+            foreach (var dir in Directory.GetDirectories(LocalAppDir, EngineSlotPrefix + "*"))
+            {
+                var name = Path.GetFileName(dir);
+                if (!name.StartsWith(EngineSlotPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                var version = name[EngineSlotPrefix.Length..];
+                if (version.Length == 0) continue;
+                // "engine.old" / "engine.tmp" 不是版本槽，跳过。
+                if (version is "old" or "tmp") continue;
+                if (!File.Exists(Path.Combine(dir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))) continue;
+                result.Add(new EngineVersionEntry(
+                    version, dir, false,
+                    DirectorySizeBytes(dir),
+                    Directory.GetCreationTime(dir)));
+            }
+        }
+        catch { }
+
+        return result;
+    }
+
     /// <summary>
     /// 上次替换若在两步之间被打断（engine 已改名、staging 还没顶上），
     /// 这里把 engine.old 改回来，避免出现"引擎凭空消失"。
+    /// 注意顺序：必须先跑这个，再让 MigrateEngineOldToSlot 把 engine.old 归档成版本槽，
+    /// 否则"活动目录缺失"的中间态会被归档动作掩盖掉。
     /// </summary>
     private void RecoverEngineSwap()
     {
@@ -1646,6 +1814,9 @@ internal sealed class HarnessForm : Form
             if (cts.IsCancellationRequested) return;
 
             SetInfo($"正在安装引擎 {latest}（先装临时目录，成功后替换）…");
+            // 升级是配置迁移的实际触发点（引擎版本一变，下次启动就可能改写 settings.yaml），
+            // 所以这里再拍一份——此时还是"升级前"的配置，是最有价值的还原点。
+            ConfigBackup.CreateSnapshot($"升级引擎前（{current ?? "未安装"} → {latest}）");
             await InstallEngineAsync(node, latest, ResolveNpmRegistry(node, cts.Token), cts.Token);
             if (cts.IsCancellationRequested) return;
 
@@ -2100,7 +2271,42 @@ internal sealed class HarnessForm : Form
             var listening = ListeningPorts().OrderBy(x => x).ToArray();
             sb.AppendLine();
             sb.AppendLine($"本机 TCP 监听端口（{listening.Length} 个）：{string.Join(", ", listening)}");
-            MessageBox.Show(sb.ToString(), "环境检测", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+            // 配置备份状态 + 一键恢复。
+            // 实测 DSH 的 settings 迁移会丢掉不匹配 profile 条目 id 的配置段
+            // （jet-hub 账号列表、llm-pi-ai 的自定义供应商都中过招），
+            // 所以这里既报状态，也给一条不用手动翻目录的恢复路径。
+            sb.AppendLine();
+            var latestBackup = ConfigBackup.LatestSnapshot();
+            if (latestBackup is null)
+            {
+                sb.AppendLine($"○ 配置备份：还没有快照（点「开始」或「重启」会自动生成，存于 {ConfigBackup.BackupRoot}）");
+            }
+            else
+            {
+                var info = Path.Combine(latestBackup, "backup-info.txt");
+                var when = Directory.GetCreationTime(latestBackup);
+                sb.AppendLine($"✓ 配置备份：最新一份 {when:yyyy-MM-dd HH:mm}（{Path.GetFileName(latestBackup)}）");
+                if (File.Exists(info))
+                {
+                    foreach (var line in File.ReadAllLines(info).Where(l => l.StartsWith("原因")))
+                        sb.AppendLine("    " + line.Trim());
+                }
+                sb.AppendLine($"    位置：{ConfigBackup.BackupRoot}");
+            }
+
+            var restore = MessageBox.Show(sb.ToString(), "环境检测", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            if (restore == DialogResult.Yes)
+            {
+                if (latestBackup is null)
+                {
+                    MessageBox.Show("还没有可恢复的备份快照。", "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    RestoreLatestBackup(latestBackup);
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -2110,6 +2316,35 @@ internal sealed class HarnessForm : Form
         {
             if (!closing && !IsDisposed) await RefreshStatusAsync();
         }
+    }
+
+    /// <summary>
+    /// 用最新快照覆盖回 $DSH_HOME。刻意只覆盖快照里有的文件、不动其他任何东西，
+    /// 并在覆盖前把"当前状态"再存一份——万一恢复错了还能退回来。
+    /// </summary>
+    private void RestoreLatestBackup(string snapshotDir)
+    {
+        var confirm = MessageBox.Show(
+            $"用这份快照覆盖当前配置？\n\n快照：{Path.GetFileName(snapshotDir)}\n" +
+            $"目标：{Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}\\.dsh\\\n\n" +
+            "只覆盖快照里存在的文件（.credentials.yaml、settings.yaml、各 profile 的 cordis*.yml 等），\n" +
+            "不碰 node_modules 与引擎。覆盖前我会先把当前状态另存一份。\n\n" +
+            "恢复后需要重启引擎（点「停止」再点「开始」）才会生效。",
+            "恢复配置备份", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes) return;
+
+        // 先给"恢复前"的状态留一份，保证这一步本身也可逆。
+        ConfigBackup.CreateSnapshot("恢复配置前（当前状态）");
+        var count = ConfigBackup.Restore(snapshotDir);
+        if (count < 0)
+        {
+            MessageBox.Show("恢复失败，可能原因：引擎正在运行占用了配置文件。\n请先点「停止」再试。",
+                "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        MessageBox.Show(
+            $"已从快照恢复 {count} 个配置文件。\n\n请点「停止」再点「开始」重启引擎使其生效。",
+            "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private static async Task<string?> GetToolVersionAsync(string exe, string args)
