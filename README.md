@@ -122,6 +122,16 @@ dotnet publish --configuration Release
 > 旧启动器**正在运行时**这个默认路径会被锁住（报 MSB3027，锁文件的正是运行中的
 > `DeepSeekHarness.exe`），此时改用独立输出目录，见下面「更新启动器本体」。
 
+### 跑单测
+
+```powershell
+dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
+```
+
+只测"判错了不报错"的那几处决策：杀哪些进程、要不要拍配置快照、恢复路径是否越界、
+semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局自检。
+改动这几个函数前先跑一遍，绿了再改。
+
 ## 更新启动器本体（标准流程：随时跑 `更新启动器.bat`，Web 会话不中断）
 
 每次优化启动器本体都按这个方式更新。1.3.0 起引擎 stdio 已文件化（见「生命周期与单实例」），
@@ -180,13 +190,18 @@ dotnet publish --configuration Release
   窗口因此能在遍历 2.5 万个 `node_modules` 文件时保持响应。
 - `FoldersForm.cs`：相关目录一览窗口。
 - `ConfigBackup.cs`：配置快照（启动前与升级前自动拍摄、按文件哈希去重、一键恢复）。
+  快照判定（`NeedsSnapshot`）与恢复路径守卫（`IsWithinRoot`）是纯函数，有单测。
 - `LayoutDump.cs`：布局自检（`DSH_LAYOUT_DUMP=1` / `DSH_LAYOUT_TEST=1` 时把真实几何写入 `layout-dump.txt`）。
   自检只在 `Program.cs` 的 `DSH_LAYOUT_TEST=1` 入口里驱动，两个对话框不再各自挂 `Shown` 处理器。
 - `Program.cs`：程序入口、单实例互斥、启动异常兜底（写 `crash-log.txt`）。
 - `app.manifest`：应用清单（asInvoker 不提权、supportedOS 声明、长路径感知）。
   DPI 感知不在清单里声明——它由 csproj 的 `ApplicationHighDpiMode` 给出（取值 `SystemAware`），
   与 `UseWindowsForms` 生成的 `ApplicationConfiguration.Initialize()` 保持单一来源。
-- `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。
+- `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。含 `InternalsVisibleTo`：
+  只对配套测试工程开放几个 internal 纯函数；同时把 `tests\` 排除出本项目的 `**/*.cs` 通配。
+- `tests\DeepSeekHarness.Tests\`：xunit 单测（54 条）。刻意只覆盖"判错了不报错"的决策：
+  进程匹配内核（杀谁）、快照判定、恢复路径守卫、semver 范围判定。
+  这几处的共同点是错了不会有任何报错，只在用户眼前发生——所以必须有测试钉住。
 - `更新启动器.bat`：标准更新入口，随时可执行（1.3.0 起 Web 会话不中断；首次迁移例外见
   「更新启动器本体」）。按映像名只杀启动器（不碰 node）、
   从 `%LOCALAPPDATA%\DeepSeekHarness\update-staging\` 取新 exe 覆盖 `bin\Release` 与脚本旁副本、

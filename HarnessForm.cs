@@ -959,10 +959,21 @@ internal sealed class HarnessForm : Form
         processRecordCacheAt = DateTime.MinValue;
     }
 
-    private static bool IsHarnessCommand(ProcessRecord p)
+    private static bool IsHarnessCommand(ProcessRecord p) =>
+        MatchesHarnessCommand(p.Name, p.CommandLine, engineDir, userHomeDir, DefaultPort);
+
+    /// <summary>
+    /// <see cref="IsHarnessCommand"/> 的纯函数内核：吃参数、不读任何静态状态。
+    /// 单独拆出来只有一个理由——"杀错进程"是本项目最贵的一个判断：会崩掉用户
+    /// 正在用的桌面客户端、会误杀别的登录会话的引擎，而它错了不会报错。
+    /// 这类逻辑必须有单测钉住，不能只靠注释（见 tests/DeepSeekHarness.Tests）。
+    /// 改动时保持与调用点行为完全一致，别顺手"优化"匹配规则。
+    /// </summary>
+    internal static bool MatchesHarnessCommand(
+        string name, string commandLine, string engineDir, string userHomeDir, int port)
     {
-        if (p.Name.Equals("DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
-        var c = p.CommandLine;
+        if (name.Equals("DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
+        var c = commandLine;
 
         // —— 绝不能杀的目标：DSH 桌面客户端（Electron）自己的引擎宿主 ——
         // 客户端不是 node.exe，而是用它自己的可执行文件跑宿主：
@@ -981,10 +992,10 @@ internal sealed class HarnessForm : Form
 
         // 其余宽松匹配只对 node / npx 生效。此前对任意进程名都套用，
         // 一个恰好含 "dsh web" 字样的非 node 进程也会被整树杀掉。
-        var isNode = p.Name.Equals("node.exe", StringComparison.OrdinalIgnoreCase);
-        var isNpx = p.Name.Equals("npx.cmd", StringComparison.OrdinalIgnoreCase) ||
-                    p.Name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase) ||
-                    p.Name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase);
+        var isNode = name.Equals("node.exe", StringComparison.OrdinalIgnoreCase);
+        var isNpx = name.Equals("npx.cmd", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase);
         if (!isNode && !isNpx) return false;
 
         // 宽松匹配只认**本用户**的残留：另一个登录会话里的引擎 / npx 缓存命令行
@@ -1001,7 +1012,7 @@ internal sealed class HarnessForm : Form
         // 命令行必须还出现本启动器的端口，否则一个碰巧提到 "dsh" 的 node/cmd 进程
         // 也会被整树杀掉——误杀别人进程的代价远大于漏杀一个残留
         // （真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
-        if (!c.Contains(DefaultPort.ToString(), StringComparison.Ordinal)) return false;
+        if (!c.Contains(port.ToString(), StringComparison.Ordinal)) return false;
 
         return Regex.IsMatch(c, @"(?i)(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b") ||
                Regex.IsMatch(c, @"(?i)\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b");
@@ -2013,7 +2024,7 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>把 "0.2.0-rc.2" 解析成可比较的四段版本；解析不了返回 null。</summary>
-    private static Version? ParseVersion(string? text)
+    internal static Version? ParseVersion(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return null;
         var core = text.Trim().TrimStart('v', 'V');
@@ -2028,7 +2039,7 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>S1 &gt; S2 → 1；相等 → 0；S1 &lt; S2 → -1；无法比较 → null。</summary>
-    private static int? CompareVersionStrings(string a, string b)
+    internal static int? CompareVersionStrings(string a, string b)
     {
         var va = ParseVersion(a);
         var vb = ParseVersion(b);
@@ -2066,16 +2077,26 @@ internal sealed class HarnessForm : Form
     /// ">=0.1.7-rc.1"、"&gt;=0.1.7-rc.1 &lt;0.3.0-0"、"^4.0.1"、"~1.2.3"、
     /// 裸版本号（= 精确匹配，同 npm 语义）、"A || B"。
     /// 三态返回：true 满足 / false 明确不满足 / null 无法判定。
+    /// 本方法及下面几个 semver 辅助是 internal 而非 private，只为一件事：
+    /// 能被 tests/DeepSeekHarness.Tests 直接单测。这里每次"拿不准就返回 null"
+    /// 都是刻意选择（宁可让用户看到"未能判定"，也不猜）——而这类语义一旦被
+    /// 顺手改坏，编译器和运行时都不会有反应。
     ///
     /// 这里必须把"明确不满足"和"无法判定"分开：之前只要有一个 token 判定不出来
     /// 就整体返回 null，导致"已知不兼容"被降级成"未知"，护栏会漏报。
-    /// 规则：某个候选项的全部 token 都满足 → true；某个候选项里有 token 明确不满足
-    /// （且没有无法判定的 token 挡在前面）→ 这个候选项为 false；所有候选项都为 false → false；
-    /// 否则（存在无法判定的部分）→ null。
+    /// 规则（三值 Kleene：任一候选项满足 → true；全部明确不满足 → false；
+    /// 只要还剩一个判不出来 → null）：
+    ///   某个候选项的全部 token 都满足 → true；
+    ///   某个候选项里有 token 明确不满足（且没有无法判定的 token 挡在前面）→ 该候选项为 false；
+    ///   只要存在"无法判定"的候选项，整体就不能是 false——
+    ///   例如 ">=0.2.0 || *"，第一个候选项明确不满足、第二个（通配符）判不出来，
+    ///   整体必须报 null 而非 false。原先只要存在一个明确不满足的候选项就返回 false，
+    ///   等于把"我判不出来"当成"确定不满足"，会凭空报出插件不兼容的警告。
     /// </summary>
-    private static bool? SatisfiesRange(string candidate, string range)
+    internal static bool? SatisfiesRange(string candidate, string range)
     {
         var anyAlternativeFailed = false;
+        var anyAlternativeUnknown = false;
         foreach (var alternative in range.Split("||", StringSplitOptions.RemoveEmptyEntries))
         {
             var allSatisfied = true;   // 目前为止每个 token 都满足
@@ -2089,12 +2110,16 @@ internal sealed class HarnessForm : Form
                 break;
             }
             if (allSatisfied && !anyUnknown) return true;   // 该候选项确定满足
-            if (!anyUnknown && !allSatisfied) anyAlternativeFailed = true;
+            if (anyUnknown) { anyAlternativeUnknown = true; continue; }
+            allSatisfied = false;
+            anyAlternativeFailed = true;
         }
-        return anyAlternativeFailed ? false : null;
+        // "无法判定"优先于"明确不满足"：只要还有一个候选项判不出来，
+        // 整体就不能断言 false（否则会把本来满足的范围报成插件不兼容）。
+        return anyAlternativeFailed && !anyAlternativeUnknown ? false : null;
     }
 
-    private static bool? SatisfiesSingle(string candidate, string token)
+    internal static bool? SatisfiesSingle(string candidate, string token)
     {
         token = token.Trim();
         if (token.Length == 0) return null;
@@ -2153,7 +2178,7 @@ internal sealed class HarnessForm : Form
     /// node-addon-system=0.1.2，各有自己的版本号。把引擎版本 0.2.0-rc.2 拿去比
     /// "^4.0.1"（cordis）永远不成立——那正是早期版本会误报"4 项不满足"的原因。
     /// </summary>
-    private static bool IsDshVersionedPackage(string packageName)
+    internal static bool IsDshVersionedPackage(string packageName)
     {
         const string prefix = "@deepseek-ai/dsh";
         if (!packageName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;

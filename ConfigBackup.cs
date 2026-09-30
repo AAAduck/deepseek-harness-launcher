@@ -105,15 +105,7 @@ internal static class ConfigBackup
                 }
             }
 
-            var durableChanged = hashes.Any(kv =>
-                !volatileFiles.Contains(kv.Key) &&
-                (!previous.TryGetValue(kv.Key, out var old) || !string.Equals(old, kv.Value, StringComparison.Ordinal)));
-            // 键集合双向对比，而不是只比数量：同一轮里"一增一减、数量恰好不变"
-            // 时（换 profile、改 patch 文件名），只比 hashes.Count != previous.Count 会漏拍。
-            var setChanged = hashes.Keys.Except(previous.Keys, StringComparer.OrdinalIgnoreCase).Any() ||
-                             previous.Keys.Except(hashes.Keys, StringComparer.OrdinalIgnoreCase).Any();
-
-            if (previous.Count > 0 && !durableChanged && !setChanged)
+            if (!NeedsSnapshot(hashes, previous, volatileFiles))
                 return null;   // 只有易变文件动过（或什么都没变），不占用快照名额
 
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
@@ -152,6 +144,34 @@ internal static class ConfigBackup
         catch { return null; }
     }
 
+    /// <summary>
+    /// 这一轮要不要新拍一份快照。**纯函数**（只吃两张哈希表，不碰文件系统），
+    /// 因为它是整个备份机制里唯一一个"判错了不报错"的决策：判成"不用拍"，
+    /// 用户真正需要还原的那一刻才会发现快照根本没留下。
+    ///
+    /// 规则：
+    /// ① 稳定文件（不含易变文件）内容变了 → 要拍。凭据轮换这类例行改写不算。
+    /// ② 键集合有任何增删 → 要拍。用**双向集合对比**而不是只比数量：
+    ///    "一增一减、数量恰好不变"（换 profile、改 patch 文件名）曾被漏掉。
+    /// ③ 上一份清单为空（首次运行）→ 要拍。
+    /// </summary>
+    internal static bool NeedsSnapshot(
+        IReadOnlyDictionary<string, string> hashes,
+        IReadOnlyDictionary<string, string> previous,
+        ISet<string> volatileFiles)
+    {
+        if (previous.Count == 0) return true;
+
+        var durableChanged = hashes.Any(kv =>
+            !volatileFiles.Contains(kv.Key) &&
+            (!previous.TryGetValue(kv.Key, out var old) || !string.Equals(old, kv.Value, StringComparison.Ordinal)));
+
+        var setChanged = hashes.Keys.Except(previous.Keys, StringComparer.OrdinalIgnoreCase).Any() ||
+                         previous.Keys.Except(hashes.Keys, StringComparer.OrdinalIgnoreCase).Any();
+
+        return durableChanged || setChanged;
+    }
+
     private static string EngineVersionAtBackup()
     {
         try
@@ -180,6 +200,24 @@ internal static class ConfigBackup
             }
         }
         catch { }
+    }
+
+    /// <summary>
+    /// 目标路径是否真的落在 <paramref name="rootFullPath"/> 目录**之内**。纯函数、可单测——
+    /// 它是恢复动作唯一的纵深防御：判错了不会报错，只会把用户的配置写到别处去。
+    /// 三个边界都要成立：前缀相同、root 后面紧跟一个分隔符（否则 <c>C:\a\bc</c> 会被
+    /// <c>C:\a\b</c> 误判成在内部）、且候选路径不是 root 自己。
+    /// </summary>
+    internal static bool IsWithinRoot(string candidateFullPath, string rootFullPath)
+    {
+        if (string.IsNullOrEmpty(candidateFullPath) || string.IsNullOrEmpty(rootFullPath)) return false;
+        if (!candidateFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase)) return false;
+        if (candidateFullPath.Length <= rootFullPath.Length) return false;
+        // 注意：这里必须比 Path.DirectorySeparatorChar，不能用 char.IsSeparator——
+        // 后者判的是 Unicode「分隔符」类别（空格类），对 '\' 返回 false，
+        // 会让这道守卫把**所有**路径都判成越界（恢复动作全量跳过，且不报错）。
+        var next = candidateFullPath[rootFullPath.Length];
+        return next == Path.DirectorySeparatorChar || next == Path.AltDirectorySeparatorChar;
     }
 
     /// <summary>最新一份快照的路径，没有则 null。</summary>
@@ -217,7 +255,7 @@ internal static class ConfigBackup
                 // 快照目录由本程序生成、正常不会越界，但一旦目录被外部改动过，
                 // 一个 "../" 就可能写到别处去。
                 var full = Path.GetFullPath(dst);
-                if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                if (!IsWithinRoot(full, root))
                     continue;
                 try
                 {

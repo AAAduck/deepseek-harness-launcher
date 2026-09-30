@@ -51,4 +51,18 @@
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
+
+  <!-- tests\ 下的代码属于测试工程，绝不能被本项目默认的 **/*.cs 通配吃进来：
+       被编进 WinExe 的话，启动时会因找不到 xunit 程序集而直接起不来。 -->
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+  </ItemGroup>
+
+  <!-- 单测要直接跑几个 internal 纯函数：进程匹配内核、快照判定、恢复路径守卫、
+       semver 范围判定。它们默认对外部程序集不可见，这里只对配套测试开口子。 -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>DeepSeekHarness.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 </Project>
