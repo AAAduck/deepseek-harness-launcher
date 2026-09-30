@@ -59,6 +59,8 @@ internal sealed class HarnessForm : Form
     private readonly Button restartButton;
     private readonly Button stopButton;
     private readonly Button upgradeButton;
+    private readonly Button versionsButton;
+    private readonly Button foldersButton;
     private readonly Button refreshButton;
     private readonly Button envButton;
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1500 };
@@ -156,7 +158,8 @@ internal sealed class HarnessForm : Form
 
         // 文案必须与真实行为一致：插件更新现在发生在引擎启动「之后」（并行/后台），
         // 且改的是 profile 的 node_modules，所以生效时机是下一次启动。
-        autoUpdateCheckbox.Text = "启动后更新插件（下次生效）";
+        // 实测这个 9pt 下宽 164px；"（下次生效）"移到 tooltip 里，给右侧按钮腾空间。
+        autoUpdateCheckbox.Text = "启动后更新插件";
         autoUpdateCheckbox.Checked = LoadAutoUpdateSetting();
         autoUpdateCheckbox.AutoSize = true;
         autoUpdateCheckbox.Location = new Point(28, 110);
@@ -167,19 +170,26 @@ internal sealed class HarnessForm : Form
 
         // 引擎不再自动跟随最新版：升级只在这个按钮被点击时发生。
         // 按钮放在面板内，避免动到已排好的 5 个主按钮几何（窗体尺寸固定 560×265）。
-        upgradeButton = new Button
-        {
-            Text = "升级引擎",
-            Location = new Point(320, 105),
-            Size = new Size(94, 26),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(114, 122, 143),
-            ForeColor = Color.White,
-            Font = BoldFont,
-            Cursor = Cursors.Hand
-        };
-        upgradeButton.FlatAppearance.BorderSize = 0;
-        upgradeButton.AccessibleName = "升级 DSH 引擎到 npm 上的最新版本";
+        //
+        // 这一行三个小按钮的坐标是按实测文字宽度算出来的，不是估的：
+        // 复选框实测宽 164px、起点 x=50 → 右边界 214；面板右边界 446。
+        // 可用区间 222..446，三个 72px 按钮 + 8px 间距正好放得下。
+        // 底部那一行 6 个主按钮已经排满（右边界 524），所以新按钮加在这里，不加宽窗体。
+        // 「升级引擎」缩成「升级」是为此腾的空间，完整含义放在 AccessibleName 与 tooltip 里。
+        foldersButton = NewPanelButton("目录", "打开 DeepSeek Harness 相关目录",
+            new Point(238, 105), Color.FromArgb(58, 124, 240));
+        foldersButton.TabIndex = 7;
+        foldersButton.Click += (_, _) => OpenFoldersWindow();
+        panel.Controls.Add(foldersButton);
+
+        versionsButton = NewPanelButton("版本管理", "管理已安装的引擎版本：切换、删除",
+            new Point(318, 105), Color.FromArgb(88, 94, 104));
+        versionsButton.TabIndex = 6;
+        versionsButton.Click += (_, _) => OpenEngineVersions();
+        panel.Controls.Add(versionsButton);
+
+        upgradeButton = NewPanelButton("升级", "升级 DSH 引擎到 npm 上的最新版本",
+            new Point(398, 105), Color.FromArgb(114, 122, 143));
         upgradeButton.TabIndex = 2;
         upgradeButton.Click += async (_, _) => await RunEngineUpgradeAsync();
         panel.Controls.Add(upgradeButton);
@@ -1081,6 +1091,72 @@ internal sealed class HarnessForm : Form
         if (ct.IsCancellationRequested) return;
         if (latest is null) SetInfo("查不到版本号，按 latest 安装（网络受限时的降级路径）");
         await InstallEngineAsync(node, latest ?? "latest", ResolveNpmRegistry(node, ct), ct);
+    }
+
+    /// <summary>
+    /// 面板内那一排小按钮（目录 / 版本管理 / 升级）。三者几何一致，抽出来避免三份重复代码。
+    /// </summary>
+    private Button NewPanelButton(string text, string accessibleName, Point location, Color backColor)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Location = location,
+            Size = new Size(72, 26),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = backColor,
+            ForeColor = Color.White,
+            Font = BoldFont,
+            Cursor = Cursors.Hand,
+            AccessibleName = accessibleName
+        };
+        button.FlatAppearance.BorderSize = 0;
+        return button;
+    }
+
+    /// <summary>
+    /// 打开"相关目录"窗口。相关位置散落在 %LOCALAPPDATA%\DeepSeekHarness、
+    /// %USERPROFILE%\.dsh 与各 profile 三处，排查问题时来回翻很费事。
+    /// </summary>
+    private void OpenFoldersWindow()
+    {
+        if (closing || IsDisposed) return;
+        try
+        {
+            using var dialog = new FoldersForm();
+            dialog.ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            ShowError("打开目录列表失败", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 打开引擎版本管理。版本留在本地、随时能切回去，是"以插件为主"这个取舍的最后一道保险：
+    /// 插件的 peer 要求是针对特定引擎版本写的，出问题时能一键退回上一个版本，
+    /// 比重新下载安装可靠得多。
+    /// </summary>
+    private void OpenEngineVersions()
+    {
+        if (closing || IsDisposed) return;
+        try
+        {
+            using var dialog = new EngineVersionsForm(
+                GetInstalledEngineVersions,
+                version => ActivateEngineVersionAsync(version).GetAwaiter().GetResult(),
+                DeleteEngineVersion);
+            dialog.ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            ShowError("打开版本管理失败", ex.Message);
+        }
+        finally
+        {
+            // 切换版本会停掉引擎，回来刷新一下状态与按钮可用性。
+            _ = RefreshStatusAsync();
+        }
     }
 
     private async Task<string?> ActivateEngineVersionAsync(string version)
@@ -2204,7 +2280,7 @@ internal sealed class HarnessForm : Form
             {
                 sb.AppendLine($"✓ DSH 引擎：{engine}");
                 sb.AppendLine($"    位置：{engineDir}");
-                sb.AppendLine("    升级：面板里的「升级引擎」按钮（不会自动跟随新版）");
+                sb.AppendLine("    升级：面板里的「升级」按钮；版本切换/删除：旁边的「版本管理」");
             }
 
             // 版本锁与回滚：这两项直接对应"以插件为主"的取舍，必须能一眼看到。
@@ -2502,8 +2578,11 @@ internal sealed class HarnessForm : Form
 
         upgradeButton.AccessibleName = "升级 DSH 引擎到 npm 上的最新版本";
         upgradeButton.TabIndex = 2;
+        versionsButton.AccessibleName = "管理已安装的引擎版本：切换、删除";
+        versionsButton.TabIndex = 6;
+        foldersButton.AccessibleName = "打开 DeepSeek Harness 相关目录";
+        foldersButton.TabIndex = 7;
         autoUpdateCheckbox.AccessibleName = "启动后在后台更新 DSH 插件，改动下次启动生效";
-
         // 主按钮的 Tab 顺序按视觉从左到右。
         startButton.TabIndex = 0;
         restartButton.TabIndex = 1;
@@ -2561,13 +2640,17 @@ internal sealed class HarnessForm : Form
         busy = true;
         startButton.Enabled = restartButton.Enabled = stopButton.Enabled = false;
         upgradeButton.Enabled = false;
+        // 引擎运行期间不允许切换版本：切换必须先停引擎，让用户在这里点会与启动流程打架。
+        versionsButton.Enabled = false;
         active.Text = text;
         // 忙碌时按钮文字变成"启动中/停止中"，读屏就再也读不出它是哪个按钮了，
         // 所以把原语义留在 AccessibleName 里。
         if (ReferenceEquals(active, startButton)) active.AccessibleName = "开始（" + text + "）";
         else if (ReferenceEquals(active, restartButton)) active.AccessibleName = "重启（" + text + "）";
         else if (ReferenceEquals(active, stopButton)) active.AccessibleName = "停止（" + text + "）";
-        else if (ReferenceEquals(active, upgradeButton)) active.AccessibleName = "升级引擎（" + text + "）";
+        else if (ReferenceEquals(active, upgradeButton)) active.AccessibleName = "升级（" + text + "）";
+        else if (ReferenceEquals(active, versionsButton)) active.AccessibleName = "版本管理（" + text + "）";
+        else if (ReferenceEquals(active, foldersButton)) active.AccessibleName = "目录（" + text + "）";
         status.Text = text;
         status.ForeColor = WarnColor;
         lamp.Invalidate();
@@ -2579,7 +2662,7 @@ internal sealed class HarnessForm : Form
         startButton.Text = "开始";
         restartButton.Text = "重启";
         stopButton.Text = "停止";
-        upgradeButton.Text = "升级引擎";
+        upgradeButton.Text = "升级";
         startButton.AccessibleName = "启动 Harness 引擎并打开控制台。回车键等效";
         restartButton.AccessibleName = "结束当前引擎并重新启动";
         stopButton.AccessibleName = "停止引擎并释放端口";
@@ -2594,6 +2677,7 @@ internal sealed class HarnessForm : Form
         restartButton.Enabled = true;
         stopButton.Enabled = isOn;
         upgradeButton.Enabled = true;
+        versionsButton.Enabled = true;
     }
 
     private void DrawLamp(object? sender, PaintEventArgs e)
