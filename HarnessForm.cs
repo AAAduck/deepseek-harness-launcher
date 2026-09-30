@@ -39,7 +39,6 @@ internal sealed class HarnessForm : Form
     private static readonly Font UiFont = new("Microsoft YaHei UI", 9f);
     private static readonly Font BoldFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
     private static readonly Font StatusFont = new("Microsoft YaHei UI", 14f, FontStyle.Bold);
-    private static readonly Font ButtonFont = new("Microsoft YaHei UI", 10f, FontStyle.Bold);
     private static readonly Regex AuthUrlRegex = new(
         "https?://127\\.0\\.0\\.1:\\d+/\\?token=[^\\s\\\"'<>\\x1b]+",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -57,12 +56,10 @@ internal sealed class HarnessForm : Form
     private readonly LinkLabel link = new();
     private readonly Button startButton;
     private readonly Button restartButton;
-    private readonly Button stopButton;
     private readonly Button upgradeButton;
     private readonly Button versionsButton;
     private readonly Button foldersButton;
-    /// <summary>动作组右侧的小箭头，负责展开/收起启动、停止、重启。</summary>
-    // 折叠机制已移除：8 个按钮统一尺寸后能排成一行，不再需要展开/收起状态。
+    // 折叠机制已移除：主按钮随状态切换语义后，7 个按钮能排成一行，不再需要展开/收起状态。
     private readonly Button refreshButton;
     private readonly Button envButton;
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1500 };
@@ -178,10 +175,11 @@ internal sealed class HarnessForm : Form
         //
         // 尺寸统一是刻意的：主按钮不再特殊，同高（BottomRowHeight）、同字体、同宽。
 
-        startButton = NewActionButton("启动", "启动 Harness 引擎并打开控制台。回车键等效",
+        // 主按钮随状态切换语义（未运行→启动，运行中→停止，见 ApplyPrimaryActionLabel），
+        // 所以不再有独立的「停止」按钮——之前两套设计叠加，运行中一行出现两个红色「停止」。
+        // 「重启」保持独立：它在两种状态下都有意义（清残留后拉起）。
+        startButton = NewActionButton("启动", "启动或停止 Harness 引擎。回车键等效",
             Color.FromArgb(34, 170, 85));
-        stopButton = NewActionButton("停止", "停止引擎并释放端口",
-            Color.FromArgb(224, 69, 62));
         restartButton = NewActionButton("重启", "结束当前引擎并重新启动",
             Color.FromArgb(238, 148, 32));
         refreshButton = NewActionButton("刷新", "重新检测引擎状态", Color.FromArgb(58, 124, 240));
@@ -192,16 +190,14 @@ internal sealed class HarnessForm : Form
 
         Controls.AddRange(new Control[]
         {
-            startButton, stopButton, restartButton,
+            startButton, restartButton,
             refreshButton, envButton, foldersButton, versionsButton, upgradeButton
         });
 
-        LayoutBottomRow(rowHeight: BottomRowHeight);
-
-        // 尺寸约束放在最后：SetFixedClientSize 要用"Size - ClientSize"算边框与标题栏，
-        // 而那个差值取决于 FormBorderStyle。之前它在 FormBorderStyle 之前调用，
-        // 算出的边框宽度是错的（自检抓出客户区被压到 197px 宽）。
+        // 尺寸约束必须在 LayoutBottomRow 之前：布局按实际 ClientSize 反推行位置，
+        // 而构造完成前 ClientSize 还是默认值。之前顺序反了，靠 Shown 里重排一次才救回来。
         SetFixedClientSize(ClientWidth, TargetClientHeight);
+        LayoutBottomRow(rowHeight: BottomRowHeight);
 
         // 尺寸自检：记录设置前后来定位宽度被谁改小（曾经的坑：句柄未创建时设尺寸会被钳小）。
         if (LayoutDump.Enabled)
@@ -220,15 +216,13 @@ internal sealed class HarnessForm : Form
             // 所以这里按最终尺寸重排一次。
             LayoutBottomRow(rowHeight: BottomRowHeight);
 
-            // 自检入口：DSH_LAYOUT_DUMP=1 时在几个尺寸下各排一次并记录几何，然后退出。
+            // 自检入口：DSH_LAYOUT_DUMP=1 时记录几何后退出。
+            // 曾试图在此改宽度测自适应，但窗体尺寸已锁（Min=Max），赋值只会被钳回原值——
+            // 改了也是同一个几何，测了等于没测；宽度自适应由按钮重排逻辑保证。
             if (Environment.GetEnvironmentVariable("DSH_LAYOUT_DUMP") == "1")
             {
-                foreach (var width in new[] { ClientSize.Width, 480, 700 })
-                {
-                    ClientSize = new Size(width, ClientSize.Height);
-                    LayoutBottomRow(rowHeight: BottomRowHeight);
-                    DumpLayout($"客户区={ClientSize.Width}");
-                }
+                LayoutBottomRow(rowHeight: BottomRowHeight);
+                DumpLayout("显示后");
                 Close();
                 return;
             }
@@ -244,7 +238,6 @@ internal sealed class HarnessForm : Form
             else await RunStartAsync(startButton, "启动中", reuseExisting: true);
         };
         restartButton.Click += async (_, _) => await RunStartAsync(restartButton, "重启中", reuseExisting: false);
-        stopButton.Click += async (_, _) => await StopClickedAsync();
         refreshButton.Click += async (_, _) => await RefreshStatusAsync();
         envButton.Click += async (_, _) => await RunEnvCheckAsync();
         foldersButton.Click += (_, _) => OpenFoldersWindow();
@@ -252,9 +245,17 @@ internal sealed class HarnessForm : Form
         upgradeButton.Click += async (_, _) => await RunEngineUpgradeAsync();
         refreshTimer.Tick += async (_, _) => await RefreshStatusAsync();
 
-        // 键盘可达性：回车 = 启动，Esc = 停止（破坏性最小的那个）。
+        // 键盘可达性：回车 = 启动/停止（随主按钮），Esc = 停止引擎。
+        // Esc 之前靠 CancelButton 绑在「停止」按钮上；独立停止按钮删除后改用 KeyPreview，
+        // 语义不变（破坏性最小的那个动作），也不再依赖某个可见控件。
         AcceptButton = startButton;
-        CancelButton = stopButton;
+        KeyPreview = true;
+        KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Escape) return;
+            e.Handled = true;
+            _ = StopClickedAsync();
+        };
         ApplyAccessibility();
         Shown += async (_, _) =>
         {
@@ -270,7 +271,7 @@ internal sealed class HarnessForm : Form
             CancelPendingStart();
             // 之前这里只有 dshProcess?.Dispose()——Dispose 不结束进程，于是关窗后
             // 引擎继续在后台活着、占着端口，下次启动还能被"复用"到，泄漏被完全掩盖。
-            // 关窗 = 退出，就把引擎一起结束；想让它留着跑请用「停止」之外的场景自行启动。
+            // 关窗即退出：把引擎一并结束，不留占端口的后台进程；下次启动会重新拉起。
             StopEngineForExit();
         };
         UpdateButtons();
@@ -394,7 +395,8 @@ internal sealed class HarnessForm : Form
     private async Task StopClickedAsync()
     {
         if (busy) return;
-        EnterBusy(stopButton, "停止中");
+        // 独立停止按钮已并入主按钮（随状态切换语义），停止动作的忙碌态显示在主按钮上。
+        EnterBusy(startButton, "停止中");
         try
         {
             CancelPendingStart();
@@ -668,7 +670,7 @@ internal sealed class HarnessForm : Form
                 status.Text = "已运行";
                 status.ForeColor = WarnColor;
                 info.Text = "端口 3080 正在运行，但认证链接不可用";
-                link.Text = "点击“开始”刷新认证链接";
+                link.Text = "点击“启动”刷新认证链接";
             }
             else if (ownOn)
             {
@@ -683,8 +685,8 @@ internal sealed class HarnessForm : Form
                 status.ForeColor = IdleColor;
                 var engine = ReadEngineVersion(engineDir);
                 info.Text = engine is null
-                    ? "引擎未安装，点击“开始”会自动安装"
-                    : $"引擎 {engine} · 点击“开始”启动";
+                    ? "引擎未安装，点击“启动”会自动安装"
+                    : $"引擎 {engine} · 点击“启动”启动";
                 link.Text = "启动后自动打开认证链接";
             }
             lamp.Invalidate();
@@ -1147,7 +1149,6 @@ internal sealed class HarnessForm : Form
     }
 
     private const int BottomRowHeight = 34;
-    private const int SideMargin = 22;
     /// <summary>
     /// 期望的客户区高度。窗体固定尺寸，这个值决定整体高度。
     /// 注意 MinimumSize/MaximumSize 用的是**窗口**尺寸（含标题栏与边框），
@@ -1177,7 +1178,7 @@ internal sealed class HarnessForm : Form
     {
         var buttons = new List<Button>
         {
-            startButton, stopButton, restartButton,
+            startButton, restartButton,
             refreshButton, envButton, foldersButton, versionsButton, upgradeButton
         };
         var gap = 8;
@@ -1203,10 +1204,7 @@ internal sealed class HarnessForm : Form
             buttons[i].Location = new Point(x, rowY);
             x += widths[i] + gap;
         }
-        bottomRowY = rowY;
     }
-
-    private int bottomRowY = 168;
 
     private static int TextWidth(string text, Font font) =>
         TextRenderer.MeasureText(text, font).Width;
@@ -1257,22 +1255,14 @@ internal sealed class HarnessForm : Form
         LayoutDump.Capture(
             $"{label} Dpi={DeviceDpi} Scale={AutoScaleFactor} Min={MinimumSize.Width}x{MinimumSize.Height}",
             this,
-            startButton, stopButton, restartButton,
+            startButton, restartButton,
             refreshButton, envButton, foldersButton, versionsButton, upgradeButton);
     }
 
     /// <summary>
-    /// 展开/收起动作按钮组：向下多长出一行放「重启」。
-    ///
-    /// 窗体是固定尺寸的，所以要改三处且必须自洽：ClientSize 是客户区，
-    /// MinimumSize/MaximumSize 是**窗口**尺寸（含标题栏与边框）。
-    /// 之前把 MinimumSize 设成了 560x258 而 ClientSize 只有 560x214——
-    /// 最小值比实际还大，窗口被反而挤小，展开行因此溢出客户区。
-    /// 正确的做法是先把 ClientSize 落到目标值，再按算出来的窗口尺寸设最小/最大。
-    /// </summary>
-    /// <summary>
     /// 主按钮的文字随状态变，永远是"当前该点的那个"：未运行→启动，运行中→停止。
-    /// 「停止」和「重启」也各自独立可见可点，所以不需要折叠机制。
+    /// 独立的「停止」按钮已并入主按钮（两套设计叠加时，运行中会出现两个红色「停止」），
+    /// 「重启」保持独立——它在两种状态下都有意义（清掉残留后重新拉起）。
     /// </summary>
     private void ApplyPrimaryActionLabel()
     {
@@ -1313,7 +1303,7 @@ internal sealed class HarnessForm : Form
         {
             using var dialog = new EngineVersionsForm(
                 GetInstalledEngineVersions,
-                version => ActivateEngineVersionAsync(version).GetAwaiter().GetResult(),
+                ActivateEngineVersionAsync,
                 DeleteEngineVersion);
             dialog.ShowDialog(this);
         }
@@ -2279,7 +2269,7 @@ internal sealed class HarnessForm : Form
         {
             try { proc?.Dispose(); } catch { }
             AppendUpdateLog(output.ToString());
-            // 记下"跑过了"，否则每次点「开始」都要付一次 pnpm 的网络往返。
+            // 记下"跑过了"，否则每次点「启动」都要付一次 pnpm 的网络往返。
             // 想每次都跑：删掉 %LOCALAPPDATA%\DeepSeekHarness\lastPluginUpdate.txt
             StampPluginUpdate();
         }
@@ -2288,7 +2278,7 @@ internal sealed class HarnessForm : Form
     /// <summary>
     /// 同一自然日只自动更新一次插件。pnpm update 即便命中热 store 也要 3 秒起，
     /// 遇上 GitHub 依赖超时实测 24 秒、首次拉依赖 3 分 37 秒；而插件一天更新一次
-    /// 和每次启动都更新，实际没有区别。手动点「开始」也受这个节流约束，
+    /// 和每次启动都更新，实际没有区别。手动点「启动」也受这个节流约束，
     /// 需要强制刷新时删掉戳记文件即可。
     /// </summary>
     private int PluginUpdateCooldownHours => 20;
@@ -2444,13 +2434,13 @@ internal sealed class HarnessForm : Form
 
             var engine = ReadEngineVersion(engineDir);
             if (engine is null)
-                issues.Add("DSH 引擎未安装（点「开始」会自动安装，约 1–2 分钟）");
+                issues.Add("DSH 引擎未安装（点「启动」会自动安装，约 1–2 分钟）");
             else
                 sb.AppendLine($"✓ DSH 引擎 {engine}");
 
             var profileReady = File.Exists(Path.Combine(webProfileDir, "package.json"));
             if (!profileReady)
-                issues.Add("profile 未初始化（首次点「开始」会自动完成）");
+                issues.Add("profile 未初始化（首次点「启动」会自动完成）");
 
             // 端口：只有被占才算问题；空闲时不必占一行。
             if (IsPortListening(DefaultPort))
@@ -2503,7 +2493,7 @@ internal sealed class HarnessForm : Form
             if (latestBackup is not null)
                 notes.Add($"配置备份最新一份：{Directory.GetCreationTime(latestBackup):MM-dd HH:mm}");
             else
-                notes.Add("尚无配置备份（点「开始」会自动生成）");
+                notes.Add("尚无配置备份（点「启动」会自动生成）");
 
             // ── 汇总 ────────────────────────────────────────────────────────────
             var head = new StringBuilder();
@@ -2557,7 +2547,7 @@ internal sealed class HarnessForm : Form
             $"目标：{Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}\\.dsh\\\n\n" +
             "只覆盖快照里存在的文件（.credentials.yaml、settings.yaml、各 profile 的 cordis*.yml 等），\n" +
             "不碰 node_modules 与引擎。覆盖前我会先把当前状态另存一份。\n\n" +
-            "恢复后需要重启引擎（点「停止」再点「开始」）才会生效。",
+            "恢复后需要重启引擎（点「停止」再点「启动」）才会生效。",
             "恢复配置备份", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
 
@@ -2571,7 +2561,7 @@ internal sealed class HarnessForm : Form
             return;
         }
         MessageBox.Show(
-            $"已从快照恢复 {count} 个配置文件。\n\n请点「停止」再点「开始」重启引擎使其生效。",
+            $"已从快照恢复 {count} 个配置文件。\n\n请点「停止」再点「启动」重启引擎使其生效。",
             "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
@@ -2720,9 +2710,18 @@ internal sealed class HarnessForm : Form
         // 主按钮的 Tab 顺序按视觉从左到右。
         startButton.TabIndex = 0;
         restartButton.TabIndex = 1;
-        stopButton.TabIndex = 3;
         refreshButton.TabIndex = 4;
         envButton.TabIndex = 5;
+
+        // 悬停提示（读屏走 AccessibleName，普通用户走 tooltip）。之前 ToolTip
+        // 实例化后从没 SetToolTip 过任何控件，纯占资源——现在真的用起来。
+        tooltip.SetToolTip(restartButton, "结束当前引擎并重新启动（会先清理残留进程与端口）");
+        tooltip.SetToolTip(refreshButton, "重新检测引擎状态");
+        tooltip.SetToolTip(envButton, "检测 Node、npm、pnpm、引擎、插件兼容性与端口");
+        tooltip.SetToolTip(foldersButton, "打开 DeepSeek Harness 相关目录一览");
+        tooltip.SetToolTip(versionsButton, "查看/切换/删除本机已安装的引擎版本");
+        tooltip.SetToolTip(upgradeButton, "升级引擎到 npm 上的最新版本（升级前会做插件兼容性检查）");
+        tooltip.SetToolTip(autoUpdateCheckbox, "引擎启动后在后台跑一次 pnpm update；改动下次启动生效，同一自然日只跑一次");
     }
 
     private void ApplyWindowIcon()
@@ -2741,7 +2740,7 @@ internal sealed class HarnessForm : Form
         var url = authenticatedUrl ?? TryReadUrlFile();
         if (url is null)
         {
-            MessageBox.Show("当前没有可用的认证链接，请点击“开始”获取。", "DeepSeek Harness");
+            MessageBox.Show("当前没有可用的认证链接，请点击“启动”获取。", "DeepSeek Harness");
             return;
         }
         OpenBrowser(url);
@@ -2772,19 +2771,14 @@ internal sealed class HarnessForm : Form
     private void EnterBusy(Button active, string text)
     {
         busy = true;
-        startButton.Enabled = restartButton.Enabled = stopButton.Enabled = false;
+        startButton.Enabled = restartButton.Enabled = false;
         upgradeButton.Enabled = false;
         // 引擎运行期间不允许切换版本：切换必须先停引擎，让用户在这里点会与启动流程打架。
         versionsButton.Enabled = false;
         active.Text = text;
-        // 忙碌时按钮文字变成"启动中/停止中"，读屏就再也读不出它是哪个按钮了，
-        // 所以把原语义留在 AccessibleName 里。
-        if (ReferenceEquals(active, startButton)) active.AccessibleName = "开始（" + text + "）";
-        else if (ReferenceEquals(active, restartButton)) active.AccessibleName = "重启（" + text + "）";
-        else if (ReferenceEquals(active, stopButton)) active.AccessibleName = "停止（" + text + "）";
-        else if (ReferenceEquals(active, upgradeButton)) active.AccessibleName = "升级（" + text + "）";
-        else if (ReferenceEquals(active, versionsButton)) active.AccessibleName = "版本管理（" + text + "）";
-        else if (ReferenceEquals(active, foldersButton)) active.AccessibleName = "目录（" + text + "）";
+        // 忙碌时按钮文字变成"启动中/重启中"，读屏就再也读不出它是哪个按钮了；
+        // busyText 本身自描述，直接作为 AccessibleName。
+        active.AccessibleName = text;
         status.Text = text;
         status.ForeColor = WarnColor;
         lamp.Invalidate();
@@ -2793,11 +2787,11 @@ internal sealed class HarnessForm : Form
     private void EndBusy()
     {
         busy = false;
+        // 恢复所有在 EnterBusy 里被改成"xx中"的文字。此前只恢复主按钮与升级，
+        // 点过「重启」后 restartButton 会永远停在"重启中"——回归过一次的坑。
+        restartButton.Text = "重启";
         upgradeButton.Text = "升级";
-        startButton.AccessibleName = "启动 Harness 引擎并打开控制台。回车键等效";
-        restartButton.AccessibleName = "结束当前引擎并重新启动";
-        stopButton.AccessibleName = "停止引擎并释放端口";
-        upgradeButton.AccessibleName = "升级 DSH 引擎到 npm 上的最新版本";
+        // 主按钮的文字/AccessibleName 由 ApplyPrimaryActionLabel 按运行状态恢复。
         UpdateButtons();
     }
 
@@ -2806,7 +2800,6 @@ internal sealed class HarnessForm : Form
         if (busy) return;
         startButton.Enabled = true;
         restartButton.Enabled = true;
-        stopButton.Enabled = isOn;
         upgradeButton.Enabled = true;
         versionsButton.Enabled = true;
         // 主按钮的文字/颜色随运行状态变，这里是唯一会在状态变化后被调用的地方。

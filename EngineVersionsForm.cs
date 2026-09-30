@@ -23,13 +23,13 @@ internal sealed class EngineVersionsForm : Form
     private readonly Button deleteButton = new();
     private readonly Button closeButton = new();
     private readonly Button refreshButton = new();
-    private readonly Func<string, string?> activateVersion;
+    private readonly Func<string, Task<string?>> activateVersion;
     private readonly Action<string> deleteVersion;
     private readonly Func<IReadOnlyList<EngineVersionEntry>> listVersions;
 
     internal EngineVersionsForm(
         Func<IReadOnlyList<EngineVersionEntry>> listVersions,
-        Func<string, string?> activateVersion,
+        Func<string, Task<string?>> activateVersion,
         Action<string> deleteVersion)
     {
         this.listVersions = listVersions;
@@ -110,8 +110,7 @@ internal sealed class EngineVersionsForm : Form
 
     /// <summary>
     /// DSH_LAYOUT_DUMP=1 时在多个尺寸下各排一次并记录几何，用来验证"拉伸后内容是否跟着走"。
-    /// 只靠肉眼看窗口是验证不了这件事的。
-    /// 每个尺寸记录两次（重排前、重排后）会翻倍，所以按"几何真正变化"才再记一次。
+    /// 只靠肉眼看窗口是验证不了这件事的。每个尺寸记录一次。
     /// </summary>
     private void DumpLayoutIfRequested()
     {
@@ -236,7 +235,7 @@ internal sealed class EngineVersionsForm : Form
 
         hint.Text = list.Items.Count switch
         {
-            0 => "没有检测到已安装的引擎。点「开始」会自动安装。",
+            0 => "没有检测到已安装的引擎。点「启动」会自动安装。",
             1 => "只装了一个版本。升级后旧版本会保留在这里，出问题可以切回去。",
             _ => "切换版本不会删除任何东西；删除操作只对未被使用的版本可用。"
         };
@@ -253,27 +252,38 @@ internal sealed class EngineVersionsForm : Form
         deleteButton.Enabled = sel is not null && !sel.IsActive;
     }
 
-    private void ActivateSelected()
+    private async void ActivateSelected()
     {
         var sel = Selected;
         if (sel is null || sel.IsActive) return;
 
         var confirm = MessageBox.Show(
             $"把活动引擎切换到 {sel.Version}？\n\n" +
-            "切换需要引擎处于停止状态。若正在运行，请切换后点主界面的「开始」重新启动。\n" +
-            "当前版本不会被删除，随时可以切回来。",
+            "若引擎正在运行会先停止它（含整个进程树），然后交换目录。\n" +
+            "完成后请回主界面点「启动」以新版本启动。当前版本不会被删除，随时可以切回来。",
             "切换引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
 
-        var error = activateVersion(sel.Version);
+        // 切换是本对话框最重的操作：停引擎（最多等端口关闭 8 秒）+ 两次目录改名。
+        // 之前用 .GetAwaiter().GetResult() 在 UI 线程上同步等，期间两个窗口全部冻结，
+        // 看起来像死机——改成真正的 async，等待期间给出提示、按钮禁用。
+        activateButton.Enabled = deleteButton.Enabled = refreshButton.Enabled = false;
+        hint.Text = $"正在切换到 {sel.Version}…（停引擎 + 换目录，可能需要几秒）";
+
+        string? error;
+        try { error = await activateVersion(sel.Version); }
+        catch (Exception ex) { error = ex.Message; }
+        finally { UpdateButtons(); }
+
         if (error is not null)
         {
+            hint.Text = "切换失败";
             MessageBox.Show(error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
         Reload();
         MessageBox.Show(
-            $"已切换到 {sel.Version}。\n\n请回到主界面点「开始」重启引擎使其生效。",
+            $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
             "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 

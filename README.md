@@ -19,19 +19,21 @@
 ## 怎么用
 
 1. 双击 `DeepSeekHarness.exe`（未签名，第一次会被 SmartScreen 拦一下，点「更多信息 → 仍要运行」）。
-2. **第一次**点「开始」：自动把引擎装到固定目录，需要联网，约 1–2 分钟，界面有进度。
+2. **第一次**点「启动」：自动把引擎装到固定目录，需要联网，约 1–2 分钟，界面有进度。
 3. **之后**每次启动：窗口约 2–3 秒出现，引擎引导约 8–13 秒后浏览器自动打开认证链接
    （引擎引导实测：热缓存 8.2 秒、冷缓存 12.3 秒——这段是 DSH 引擎自己的开销，启动器只是等它）。
    插件更新在引擎起来**之后**才跑，不再拖慢控制台出现的时间。
 
-窗口上的按钮：
+窗口上的按钮（一行七个，尺寸一致）：
 
-- **开始 / 重启 / 停止**：管理引擎进程和端口。
-- **升级引擎**：查 npm 最新版 → 装到 `engine.tmp` → **成功才替换**正式引擎；失败保留当前版本，不影响使用。
+- **启动/停止**（同一个按钮，文字与颜色随运行状态切换：未运行→绿色「启动」，运行中→红色「停止」）与 **重启**：管理引擎进程和端口。
+- **升级**：查 npm 最新版 → 装到 `engine.tmp` → **成功才替换**正式引擎；失败保留当前版本，不影响使用。
+- **版本**：查看/切换/删除本机已安装的引擎版本。升级留下的旧版本保留在 `engine.old`（下次启动归档为 `engine.<版本号>`），插件不兼容时一键切回。
+- **目录**：DeepSeek Harness 相关目录一览（双击在资源管理器里打开）。
 - **启动后更新插件**（复选框）：引擎启动后跑 `pnpm update`，改动在**下次启动**生效。同一自然日只自动跑一次（节流戳记见下表），要强制重跑就删掉 `lastPluginUpdate.txt`。
-- **环境**：一键检查 Node / npm / pnpm / 引擎 / profile / 端口占用，缺什么直接给修复命令。
+- **环境**：检测 Node / npm / pnpm / 引擎 / 插件兼容性 / 端口占用。报告只列结论与需要处理的问题。
 
-键盘：**回车** = 开始，**Esc** = 停止，**Tab** 可遍历所有控件。
+键盘：**回车** = 启动/停止（随主按钮），**Esc** = 停止引擎，**Tab** 可遍历所有控件。
 
 ### 生命周期与单实例
 
@@ -46,14 +48,14 @@
 
 Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` → `%APPDATA%\npm` → `%LOCALAPPDATA%\DeepSeekHarness\node-dir.txt`。
 
-**引擎装在哪、会不会自动更新？** 引擎装在固定目录，启动时直接运行 `node_modules\@deepseek-ai\dsh\lib\bin.js web`，不走 npx、不查版本、不联网重装。所以它**不会**自动跟进新版，想升级就点「升级引擎」。
+**引擎装在哪、会不会自动更新？** 引擎装在固定目录，启动时直接运行 `node_modules\@deepseek-ai\dsh\lib\bin.js web`，不走 npx、不查版本、不联网重装。所以它**不会**自动跟进新版，想升级就点「升级」。
 
 装引擎用的是与 `npx` 内部相同的标准做法：在私有目录里跑一次 `npm install` 再直接执行 `bin.js`。
 区别在于版本是**钉死的**：安装时先查精确版本号，配合 `npm install --save-exact`，所以
 `engine/package.json` 与 `engine/package-lock.json` 记录的版本始终一致，同一份 manifest
 在任何日子重装都得到同一个版本（直接写 `"latest"` 会绕过锁文件、抓到当天最新版，无法复现）。
 
-**npm 源跟随你的配置。** 引擎的安装与「升级引擎」的版本查询都会先读
+**npm 源跟随你的配置。** 引擎的安装与「升级」的版本查询都会先读
 `npm config get registry` 并显式使用它，所以 `npm config set registry https://registry.npmmirror.com`
 对启动器**同样生效**。没配过才回落到官方源 `https://registry.npmjs.org/`。
 读取到的源会做参数校验，含引号或空白的值不采用。
@@ -107,7 +109,11 @@ dotnet publish --configuration Release
 
 ## 文件说明
 
-- `HarnessForm.cs`：界面、进程管理、端口检测、认证 URL 捕获、引擎安装与升级、插件更新节流。
+- `HarnessForm.cs`：主界面、进程管理、端口检测、认证 URL 捕获、引擎安装与升级、插件兼容性检查、配置备份恢复。
+- `EngineVersionsForm.cs`：引擎版本管理窗口（列表 / 切换 / 删除）。
+- `FoldersForm.cs`：相关目录一览窗口。
+- `ConfigBackup.cs`：配置快照（启动前与升级前自动拍摄、按文件哈希去重、一键恢复）。
+- `LayoutDump.cs`：布局自检（`DSH_LAYOUT_DUMP=1` / `DSH_LAYOUT_TEST=1` 时把真实几何写入 `layout-dump.txt`）。
 - `Program.cs`：程序入口、单实例互斥、启动异常兜底（写 `crash-log.txt`）。
 - `app.manifest`：应用清单（asInvoker 不提权、supportedOS 声明、DPI 模式、长路径感知）。
 - `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。

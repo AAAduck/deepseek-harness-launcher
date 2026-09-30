@@ -112,6 +112,9 @@ internal static class ConfigBackup
 
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
             var target = Path.Combine(BackupRoot, stamp);
+            // 同一秒内两次快照会撞目录名（两次快速点「重启」就可能），加序号岔开。
+            for (var n = 2; Directory.Exists(target); n++)
+                target = Path.Combine(BackupRoot, $"{stamp}-{n}");
             Directory.CreateDirectory(target);
 
             foreach (var rel in files)
@@ -157,9 +160,10 @@ internal static class ConfigBackup
     {
         try
         {
+            // 目录名 = yyyyMMdd-HHmmss（15 字符）；撞名时带 "-2" 之类后缀，同样纳入清理。
             var dirs = Directory.GetDirectories(BackupRoot)
                 .Select(d => new DirectoryInfo(d))
-                .Where(d => d.Name.Length == 15 && d.Name[8] == '-')   // yyyyMMdd-HHmmss
+                .Where(d => d.Name.Length >= 15 && d.Name[8] == '-')
                 .OrderByDescending(d => d.Name)
                 .ToList();
             foreach (var old in dirs.Skip(KeepSnapshots))
@@ -178,7 +182,7 @@ internal static class ConfigBackup
             if (!Directory.Exists(BackupRoot)) return null;
             return Directory.GetDirectories(BackupRoot)
                 .Select(d => new DirectoryInfo(d))
-                .Where(d => d.Name.Length == 15 && d.Name[8] == '-')
+                .Where(d => d.Name.Length >= 15 && d.Name[8] == '-')
                 .OrderByDescending(d => d.Name)
                 .FirstOrDefault()?.FullName;
         }

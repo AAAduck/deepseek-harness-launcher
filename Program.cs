@@ -78,7 +78,7 @@ internal static class Program
 
         using (var versions = new EngineVersionsForm(
                    () => Array.Empty<EngineVersionEntry>(),
-                   _ => null,
+                   _ => Task.FromResult<string?>(null),
                    _ => { }))
         {
             versions.Show();
