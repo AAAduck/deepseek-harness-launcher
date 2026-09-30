@@ -221,6 +221,7 @@ internal sealed class FoldersForm : Form
             new("引擎（上一版本）", Path.Combine(appDir, "engine.old"), "升级前的备份，可回退", false),
             new("配置备份", Path.Combine(appDir, "config-backups"), "启动器自动拍的配置快照", false),
             new("认证链接", Path.Combine(appDir, "web-url.txt"), "含 token 的本地链接", true),
+            new("引擎输出日志", Path.Combine(appDir, "engine-stdio.log"), "引擎 stdout/stderr（每次重新拉起时重开）", true),
             new("更新日志", Path.Combine(appDir, "update-log.txt"), "插件更新的输出", true),
             new("会话记录", Path.Combine(dshHome, "sessions"), "历史对话", false),
             new("附件", Path.Combine(dshHome, "attachments"), "上传的图片等", false),

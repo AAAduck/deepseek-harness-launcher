@@ -5,31 +5,29 @@ rem 用脚本所在目录定位，不硬编码绝对路径——挪目录/拷给
 set "ROOT=%~dp0"
 set "STAGED=%LOCALAPPDATA%\DeepSeekHarness\update-staging\DeepSeekHarness.exe"
 
-rem ── 本脚本的真实行为（2026-10 本机实测，别抱幻想）─────────────────────────
-rem 引擎的 stdout/stderr 管道读端挂在启动器进程上。taskkill /f 杀掉启动器后，
-rem 管道断裂，node 引擎在**下一次写日志时**即被 EPIPE 带崩（实测约 1 秒内
-rem EXIT code=1）。所以本脚本会短暂打断 Web UI，做不到"引擎原地无感存活"。
-rem 脚本的实际价值是：
-rem   ① 时机由你选——在**空闲时段**手动执行，把打断成本压到零；
-rem   ② 只按映像名杀 DeepSeekHarness.exe，精确、可重跑、失败分支不伤引擎；
-rem   ③ 新实例起来后走自动流程：探针失败 → 停残留 → 重新拉起引擎 →
-rem      新认证链接自动开浏览器；会话历史在盘上，接续不丢。
-rem （真想做到更新零打断，需要把引擎 stdio 从启动器剥离成日志文件——见 README
-rem   「已知限制」，那是代码层面的改造，不是脚本能解决的。）
-echo 即将把启动器更新到 1.2.0（审查修复轮：PATH 覆盖 / 过期链接 / 进程缓存 / 误触恢复 等）。
-echo 提醒：更新会短暂打断 Web UI（实测引擎约 1 秒内随断管退出），请确认当前没有
-echo 正在跑的对话再执行；新启动器会自动重拉引擎，历史会话不丢。
+rem ── 本脚本的机制（1.3.0 起，本机实测验证）─────────────────────────────────
+rem 引擎的 stdout/stderr 已从管道改为 engine-stdio.log 文件（启动器 tail 文件捕获
+rem 认证链接与进度），引擎的生死与启动器解耦。所以：
+rem   ① taskkill /f 只按映像名杀 DeepSeekHarness.exe（绝不碰 node.exe）——
+rem      引擎与 3080 上的 Web 会话原样存活；
+rem   ② 新实例起来后探到 web-url.txt 的链接仍可用，直接复用引擎、打开浏览器，
+rem      全程无感（实测：模拟启动器强杀后引擎持续存活写日志）；
+rem   ③ 例外：从管道耦合的旧版跨进 1.3.0 的【首次】更新，旧引擎仍会随断管退出，
+rem      新实例自动走完整重启（十几秒，会话历史在盘上不丢）。这一次之后皆无感。
+echo 即将把启动器更新到 1.3.0（无感更新：引擎 stdio 文件化，不再随启动器陪葬）。
+echo Web 会话不会中断（首次从旧版迁移除外，那会重启一次引擎、历史不丢）。
 echo.
 
 if not exist "%STAGED%" (
   echo 找不到待更新的启动器：
   echo   %STAGED%
   echo 请先把新版本 exe 放进 update-staging\ 目录，再运行本脚本。
+  echo （引擎没被动过，当前一切照旧。）
   pause
   exit /b 1
 )
 
-echo 按任意键开始更新（建议先关掉/暂停浏览器里的会话页）...
+echo 按任意键开始更新（浏览器里的会话不用关）...
 pause >nul
 taskkill /im DeepSeekHarness.exe /f >nul 2>&1
 timeout /t 2 /nobreak >nul
@@ -37,10 +35,11 @@ copy /y "%STAGED%" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe
 if errorlevel 1 (
   echo 复制到 bin\Release 失败：目标 exe 可能仍被占用。
   echo 旧启动器可能没被杀干净——确认 DeepSeekHarness.exe 已退出后重跑脚本。
+  echo （引擎不受影响，会话不会因此中断。）
   pause
   exit /b 1
 )
 copy /y "%STAGED%" "%ROOT%DeepSeekHarness.exe" >nul 2>&1
 if errorlevel 1 echo （提示：脚本旁边的桌面副本没更新成功，不影响本次启动，可之后手动复制。）
-echo 更新完成，正在启动新版本（它会重新拉起引擎并自动打开认证链接）...
+echo 更新完成，正在启动新版本（会自动接上还在跑的引擎）...
 start "" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"

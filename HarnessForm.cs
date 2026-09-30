@@ -88,6 +88,17 @@ internal sealed class HarnessForm : Form
     private Process? dshProcess;
     private CancellationTokenSource? startCts;
     private readonly List<string> recentOutput = new();
+    // ── 引擎 stdio 文件化（与启动器生死解耦）──────────────────────────────
+    // 原来的管道模式里，读端挂在启动器进程上：启动器一死（强杀/崩溃/更新），
+    // 引擎下一次写日志就随断管退出（本机实测 ~1 秒 EXIT code=1）。
+    // 现在引擎经 cmd 把 stdout/stderr 重定向进 engine-stdio.log，本进程按增量
+    // tail 读文件复现代替管道事件。效果：引擎不再随启动器陪葬——更新/崩溃后
+    // 新实例探到 web-url.txt 仍可用就直接复用还在跑的引擎，Web 会话零打断。
+    private static readonly string engineStdioLog = Path.Combine(LocalAppDir, "engine-stdio.log");
+    private long engineLogPos;                                  // tail 已读到的字节偏移
+    private Decoder engineLogDecoder = Encoding.UTF8.GetDecoder();
+    private string engineLogRemainder = string.Empty;           // 未完成的半行
+    private int engineTailToken;                                // 代际标记：新引擎起跑后旧循环自行退场
     private string? authenticatedUrl;
     private bool isOn;
     private bool busy;
@@ -469,17 +480,31 @@ internal sealed class HarnessForm : Form
                 (hint is null ? string.Empty : "\n\n" + hint));
         }
 
+        // 引擎 stdio 文件化：经 cmd 把 stdout/stderr 追加重定向进 engine-stdio.log。
+        // 不再用管道的理由见字段区注释（启动器死亡 → 断管 → 引擎陪葬，实测 ~1 秒）。
+        // 只在这次**真的**要拉新引擎时才重开日志文件；复用路径到不了这里。
+        // 先起代际令牌：旧引擎的 tail 循环随即退场，再复位读取状态。
+        var tailToken = ++engineTailToken;
+        engineLogPos = 0;
+        engineLogDecoder = Encoding.UTF8.GetDecoder();
+        engineLogRemainder = string.Empty;
+        try
+        {
+            Directory.CreateDirectory(LocalAppDir);
+            if (File.Exists(engineStdioLog)) File.Delete(engineStdioLog);
+        }
+        catch { }
+
         var psi = new ProcessStartInfo
         {
-            FileName = node,
-            Arguments = $"\"{EngineEntryScript}\" web --no-open --host 127.0.0.1 --port {DefaultPort}",
+            FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+            // /s：整条外层引号原样交给 cmd；>> 与 2>&1 由 cmd 完成，node 拿到的是文件句柄。
+            Arguments = "/d /s /c \"\"" + node + "\" \"" + EngineEntryScript +
+                        "\" web --no-open --host 127.0.0.1 --port " + DefaultPort +
+                        " >> \"" + engineStdioLog + "\" 2>&1\"",
             WorkingDirectory = workDir,
             UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8
+            CreateNoWindow = true
         };
         psi.Environment["DSH_HOME"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
         // 必须读**父进程**的 PATH：psi.Environment 是子进程环境的"覆盖表"，初始为空，
@@ -493,8 +518,6 @@ internal sealed class HarnessForm : Form
         ConfigureOptionalProxy(psi);
 
         var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        process.OutputDataReceived += (_, e) => HandleProcessLine(e.Data);
-        process.ErrorDataReceived += (_, e) => HandleProcessLine(e.Data);
         process.Exited += (_, _) =>
         {
             if (closing || IsDisposed) return;
@@ -505,8 +528,8 @@ internal sealed class HarnessForm : Form
         };
         if (!process.Start()) throw new InvalidOperationException("无法启动 DSH 引擎。");
         dshProcess = process;
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
+        // 文件 tail 替代原来的管道事件：认证链接捕获、进度行、recentOutput 摘要都走它。
+        _ = EngineTailLoopAsync(process, tailToken);
 
         var started = DateTime.UtcNow;
         var deadline = started + TimeSpan.FromSeconds(StartTimeoutSeconds);
@@ -531,7 +554,8 @@ internal sealed class HarnessForm : Form
                 var summary = RecentOutputSummary();
                 if (summary.Contains("未输出任何日志"))
                 {
-                    summary += "\n（提示：若引擎是被杀掉的，它来不及输出；可点「环境」查看引擎与 Node 状态，" +
+                    summary += "\n（引擎输出已改到日志文件，可直接打开查看：" + engineStdioLog +
+                              "；也可点「环境」查看引擎与 Node 状态，" +
                               $"或手动执行 node \"{EngineEntryScript}\" web --no-open --port {DefaultPort} 复现）";
                 }
                 throw new InvalidOperationException(
@@ -620,6 +644,87 @@ internal sealed class HarnessForm : Form
             });
         }
         catch { }
+    }
+
+    /// <summary>
+    /// engine-stdio.log 的增量读取：每 250ms 把新字节解码、按行喂给
+    /// <see cref="HandleProcessLine"/>——替代原来的 stdout/stderr 管道事件。
+    /// 退出时代际令牌一换，上一任循环自行收工；进程退出后再把尾巴读干净
+    /// （崩溃前的最后几行日志就在那里，"启动失败"摘要全靠它）。
+    /// 整段自吞异常：这是个后台循环，任何一轮读失败下一轮继续即可。
+    /// </summary>
+    private async Task EngineTailLoopAsync(Process process, int token)
+    {
+        var buffer = new byte[16 * 1024];
+        while (true)
+        {
+            if (token != engineTailToken) return;
+            try
+            {
+                FeedEngineLogChunk(buffer);
+            }
+            catch { }
+
+            if (token != engineTailToken) return;
+            if (ProcessHasExited(process))
+            {
+                // 退出检测与文件写入之间总有先后差：最后多读几轮，把没落完的日志收干净。
+                for (var drain = 0; drain < 4; drain++)
+                {
+                    try { if (FeedEngineLogChunk(buffer) == 0) break; } catch { break; }
+                    await Task.Delay(150);
+                }
+                return;
+            }
+            await Task.Delay(250);
+        }
+    }
+
+    /// <summary>把新增字节解码成字符并按行分发；返回本次分发的行数（供退场判断）。</summary>
+    private int FeedEngineLogChunk(byte[] buffer)
+    {
+        if (!File.Exists(engineStdioLog)) return 0;
+        using var fs = new FileStream(engineStdioLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        if (fs.Length < engineLogPos)
+        {
+            // 文件被重开/清空（下次启动会删掉重建）：偏移与解码状态全部复位。
+            engineLogPos = 0;
+            engineLogDecoder = Encoding.UTF8.GetDecoder();
+            engineLogRemainder = string.Empty;
+        }
+        if (fs.Length == engineLogPos) return 0;
+        fs.Seek(engineLogPos, SeekOrigin.Begin);
+
+        var lines = 0;
+        int len;
+        while ((len = fs.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            engineLogPos += len;
+            var chars = new char[engineLogDecoder.GetCharCount(buffer, 0, len)];
+            var n = engineLogDecoder.GetChars(buffer, 0, len, chars, 0);
+            lines += DispatchEngineLogText(new string(chars, 0, n));
+        }
+        return lines;
+    }
+
+    private int DispatchEngineLogText(string text)
+    {
+        var data = engineLogRemainder + text;
+        var cut = data.LastIndexOf('\n');
+        if (cut < 0)
+        {
+            // 一行迟迟不成形（引擎理论上不会这样，防超长行撑爆内存）：留尾巴，丢旧头。
+            engineLogRemainder = data.Length > 16 * 1024 ? data[^8192..] : data;
+            return 0;
+        }
+        engineLogRemainder = data.Substring(cut + 1);
+        var lines = 0;
+        foreach (var raw in data.Substring(0, cut + 1).Split('\n'))
+        {
+            lines++;
+            HandleProcessLine(raw.TrimEnd('\r'));
+        }
+        return lines;
     }
 
     // ---- 状态刷新 -----------------------------------------------------------
