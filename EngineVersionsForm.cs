@@ -16,21 +16,33 @@ namespace DeepSeekHarness;
 /// </summary>
 internal sealed class EngineVersionsForm : Form
 {
+    // 字体与主窗体同一个道理：外部 new 的 Font 不随控件释放，四个按钮各 new 一份
+    // 就是每次开窗漏四个 GDI 句柄（见 HarnessForm.UiFont 处的注释）。这里共享一份。
+    // 注意：这份静态 Font **刻意不在任何 Dispose 里释放**——共享单例要随进程存活
+    // （后续销毁流程中的控件仍可能引用它）。改代码时别"好心"回收。
+    private static readonly Font BodyFont = new("Microsoft YaHei UI", 9f);
+    private static readonly Font BoldFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
+    private static readonly Font TitleFont = new("Microsoft YaHei UI", 10f, FontStyle.Bold);
+
     private readonly Label title = new();
     private readonly ListView list = new();
     private readonly Label hint = new();
-    private readonly Button activateButton = new();
-    private readonly Button deleteButton = new();
-    private readonly Button closeButton = new();
-    private readonly Button refreshButton = new();
+    // 按钮不给初始化器：构造函数里一律用 NewButton 赋值。留个 `= new()` 只会让每次
+    // 构造都白造四个永不加入 Controls 的孤立 Button（连带四个 Font），纯浪费。
+    private readonly Button activateButton;
+    private readonly Button deleteButton;
+    private readonly Button closeButton;
+    private readonly Button refreshButton;
+    private readonly Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions;
     private readonly Func<string, Task<string?>> activateVersion;
-    private readonly Action<string> deleteVersion;
-    private readonly Func<IReadOnlyList<EngineVersionEntry>> listVersions;
+    private readonly Func<string, Task<string?>> deleteVersion;
+    /// <summary>正在跑一个异步操作（读取/切换/删除）。防重入，同时统一管按钮可用性。</summary>
+    private bool busy;
 
     internal EngineVersionsForm(
-        Func<IReadOnlyList<EngineVersionEntry>> listVersions,
+        Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions,
         Func<string, Task<string?>> activateVersion,
-        Action<string> deleteVersion)
+        Func<string, Task<string?>> deleteVersion)
     {
         this.listVersions = listVersions;
         this.activateVersion = activateVersion;
@@ -48,13 +60,13 @@ internal sealed class EngineVersionsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         BackColor = Color.White;
-        Font = new Font("Microsoft YaHei UI", 9f);
+        Font = BodyFont;
 
         title.Text = "本机已安装的 DSH 引擎版本";
         title.Location = new Point(16, 10);
         // AutoSize 而非硬编码宽度：窗口变窄时固定宽度会溢出客户区。
         title.AutoSize = true;
-        title.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+        title.Font = TitleFont;
         title.Anchor = AnchorStyles.Top | AnchorStyles.Left;
         Controls.Add(title);
 
@@ -91,9 +103,11 @@ internal sealed class EngineVersionsForm : Form
         Controls.Add(closeButton);
 
         refreshButton = NewButton("刷新", Color.FromArgb(58, 124, 240));
-        refreshButton.Click += (_, _) => Reload();
+        refreshButton.Click += (_, _) => _ = ReloadAsync();
         Controls.Add(refreshButton);
         CancelButton = closeButton;
+        // "切换到此版本"是本窗的主操作，之前只设了 CancelButton，键盘用户按回车没反应。
+        AcceptButton = activateButton;
 
         // 真正自适应的布局：列表吃掉中间的剩余高度，提示与按钮锚在底部。
         Resize += (_, _) =>
@@ -103,31 +117,14 @@ internal sealed class EngineVersionsForm : Form
                 title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
         };
         ApplyResponsiveLayout();
-        DumpLayoutIfRequested();
-
-        Reload();
+        _ = ReloadAsync();
     }
 
     /// <summary>
-    /// DSH_LAYOUT_DUMP=1 时在多个尺寸下各排一次并记录几何，用来验证"拉伸后内容是否跟着走"。
-    /// 只靠肉眼看窗口是验证不了这件事的。每个尺寸记录一次。
+    /// 布局自检不再挂在本窗体的 Shown 上（DSH_LAYOUT_DUMP=1 时那个处理器会直接
+    /// Close() 掉自己，导致误设环境变量时"版本管理"窗口一闪即消）。
+    /// 独立入口在 Program.RunLayoutSelfTest：它在窗体外部遍历各尺寸后自行关闭。
     /// </summary>
-    private void DumpLayoutIfRequested()
-    {
-        if (!LayoutDump.Enabled) return;
-        Shown += (_, _) =>
-        {
-            var sizes = new[] { new Size(560, 250), new Size(560, 380), new Size(780, 300), new Size(430, 214) };
-            foreach (var size in sizes)
-            {
-                ClientSize = size;
-                ApplyResponsiveLayout();
-                LayoutDump.Capture($"版本管理 高={size.Height}", this,
-                    title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
-            }
-            Close();
-        };
-    }
 
     private Button NewButton(string text, Color backColor)
     {
@@ -138,7 +135,7 @@ internal sealed class EngineVersionsForm : Form
             FlatStyle = FlatStyle.Flat,
             BackColor = backColor,
             ForeColor = Color.White,
-            Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold),
+            Font = BoldFont,
             Cursor = Cursors.Hand,
             AccessibleName = text
         };
@@ -165,17 +162,23 @@ internal sealed class EngineVersionsForm : Form
     /// </summary>
     private void ApplyResponsiveLayout()
     {
-        var bottomArea = HintHeight + BottomPad + ButtonHeight + BottomPad / 2 + 8;
-        var listHeight = Math.Max(56, ClientSize.Height - ListTop - bottomArea);
+        // 提示与按钮行都从客户区**底边反推**，不再依赖 list.Bottom：
+        // 列表高度有下限保护，窗口被压到 MinimumSize 时它会被撑大，
+        // 若提示的 y 取自 list.Bottom 就会和按钮行叠在一起。
+        var rowY = ClientSize.Height - ButtonHeight - BottomPad;
+        var hintY = rowY - Gap - HintHeight;
+
+        // 列表吃掉中间的剩余高度；上限同样由底边决定，保证不盖住提示。
+        var maxList = Math.Max(40, hintY - Gap - ListTop);
+        var listHeight = Math.Clamp(
+            ClientSize.Height - ListTop - (HintHeight + Gap + ButtonHeight + BottomPad), 40, maxList);
 
         list.Location = new Point(SidePad, ListTop);
         list.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), listHeight);
 
-        var hintY = list.Bottom + 8;
         hint.Location = new Point(SidePad, hintY);
         hint.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), HintHeight);
 
-        var rowY = ClientSize.Height - ButtonHeight - BottomPad;
         LayoutButtons(rowY);
     }
 
@@ -210,52 +213,102 @@ internal sealed class EngineVersionsForm : Form
     internal Control[] DumpControls() =>
         new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
 
-    private void Reload()
-    {
-        list.BeginUpdate();
-        list.Items.Clear();
-        foreach (var entry in listVersions())
-        {
-            var item = new ListViewItem(entry.Version);
-            item.SubItems.Add(entry.IsActive ? "● 使用中" : "可切换");
-            item.SubItems.Add(entry.SizeBytes > 0 ? $"{entry.SizeBytes / 1024.0 / 1024.0:N0} MB" : "—");
-            item.SubItems.Add(entry.InstalledAt.ToString("yyyy-MM-dd HH:mm"));
-            item.Tag = entry;
-            if (entry.IsActive) item.ForeColor = Color.FromArgb(34, 120, 60);
-            list.Items.Add(item);
-        }
-        list.EndUpdate();
-
-        // 默认选中活动版本，方便一眼看到"现在用的是哪个"
-        if (list.Items.Count > 0)
-        {
-            var active = list.Items.Cast<ListViewItem>().FirstOrDefault(i => ((EngineVersionEntry)i.Tag!).IsActive);
-            (active ?? list.Items[0]).Selected = true;
-        }
-
-        hint.Text = list.Items.Count switch
-        {
-            0 => "没有检测到已安装的引擎。点「启动」会自动安装。",
-            1 => "只装了一个版本。升级后旧版本会保留在这里，出问题可以切回去。",
-            _ => "切换版本不会删除任何东西；删除操作只对未被使用的版本可用。"
-        };
-        UpdateButtons();
-    }
-
     private EngineVersionEntry? Selected =>
-        list.SelectedItems.Count > 0 ? list.SelectedItems[0].Tag as EngineVersionEntry : null;
+        !IsDisposed && list.SelectedItems.Count > 0
+            ? list.SelectedItems[0].Tag as EngineVersionEntry
+            : null;
 
     private void UpdateButtons()
     {
+        if (busy || IsDisposed) return;
         var sel = Selected;
         activateButton.Enabled = sel is not null && !sel.IsActive;
         deleteButton.Enabled = sel is not null && !sel.IsActive;
     }
 
+    /// <summary>
+    /// 统一管理忙碌态下的控件可用性。**「刷新」必须在这里显式恢复**：
+    /// 之前它只出现在"被禁用"的那一行里，点过一次「切换」之后就永久变灰了，
+    /// 而失败分支又不刷新列表，窗口就卡在"切换失败 + 不能刷新"的状态。
+    /// </summary>
+    private void SetBusy(bool value)
+    {
+        if (IsDisposed) return;
+        busy = value;
+        // 列表也要禁用：按钮禁用挡不住双击，而并发两次目录交换会抢同一个 engine 目录。
+        list.Enabled = !value;
+        refreshButton.Enabled = !value;
+        activateButton.Enabled = !value;
+        deleteButton.Enabled = !value;
+        if (!value) UpdateButtons();
+    }
+
+    /// <summary>
+    /// 重新读取列表。列举版本要递归遍历每个引擎目录的 node_modules（本机实测 2.5 万个文件），
+    /// 所以委托是异步的、整体放在后台线程——这里原本是同步调用，窗口一打开就冻结数秒
+    /// 并被 Windows 判为未响应，而那时对话框连沙漏都来不及画出来。
+    /// </summary>
+    private async Task ReloadAsync()
+    {
+        if (busy || IsDisposed) return;
+
+        SetBusy(true);
+        hint.Text = "正在读取已安装的引擎版本…";
+        try
+        {
+            // 先取数据再 BeginUpdate：委托要遍历磁盘，不能让它夹在 Begin/EndUpdate 中间，
+            // 一旦抛异常 ListView 就永远停在更新态。
+            var entries = await listVersions();
+
+            // await 期间用户可能关了窗：主窗体那边是 using var dialog + ShowDialog，
+            // 窗口一返回就 Dispose，此后任何控件访问都是 ObjectDisposedException。
+            if (IsDisposed || !IsHandleCreated) return;
+
+            list.BeginUpdate();
+            try
+            {
+                list.Items.Clear();
+                foreach (var entry in entries)
+                {
+                    var item = new ListViewItem(entry.Version);
+                    item.SubItems.Add(entry.IsActive ? "● 使用中" : "可切换");
+                    item.SubItems.Add(entry.SizeBytes > 0 ? $"{entry.SizeBytes / 1024.0 / 1024.0:N0} MB" : "—");
+                    item.SubItems.Add(entry.InstalledAt.ToString("yyyy-MM-dd HH:mm"));
+                    item.Tag = entry;
+                    if (entry.IsActive) item.ForeColor = Color.FromArgb(34, 120, 60);
+                    list.Items.Add(item);
+                }
+            }
+            finally { list.EndUpdate(); }
+
+            // 默认选中活动版本，方便一眼看到"现在用的是哪个"
+            if (list.Items.Count > 0)
+            {
+                var active = list.Items.Cast<ListViewItem>().FirstOrDefault(i => ((EngineVersionEntry)i.Tag!).IsActive);
+                (active ?? list.Items[0]).Selected = true;
+            }
+
+            hint.Text = list.Items.Count switch
+            {
+                0 => "没有检测到已安装的引擎。点「启动」会自动安装。",
+                1 => "只装了一个版本。升级后旧版本会保留在这里，出问题可以切回去。",
+                _ => "切换版本不会删除任何东西；删除操作只对未被使用的版本可用。"
+            };
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed) hint.Text = "读取版本列表失败：" + ex.Message;
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
     private async void ActivateSelected()
     {
         var sel = Selected;
-        if (sel is null || sel.IsActive) return;
+        if (sel is null || sel.IsActive || busy) return;
 
         var confirm = MessageBox.Show(
             $"把活动引擎切换到 {sel.Version}？\n\n" +
@@ -263,34 +316,41 @@ internal sealed class EngineVersionsForm : Form
             "完成后请回主界面点「启动」以新版本启动。当前版本不会被删除，随时可以切回来。",
             "切换引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
+        if (IsDisposed) return;
 
         // 切换是本对话框最重的操作：停引擎（最多等端口关闭 8 秒）+ 两次目录改名。
         // 之前用 .GetAwaiter().GetResult() 在 UI 线程上同步等，期间两个窗口全部冻结，
         // 看起来像死机——改成真正的 async，等待期间给出提示、按钮禁用。
-        activateButton.Enabled = deleteButton.Enabled = refreshButton.Enabled = false;
+        SetBusy(true);
         hint.Text = $"正在切换到 {sel.Version}…（停引擎 + 换目录，可能需要几秒）";
 
         string? error;
         try { error = await activateVersion(sel.Version); }
         catch (Exception ex) { error = ex.Message; }
-        finally { UpdateButtons(); }
 
+        // 等待期间用户可以点「关闭」或标题栏 X。主窗体那边是 using var dialog + ShowDialog，
+        // 窗口一返回就 Dispose；此后再碰控件就是 ObjectDisposedException，从 async void
+        // 抛出无人接管会直接崩掉进程——而切换其实早就成功了。
+        if (IsDisposed || !IsHandleCreated) return;
+
+        SetBusy(false);
         if (error is not null)
         {
-            hint.Text = "切换失败";
+            hint.Text = "切换失败：" + error;
             MessageBox.Show(error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
-        Reload();
+        await ReloadAsync();
+        if (IsDisposed || !IsHandleCreated) return;
         MessageBox.Show(
             $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
             "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private void DeleteSelected()
+    private async void DeleteSelected()
     {
         var sel = Selected;
-        if (sel is null || sel.IsActive) return;
+        if (sel is null || sel.IsActive || busy) return;
 
         var confirm = MessageBox.Show(
             $"删除引擎版本 {sel.Version}？\n\n" +
@@ -299,9 +359,26 @@ internal sealed class EngineVersionsForm : Form
             "\n此操作不可恢复（该版本需要时可重新安装）。",
             "删除引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
+        if (IsDisposed) return;
 
-        deleteVersion(sel.Version);
-        Reload();
+        // 删除整棵 node_modules（2.5 万个文件）是秒级操作，所以委托是异步的。
+        SetBusy(true);
+        hint.Text = $"正在删除 {sel.Version}…（清理上万个文件，可能需要几秒）";
+
+        string? error;
+        try { error = await deleteVersion(sel.Version); }
+        catch (Exception ex) { error = ex.Message; }
+
+        if (IsDisposed || !IsHandleCreated) return;
+
+        SetBusy(false);
+        if (error is not null)
+        {
+            hint.Text = "删除失败：" + error;
+            MessageBox.Show(error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        await ReloadAsync();
     }
 }
 

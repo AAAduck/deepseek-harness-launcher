@@ -15,6 +15,12 @@ internal static class Program
     /// </summary>
     private static Mutex? singleInstanceMutex;
 
+    /// <summary>
+    /// 本实例是否真的**持有**互斥体。named Mutex 在"已存在"时构造函数不会取得所有权，
+    /// 无主 ReleaseMutex 只会抛异常再被吞掉——所有权标志记下来，退出时只释放该我们释放的。
+    /// </summary>
+    private static bool ownsSingleInstanceMutex;
+
     [STAThread]
     private static void Main()
     {
@@ -56,7 +62,8 @@ internal static class Program
         }
         finally
         {
-            try { singleInstanceMutex?.ReleaseMutex(); } catch { }
+            if (ownsSingleInstanceMutex)
+                try { singleInstanceMutex?.ReleaseMutex(); } catch { }
             try { singleInstanceMutex?.Dispose(); } catch { }
         }
     }
@@ -77,9 +84,9 @@ internal static class Program
         catch { }
 
         using (var versions = new EngineVersionsForm(
-                   () => Array.Empty<EngineVersionEntry>(),
+                   () => Task.FromResult<IReadOnlyList<EngineVersionEntry>>(Array.Empty<EngineVersionEntry>()),
                    _ => Task.FromResult<string?>(null),
-                   _ => { }))
+                   _ => Task.FromResult<string?>(null)))
         {
             versions.Show();
             Application.DoEvents();
@@ -114,11 +121,13 @@ internal static class Program
         try
         {
             singleInstanceMutex = new Mutex(initiallyOwned: true, @"Local\DeepSeekHarness.Launcher", out var createdNew);
+            ownsSingleInstanceMutex = createdNew;
             return createdNew;
         }
         catch (AbandonedMutexException)
         {
             // 上一个实例是被强杀的：互斥体归我们，继续启动。
+            ownsSingleInstanceMutex = true;
             return true;
         }
         catch
@@ -136,14 +145,20 @@ internal static class Program
     {
         try
         {
-            foreach (var process in Process.GetProcessesByName("DeepSeekHarness"))
+            // Process 对象持有内核句柄，不 Dispose 要等 GC 才释放——这里必须显式收掉，
+            // 漏掉的那几个会一直挂在进程表里。
+            var candidates = Process.GetProcessesByName("DeepSeekHarness");
+            foreach (var process in candidates)
             {
-                if (process.Id == Environment.ProcessId) continue;
-                var handle = process.MainWindowHandle;
-                if (handle == IntPtr.Zero) continue;
-                if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
-                SetForegroundWindow(handle);
-                return;
+                using (process)
+                {
+                    if (process.Id == Environment.ProcessId) continue;
+                    var handle = process.MainWindowHandle;
+                    if (handle == IntPtr.Zero) continue;
+                    if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
+                    SetForegroundWindow(handle);
+                    return;
+                }
             }
         }
         catch { }

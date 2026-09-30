@@ -16,7 +16,9 @@ internal sealed class HarnessForm : Form
 {
     private const int DefaultPort = 3080;
     private const int ProxyPort = 7897;
-    // 引擎首次安装到固定目录实测约 91 秒（慢网络会更久），120 秒会把正常安装误判成失败。
+    // 引擎安装耗时随网络波动很大：本机实测 537 个包约 67 秒，走 npx 的那次（要联网
+    // 重新解析整棵树）到过 91 秒。所以安装超时给到 900 秒——早期版本的 120 秒会把
+    // 慢网络下的正常安装直接误判成失败。
     private const int StartTimeoutSeconds = 600;
     private const int UpdateTimeoutSeconds = 600;
     private const int EngineInstallTimeoutSeconds = 900;
@@ -163,12 +165,12 @@ internal sealed class HarnessForm : Form
         autoUpdateCheckbox.CheckedChanged += (_, _) => SaveAutoUpdateSetting();
         panel.Controls.Add(autoUpdateCheckbox);
 
-        // ── 底部一行：8 个按钮全部同尺寸排成一行 ─────────────────────────────────
+        // ── 底部一行：7 个按钮全部同尺寸排成一行 ─────────────────────────────────
         // 演化过程（每一步都由实测数据推动，不是拍脑袋）：
         //  ① 最初 6 个主按钮各 94px 挤一行（右边界 524/560），调用频率天差地别的操作占同样宽度；
         //  ② 加目录/版本/升级后彻底排不下，做过"折叠 + 向下展开"；
         //  ③ 但那样主按钮只有 2 个字却占了 324px 宽（还用了 10pt），比旁边按钮大 6 倍——
-        //     把主按钮缩到与其余按钮完全一致后，8 个按钮反而能一行放下。
+        //     把主按钮缩到与其余按钮完全一致后，7 个按钮反而能一行放下。
         // 实测（9pt 粗体）：所有两字按钮文字都是 32px，加 20px 内边距 = 52px；
         // 8 × 52 + 7 × 8 = 472px，可用 496px。所以折叠机制被整个删掉了——
         // 能一行放下就不需要它，少一个交互状态也少一处出错的地方。
@@ -316,10 +318,13 @@ internal sealed class HarnessForm : Form
             // 此前是「pnpm update → 等它跑完 → 才启动引擎」，于是启动被硬生生推迟
             // 一整个 pnpm 往返（本机实测热 store 3.2 秒、GitHub 依赖超时 24 秒、
             // 首次拉依赖 3 分 37 秒），而这段时间用户盯着的只是一个没有任何进展的窗口。
-            // 现在引擎启动与插件更新并行，插件的生效时机是「下次启动」——
-            // 本来 pnpm update 也要重启才生效，所以这里没有语义损失。
+            // 两个 Task 仍然同时创建，但插件更新在内部先等引擎启动收敛才动
+            // profiles\node_modules：引擎引导时会重建 profile 的模块链接（用
+            // node_modules.lock 串行化），pnpm update 不认那个锁、直接写同一棵树，
+            // 首启/刚升级时重建窗口最长，并发就是真实的踩踏风险。
+            // 插件的生效时机本就是「下次启动」，这里没有语义损失。
             var startTask = StartHarnessAsync(cts.Token);
-            var pluginTask = UpdatePluginsAfterStartAsync(cts.Token);
+            var pluginTask = UpdatePluginsAfterStartAsync(startTask, cts.Token);
             await startTask;
             if (cts.IsCancellationRequested) return;
 
@@ -351,13 +356,19 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>
-    /// 插件更新任务：刻意不在 RunStartAsync 开头就 await，而是让它在引擎启动的同时
-    /// 先跑起来（详见 RunStartAsync 里的顺序说明）。
+    /// 插件更新任务：与引擎启动同时创建，但内部先 await startTask 等引擎就绪，
+    /// 再动 profiles\node_modules（详见 RunStartAsync 里的顺序说明）。
+    /// 引擎启动失败/取消则本轮直接跳过——更新失败信息只走 startTask 自己的异常路径，
+    /// 且这样收口后本任务永不带未观察异常退场。
     /// 未勾选复选框时立刻返回，避免无谓的 pnpm 往返。
     /// </summary>
-    private async Task UpdatePluginsAfterStartAsync(CancellationToken ct)
+    private async Task UpdatePluginsAfterStartAsync(Task startTask, CancellationToken ct)
     {
         if (!autoUpdateCheckbox.Checked) return;
+
+        try { await startTask; }
+        catch { return; }
+        if (ct.IsCancellationRequested || closing || IsDisposed) return;
 
         var last = ReadPluginUpdateStamp();
         if (last is not null)
@@ -448,9 +459,9 @@ internal sealed class HarnessForm : Form
         // 端口被别的程序占用时，node 只会报 EADDRINUSE 然后立刻退出，
         // 界面最终显示的是"立即退出（代码 1）"——同学完全无从判断。
         // 这里在启动前先说清楚（走到这一步，本启动器自己的实例已被停干净）。
-        if (IsPortListening(DefaultPort) && !await ProbeServerAsync(DefaultPort))
+        if (await IsPortListeningAsync(DefaultPort, ct) && !await ProbeServerAsync(DefaultPort))
         {
-            var hint = DescribeDynamicPortRange(DefaultPort);
+            var hint = await DescribeDynamicPortRangeAsync(DefaultPort);
             throw new InvalidOperationException(
                 $"端口 {DefaultPort} 已被其他程序占用（不是本程序启动的 DSH）。\n" +
                 $"请在命令行执行：netstat -ano | findstr :{DefaultPort}\n" +
@@ -471,7 +482,11 @@ internal sealed class HarnessForm : Form
             StandardErrorEncoding = Encoding.UTF8
         };
         psi.Environment["DSH_HOME"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
-        var path = psi.Environment["PATH"] ?? string.Empty;
+        // 必须读**父进程**的 PATH：psi.Environment 是子进程环境的"覆盖表"，初始为空，
+        // 从它读 ["PATH"] 永远是 null → 去重判断形同虚设，还会把子进程 PATH 整个覆盖成
+        // 只剩 nodeDir（子进程环境 = 父环境 + 覆盖表）。System32、git 等会从引擎的
+        // 环境里消失，属"本机碰巧能跑、别人机器上莫名失败"的坑。
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         var nodeDir = Path.GetDirectoryName(node);
         if (!string.IsNullOrWhiteSpace(nodeDir) && !path.Split(';', StringSplitOptions.RemoveEmptyEntries).Contains(nodeDir, StringComparer.OrdinalIgnoreCase))
             psi.Environment["PATH"] = nodeDir + ";" + path;
@@ -523,7 +538,7 @@ internal sealed class HarnessForm : Form
                     $"DeepSeek Harness 立即退出（{codeText}）。\n{summary}\n请检查 Node 与引擎安装（可点「环境」自检）。");
             }
 
-            if (!portAppeared && IsPortListening(DefaultPort)) portAppeared = true;
+            if (!portAppeared && await IsPortListeningAsync(DefaultPort, ct)) portAppeared = true;
 
             // 引擎在固定目录里，正常启动十几秒即可；慢通常来自 DSH 自身重建
             // profiles\node_modules 链接（首次或引擎刚升级时约几十秒）。
@@ -692,12 +707,34 @@ internal sealed class HarnessForm : Form
             lamp.Invalidate();
             UpdateButtons();
         }
+        catch (Exception ex)
+        {
+            // 这个方法被 1.5 秒一次的定时器驱动，而所有调用点都是 async void 事件处理器：
+            // 异常冒出去没人接，会直接终止进程。刷新失败最多是状态文案不准，记日志即可。
+            try { AppendStartupLog("刷新状态失败：" + ex.Message); } catch { }
+        }
         finally { refreshing = false; }
     }
 
     // ---- 进程管理 -----------------------------------------------------------
 
     private async Task StopHarnessProcessesAsync()
+    {
+        // 查杀整体放后台线程：WMI 全量查询实测约 140 ms，加上逐个 Kill，
+        // 同步跑会把 UI 线程冻住半秒——方法名带 Async 就不该在调用线程上干这些。
+        await Task.Run(StopHarnessProcessesCore);
+        // 引擎进程没了，上一份认证链接就是过期 token。不在这里清空的话，
+        // 「重启」/「升级后重启」的等待循环会在下一个引擎还没输出任何日志时
+        // 因 authenticatedUrl != null 立刻"成功返回"，浏览器先弹出过期 token 的失败页。
+        authenticatedUrl = null;
+        TryDeleteUrlFile();
+        // 刚杀完必须让进程快照缓存作废：否则紧接着的 ClearOrphanProfileLock
+        // 拿到的是"杀之前"的缓存（1 秒 TTL，而端口通常几百毫秒内就关、等不到过期），
+        // 把已死进程当成活残留，拒绝清孤儿锁——恰好复现这个功能本来要防的启动失败。
+        InvalidateProcessRecordCache();
+    }
+
+    private void StopHarnessProcessesCore()
     {
         var records = GetProcessRecords();
         var seeds = records.Values.Where(IsHarnessCommand).Select(x => x.Id).ToHashSet();
@@ -716,11 +753,11 @@ internal sealed class HarnessForm : Form
 
         foreach (var id in all.OrderByDescending(x => x))
         {
-            try { Process.GetProcessById(id).Kill(entireProcessTree: true); } catch { }
+            // Process 对象持有内核句柄，用完即收、不等 GC（与 Program.ActivateExistingWindow 同一纪律）。
+            try { using var victim = Process.GetProcessById(id); victim.Kill(entireProcessTree: true); } catch { }
         }
         try { dshProcess?.Dispose(); } catch { }
         dshProcess = null;
-        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -745,11 +782,12 @@ internal sealed class HarnessForm : Form
         {
             foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
             {
-                try { Process.GetProcessById(record.Id).Kill(entireProcessTree: true); }
+                try { using var victim = Process.GetProcessById(record.Id); victim.Kill(entireProcessTree: true); }
                 catch { }
             }
         }
         catch { }
+        InvalidateProcessRecordCache();
     }
 
     /// <summary>
@@ -796,6 +834,16 @@ internal sealed class HarnessForm : Form
         return result;
     }
 
+    /// <summary>
+    /// 让进程快照缓存立即过期。**任何一处杀掉进程之后都必须调用**：
+    /// 缓存的用途是省掉同一次启动里的重复 WMI 查询，但"刚杀完再查"恰恰需要新快照。
+    /// </summary>
+    private static void InvalidateProcessRecordCache()
+    {
+        processRecordCache = null;
+        processRecordCacheAt = DateTime.MinValue;
+    }
+
     private static bool IsHarnessCommand(ProcessRecord p)
     {
         if (p.Name.Equals("DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
@@ -826,6 +874,12 @@ internal sealed class HarnessForm : Form
 
         if (c.Contains("@deepseek-ai/dsh", StringComparison.OrdinalIgnoreCase) ||
             c.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase)) return true;
+
+        // 两条宽松正则只为兜早期 npx / dsh.cmd 时代留下的残留。再收窄一道：
+        // 命令行必须还出现本启动器的端口，否则一个碰巧提到 "dsh" 的 node/cmd 进程
+        // 也会被整树杀掉——误杀别人进程的代价远大于漏杀一个残留
+        // （真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
+        if (!c.Contains(DefaultPort.ToString(), StringComparison.Ordinal)) return false;
 
         return Regex.IsMatch(c, @"(?i)(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b") ||
                Regex.IsMatch(c, @"(?i)\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b");
@@ -859,7 +913,7 @@ internal sealed class HarnessForm : Form
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            if (!IsPortListening(port)) return;
+            if (!await IsPortListeningAsync(port, ct)) return;
             try { await Task.Delay(100, ct); }
             catch (OperationCanceledException) { return; }
         }
@@ -874,14 +928,22 @@ internal sealed class HarnessForm : Form
     private static bool IsPortListening(int port) => IsTcpOpen("127.0.0.1", port, 200);
 
     /// <summary>
+    /// <see cref="IsPortListening"/> 的异步版。**轮询路径必须用这个**：
+    /// 同步版内部 Task.WaitAny 最多阻塞 200 ms，而启动等待循环每 250 ms 调一次
+    /// （回环端口被防火墙 DROP 的机器上每次都等满），等于把 UI 线程卡掉近一半时间。
+    /// </summary>
+    private static Task<bool> IsPortListeningAsync(int port, CancellationToken ct = default)
+        => IsTcpOpenAsync("127.0.0.1", port, 200, ct);
+
+    /// <summary>
     /// Windows 在 Hyper-V / WSL / Docker Desktop 启用后会预留一大段动态端口范围
     /// （典型 49152–65535）。出网连接会随机占用这段里的端口，同时保持 4 分钟
     /// TIME_WAIT，于是"端口莫名被占"且 netstat 里找不到可疑程序。
     /// 报错信息里点出这一层，能省掉大量排查时间。
     /// </summary>
-    private static string? DescribeDynamicPortRange(int port)
+    private static async Task<string?> DescribeDynamicPortRangeAsync(int port)
     {
-        var range = GetDynamicPortRange();
+        var range = await GetDynamicPortRangeAsync();
         if (range is null) return null;
         var (start, count) = range.Value;
         if (port < start || port >= start + count) return null;
@@ -894,40 +956,90 @@ internal sealed class HarnessForm : Form
 
     private static (int Start, int Count)? dynamicPortRange;
     private static bool dynamicPortRangeRead;
+    private static readonly SemaphoreSlim dynamicPortRangeGate = new(1, 1);
 
-    private static (int Start, int Count)? GetDynamicPortRange()
+    private static async Task<(int Start, int Count)?> GetDynamicPortRangeAsync()
     {
         if (dynamicPortRangeRead) return dynamicPortRange;
-        dynamicPortRangeRead = true;
+        await dynamicPortRangeGate.WaitAsync();
+        try
+        {
+            if (dynamicPortRangeRead) return dynamicPortRange;   // 等锁期间已经有人查过了
+            dynamicPortRangeRead = true;                          // 只查一次，成功与否都不重试
+            var text = await RunCmdAsync(
+                "netsh int ipv4 show dynamicport tcp", TimeSpan.FromSeconds(2));
+            if (text is null) return null;
+            var startMatch = Regex.Match(text, @"起始端口\s*:\s*(\d+)|Start Port\s*:\s*(\d+)", RegexOptions.IgnoreCase);
+            var countMatch = Regex.Match(text, @"端口数\s*:\s*(\d+)|Number of Ports\s*:\s*(\d+)", RegexOptions.IgnoreCase);
+            if (!startMatch.Success || !countMatch.Success) return null;
+            // TryParse 而非 Parse：原来靠外层 catch 吞掉 FormatException，
+            // netsh 一旦输出异常大的数字就会走成"整个方法返回 null"。
+            if (!int.TryParse(startMatch.Groups[1].Success ? startMatch.Groups[1].Value : startMatch.Groups[2].Value,
+                              out var start)) return null;
+            if (!int.TryParse(countMatch.Groups[1].Success ? countMatch.Groups[1].Value : countMatch.Groups[2].Value,
+                              out var count)) return null;
+            dynamicPortRange = (start, count);
+            return dynamicPortRange;
+        }
+        finally { dynamicPortRangeGate.Release(); }
+    }
+
+    /// <summary>
+    /// 跑一条命令并取回标准输出，全程异步。超时、启动失败、空输出都返回 null。
+    /// innerCommand 是不含 cmd 前缀的命令本体；外层统一用
+    /// <c>chcp 65001</c> 把控制台代码页切到 UTF-8 再执行——netsh 等命令在中文
+    /// Windows 上默认输出 GBK，而这里按 UTF-8 解码，不切页时中文标签会变乱码，
+    /// 靠中文正则匹配的解析分支（如"起始端口"）就永远命不中。
+    ///
+    /// 为什么不能写成 <c>ReadToEnd() + WaitForExit(ms)</c>：ReadToEnd 会一直阻塞到
+    /// 子进程关闭 stdout 才返回，而它**排在 WaitForExit 前面**——子进程一旦卡住，
+    /// 超时判断根本没机会执行，调用它的 UI 线程就被挂住任意长时间。
+    /// 而 WaitForExitAsync(token) 在超时/取消时同样是**抛 OperationCanceledException**
+    /// 而不是正常返回，所以这里必须显式 catch 并杀掉子进程。
+    /// </summary>
+    private static async Task<string?> RunCmdAsync(string innerCommand, TimeSpan timeout,
+                                                     CancellationToken ct = default)
+    {
+        Process? proc = null;
         try
         {
             var psi = new ProcessStartInfo
             {
                 FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
-                Arguments = "/d /s /c \"netsh int ipv4 show dynamicport tcp\"",
+                Arguments = "/d /s /c \"chcp 65001 >nul & " + innerCommand + "\"",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardOutputEncoding = Encoding.UTF8
             };
-            using var proc = Process.Start(psi);
-            if (proc is null) return null;
-            var text = proc.StandardOutput.ReadToEnd();
-            if (!proc.WaitForExit(2000))
+            proc = new Process { StartInfo = psi };
+            if (!proc.Start()) return null;
+
+            // 不给 ReadToEndAsync 传 token：一旦被取消它就不会再读完剩余数据，
+            // 而杀掉子进程后管道自然会关闭、读取会干净地结束。
+            var outTask = proc.StandardOutput.ReadToEndAsync();
+            var errTask = proc.StandardError.ReadToEndAsync();
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(timeout);
+            try { await proc.WaitForExitAsync(timeoutCts.Token); }
+            catch (OperationCanceledException)
             {
-                try { proc.Kill(entireProcessTree: true); } catch { }
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                // 把两个读取任务收尾，别留下带未观察异常的 Task。
+                try { await outTask; } catch { }
+                try { await errTask; } catch { }
                 return null;
             }
-            var startMatch = Regex.Match(text, @"起始端口\s*:\s*(\d+)|Start Port\s*:\s*(\d+)", RegexOptions.IgnoreCase);
-            var countMatch = Regex.Match(text, @"端口数\s*:\s*(\d+)|Number of Ports\s*:\s*(\d+)", RegexOptions.IgnoreCase);
-            if (!startMatch.Success || !countMatch.Success) return null;
-            var start = int.Parse(startMatch.Groups[1].Success ? startMatch.Groups[1].Value : startMatch.Groups[2].Value);
-            var count = int.Parse(countMatch.Groups[1].Success ? countMatch.Groups[1].Value : countMatch.Groups[2].Value);
-            dynamicPortRange = (start, count);
-            return dynamicPortRange;
+
+            var text = await outTask;
+            // stderr 也要读掉：管道写满会让子进程自己卡死（内容不用）。
+            try { await errTask; } catch { }
+            return text;
         }
         catch { return null; }
+        finally { try { proc?.Dispose(); } catch { } }
     }
 
     /// <summary>
@@ -1104,7 +1216,7 @@ internal sealed class HarnessForm : Form
         if (pinned is not null)
         {
             SetInfo($"检测到引擎版本锁，安装指定版本 {pinned}");
-            await InstallEngineAsync(node, pinned, ResolveNpmRegistry(node, ct), ct);
+            await InstallEngineAsync(node, pinned, await ResolveNpmRegistryAsync(node, ct), ct);
             return;
         }
 
@@ -1122,11 +1234,11 @@ internal sealed class HarnessForm : Form
         catch (OperationCanceledException) { }
         if (ct.IsCancellationRequested) return;
         if (latest is null) SetInfo("查不到版本号，按 latest 安装（网络受限时的降级路径）");
-        await InstallEngineAsync(node, latest ?? "latest", ResolveNpmRegistry(node, ct), ct);
+        await InstallEngineAsync(node, latest ?? "latest", await ResolveNpmRegistryAsync(node, ct), ct);
     }
 
     /// <summary>
-    /// 底部那 8 个按钮：几何由 LayoutBottomRow 统一排，这里只定外观。
+    /// 底部那 7 个按钮：几何由 LayoutBottomRow 统一排，这里只定外观。
     /// 全部同高、同字体、同内边距——主按钮不再特殊（它曾经 324px 宽、10pt，
     /// 比旁边按钮大出 6 倍）。宽度先给占位值，布局时按实测文字改写。
     /// </summary>
@@ -1160,19 +1272,14 @@ internal sealed class HarnessForm : Form
     private const int ClientWidth = 560;
 
     /// <summary>
-    /// 把 8 个按钮排成一行：各自宽度按实测文字 + 相同内边距，整体居中。
+    /// 把 7 个按钮排成一行：宽度按实测文字 + 相同内边距，整体居中，垂直方向贴近底边。
     ///
     /// 为什么不写死 94px：中文两字按钮在 9pt 粗体下实测 32px，三字 48px，
     /// 写死宽度要么浪费空间要么把长文案挤到省略号。按文字量算，改文案时布局自己会跟着走。
-    /// 宽度用**实际 ClientSize** 而不是常量：本机 DeviceDpi 报 120（1.25 倍），
-    /// 逻辑 560 会被换算成设备 700 并因此被屏幕截断，写死常量就会算歪。
-    /// </summary>
-    /// <summary>
-    /// 把 8 个按钮排成一行：宽度按实测文字 + 相同内边距，整体居中，垂直方向贴近底边。
     ///
-    /// 刻意不依赖写死的 y / 客户区高度常量：本机 DeviceDpi 报 120（1.25 倍），
-    /// 逻辑尺寸会被换算成设备尺寸并可能被屏幕截断，写死就会算歪（自检抓出过"按钮排到 202
-    /// 而客户区只有 188"）。所以行位置由**实际 ClientSize** 反推，并在窗口显示后重排一次。
+    /// 宽度与行位置都用**实际 ClientSize** 而不是常量：本机 DeviceDpi 报 120（1.25 倍），
+    /// 逻辑 560 会被换算成设备 700 并因此被屏幕截断，写死就会算歪（自检抓出过"按钮排到 202
+    /// 而客户区只有 188"）。所以行位置由实际客户区反推，并在窗口显示后重排一次。
     /// </summary>
     private void LayoutBottomRow(int rowHeight)
     {
@@ -1302,9 +1409,9 @@ internal sealed class HarnessForm : Form
         try
         {
             using var dialog = new EngineVersionsForm(
-                GetInstalledEngineVersions,
+                GetInstalledEngineVersionsAsync,
                 ActivateEngineVersionAsync,
-                DeleteEngineVersion);
+                DeleteEngineVersionAsync);
             dialog.ShowDialog(this);
         }
         catch (Exception ex)
@@ -1322,6 +1429,9 @@ internal sealed class HarnessForm : Form
     {
         try
         {
+            if (!IsSafeVersionToken(version))
+                return $"版本号 {version} 不是合法的目录名，拒绝切换。";
+
             var slot = EngineSlotDirFor(version);
             if (!Directory.Exists(slot))
                 return $"找不到版本 {version} 的目录：\n{slot}";
@@ -1338,11 +1448,29 @@ internal sealed class HarnessForm : Form
 
             ForceDeleteDirectory(engineStageDir);
             if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineStageDir);
-            Directory.Move(slot, engineDir);
-            // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
             try
             {
-                if (active is not null) Directory.Move(engineStageDir, EngineSlotDirFor(active));
+                Directory.Move(slot, engineDir);
+            }
+            catch
+            {
+                // 新版本顶上失败：把旧引擎搬回去再上抛。
+                // 必须这么写——RecoverEngineSwap 只认 engine.old、不看 engineStageDir，
+                // 而这条路径用的正是 engineStageDir。不搬回去就会留下"没有引擎"的状态，
+                // 下次启动只能重新下载整份引擎（实测 214 MB）。
+                try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
+                throw;
+            }
+            // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
+            // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在 engine.tmp
+            // 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，至少位置可见、可管理。
+            try
+            {
+                if (active is not null)
+                    Directory.Move(engineStageDir, EngineSlotDirFor(active));
+                else if (Directory.Exists(engineStageDir))
+                    Directory.Move(engineStageDir,
+                        EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
             }
             catch (Exception ex)
             {
@@ -1359,26 +1487,33 @@ internal sealed class HarnessForm : Form
         }
     }
 
-    private void DeleteEngineVersion(string version)
+    /// <summary>
+    /// 删除一个版本槽目录。返回错误串，null 表示成功。
+    /// 错误提示交回对话框自己弹——主窗体不该隔着模态对话框代弹 MessageBox。
+    /// 删除整棵 node_modules 同样是秒级操作，所以放后台线程。
+    /// </summary>
+    private async Task<string?> DeleteEngineVersionAsync(string version)
     {
+        if (!IsSafeVersionToken(version))
+            return $"版本号 {version} 不是合法的目录名，拒绝删除。";
+        var slot = EngineSlotDirFor(version);
+        if (!Directory.Exists(slot)) return $"找不到版本 {version} 的目录。";
+
         try
         {
-            var active = ReadEngineVersion(engineDir);
+            var active = await Task.Run(() => ReadEngineVersion(engineDir));
             if (string.Equals(active, version, StringComparison.OrdinalIgnoreCase))
-            {
-                MessageBox.Show("不能删除正在使用的版本。请先切换到其他版本。",
-                    "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            var slot = EngineSlotDirFor(version);
-            if (!Directory.Exists(slot)) return;
+                return "不能删除正在使用的版本。请先切换到其他版本。";
+
             SetInfo($"正在删除引擎 {version}…");
-            ForceDeleteDirectory(slot);
+            await Task.Run(() => ForceDeleteDirectory(slot));
             AppendStartupLog($"已删除引擎版本 {version}");
+            SetInfo($"已删除引擎 {version}");
+            return null;
         }
         catch (Exception ex)
         {
-            MessageBox.Show("删除失败：" + ex.Message, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return "删除失败：" + ex.Message;
         }
     }
 
@@ -1387,6 +1522,18 @@ internal sealed class HarnessForm : Form
     private const string EngineSlotPrefix = "engine.";
 
     private static string EngineSlotDirFor(string version) => Path.Combine(LocalAppDir, EngineSlotPrefix + version);
+
+    /// <summary>
+    /// 版本号必须是一个纯粹的目录名片段：它会被拼成 <c>engine.&lt;版本&gt;</c>
+    /// 再交给 ForceDeleteDirectory 递归删除。来源虽是真实目录名（风险很低），
+    /// 但删除不可逆，这里作为纵深防御卡一道。
+    /// </summary>
+    private static bool IsSafeVersionToken(string? version) =>
+        !string.IsNullOrWhiteSpace(version) &&
+        version.Length <= 64 &&
+        version == Path.GetFileName(version) &&
+        !version.Contains("..", StringComparison.Ordinal) &&
+        version.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
 
     /// <summary>目录占用，MB 粒度。用 EnumerateFiles 避免一次性把所有 FileInfo 建出来。</summary>
     private static long DirectorySizeBytes(string dir)
@@ -1442,7 +1589,16 @@ internal sealed class HarnessForm : Form
         }
     }
 
-    internal IReadOnlyList<EngineVersionEntry> GetInstalledEngineVersions()
+    /// <summary>
+    /// 列出已安装的引擎版本。**必须放到后台执行**：每个版本都要 DirectorySizeBytes
+    /// 递归遍历一遍 node_modules（本机实测 2.5 万个文件），两个版本就是几万次
+    /// FileInfo.Length。同步做在 UI 线程上，"版本管理"窗口会冻结数秒并被 Windows
+    /// 判为未响应——而那时对话框还没画出来，连沙漏都看不到。
+    /// </summary>
+    internal Task<IReadOnlyList<EngineVersionEntry>> GetInstalledEngineVersionsAsync() =>
+        Task.Run(() => GetInstalledEngineVersionsCore());
+
+    private IReadOnlyList<EngineVersionEntry> GetInstalledEngineVersionsCore()
     {
         MigrateEngineOldToSlot();
         var result = new List<EngineVersionEntry>();
@@ -1502,6 +1658,13 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private async Task InstallEngineAsync(string node, string versionSpec, string registry, CancellationToken ct)
     {
+        // versionSpec 会进 package.json，而 engine-version.txt 里的版本锁可能是
+        // 用户手写的。不校验的话一个引号就能拼出非法 JSON，报错却由 npm 背锅、极难定位。
+        if (!IsSafeVersionToken(versionSpec))
+            throw new InvalidOperationException(
+                $"引擎版本指定不合法：{versionSpec}\n" +
+                "应为纯版本号（如 0.1.5-rc.2）或 latest，不能含空白、引号或路径分隔符。");
+
         var npm = ResolveNpmPath(node);
         ForceDeleteDirectory(engineStageDir);
         Directory.CreateDirectory(engineStageDir);
@@ -1510,10 +1673,16 @@ internal sealed class HarnessForm : Form
         // 配合 --prefer-offline 命中本地 cacache，重装基本不重新下载。
         // 这里写的 spec 就是最终 spec（调用方传精确版本号，不是 latest/caret），
         // 再配合下面的 --save-exact，manifest 与 lock 才会真正一致 → 装出来的版本可复现。
+        // 用序列化器生成，不再手工拼 JSON 字符串。
         File.WriteAllText(
             Path.Combine(engineStageDir, "package.json"),
-            "{\n  \"name\": \"dsh-engine\",\n  \"private\": true,\n  \"version\": \"0.0.0\",\n  \"dependencies\": {\n    \"" +
-            EnginePackageName + "\": \"" + versionSpec + "\"\n  }\n}\n",
+            JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["name"] = "dsh-engine",
+                ["private"] = true,
+                ["version"] = "0.0.0",
+                ["dependencies"] = new Dictionary<string, string> { [EnginePackageName] = versionSpec },
+            }, new JsonSerializerOptions { WriteIndented = true }) + "\n",
             new UTF8Encoding(false));
 
         var psi = new ProcessStartInfo
@@ -1529,7 +1698,8 @@ internal sealed class HarnessForm : Form
             StandardErrorEncoding = Encoding.UTF8
         };
         var nodeDir = Path.GetDirectoryName(node);
-        var path = psi.Environment["PATH"] ?? string.Empty;
+        // 同 StartHarnessAsync：读父进程 PATH，缺 nodeDir 时才前置，不做整体覆盖。
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(nodeDir) && !path.Split(';', StringSplitOptions.RemoveEmptyEntries).Contains(nodeDir, StringComparer.OrdinalIgnoreCase))
             psi.Environment["PATH"] = nodeDir + ";" + path;
         ConfigureOptionalProxy(psi);
@@ -1606,40 +1776,32 @@ internal sealed class HarnessForm : Form
     /// 这里读出用户的实际配置并显式传给 npm，让"配了镜像就真的生效"。
     /// </summary>
     private static string? effectiveRegistry;
+    private static readonly SemaphoreSlim registryGate = new(1, 1);
 
-    private static string ResolveNpmRegistry(string node, CancellationToken ct)
+    private static async Task<string> ResolveNpmRegistryAsync(string node, CancellationToken ct)
     {
-        if (effectiveRegistry is not null) return effectiveRegistry;
+        var cached = Volatile.Read(ref effectiveRegistry);
+        if (cached is not null) return cached;
+
+        await registryGate.WaitAsync();
         try
         {
+            cached = Volatile.Read(ref effectiveRegistry);
+            if (cached is not null) return cached;
+            // ResolveNpmPath 找不到 npm 时抛 FileNotFoundException：原实现靠 catch 吞掉
+            // 并回落到官方源，这里保持同样的行为。
             var npm = ResolveNpmPath(node);
-            var psi = new ProcessStartInfo
+            var text = await RunCmdAsync(
+                $"\"{npm}\" config get registry", TimeSpan.FromSeconds(5), ct);
+            if (text is not null)
             {
-                FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
-                Arguments = $"/d /s /c \"\"{npm}\" config get registry\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardOutputEncoding = Encoding.UTF8
-            };
-            using var proc = Process.Start(psi);
-            if (proc is not null)
-            {
-                var text = proc.StandardOutput.ReadToEnd();
-                if (proc.WaitForExit(5000))
-                {
-                    var value = text.Trim().Split('\n').Last().Trim();
-                    if (IsSafeNpmValue(value)) effectiveRegistry = value;
-                }
-                else
-                {
-                    try { proc.Kill(entireProcessTree: true); } catch { }
-                }
+                var value = text.Trim().Split('\n').Last().Trim();
+                if (IsSafeNpmValue(value)) Volatile.Write(ref effectiveRegistry, value);
             }
         }
         catch { }
-        return effectiveRegistry ?? DefaultRegistry;
+        finally { registryGate.Release(); }
+        return Volatile.Read(ref effectiveRegistry) ?? DefaultRegistry;
     }
 
     /// <summary>
@@ -1938,10 +2100,12 @@ internal sealed class HarnessForm : Form
             using var queryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             queryCts.CancelAfter(TimeSpan.FromSeconds(EngineQueryTimeoutSeconds));
 
+            // 注册表要单独取：RunCmdAsync 是异步的，不能再塞进下面的初始化器里。
+            var registry = await ResolveNpmRegistryAsync(node, queryCts.Token);
             var psi = new ProcessStartInfo
             {
                 FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
-                Arguments = $"/d /s /c \"\"{npm}\" view {EnginePackageName} version --registry {ResolveNpmRegistry(node, ct)}\"",
+                Arguments = $"/d /s /c \"\"{npm}\" view {EnginePackageName} version --registry {registry}\"",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
@@ -1950,8 +2114,10 @@ internal sealed class HarnessForm : Form
                 StandardErrorEncoding = Encoding.UTF8
             };
             var nodeDir = Path.GetDirectoryName(node);
-            var path = psi.Environment["PATH"] ?? string.Empty;
-            if (!string.IsNullOrWhiteSpace(nodeDir)) psi.Environment["PATH"] = nodeDir + ";" + path;
+            // 同 StartHarnessAsync：读父进程 PATH，只在缺时前置 nodeDir。
+            var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(nodeDir) && !path.Split(';', StringSplitOptions.RemoveEmptyEntries).Contains(nodeDir, StringComparer.OrdinalIgnoreCase))
+                psi.Environment["PATH"] = nodeDir + ";" + path;
             ConfigureOptionalProxy(psi);
 
             using var proc = new Process { StartInfo = psi };
@@ -1989,7 +2155,7 @@ internal sealed class HarnessForm : Form
             {
                 SetInfo($"已锁定引擎版本 {pinned}，升级被跳过（清空 engine-version.txt 可解除）");
                 if (!closing && !IsDisposed)
-                    MessageBox.Show(
+                    MessageBox.Show(this,
                         $"引擎版本已锁定为 {pinned}，不会升级。\n\n" +
                         "这是为了避免新版引擎让你的插件失效。\n" +
                         $"要升级请先删除或清空：\n{engineVersionPinFile}",
@@ -2052,7 +2218,7 @@ internal sealed class HarnessForm : Form
             // 升级是配置迁移的实际触发点（引擎版本一变，下次启动就可能改写 settings.yaml），
             // 所以这里再拍一份——此时还是"升级前"的配置，是最有价值的还原点。
             ConfigBackup.CreateSnapshot($"升级引擎前（{current ?? "未安装"} → {latest}）");
-            await InstallEngineAsync(node, latest, ResolveNpmRegistry(node, cts.Token), cts.Token);
+            await InstallEngineAsync(node, latest, await ResolveNpmRegistryAsync(node, cts.Token), cts.Token);
             if (cts.IsCancellationRequested) return;
 
             SetInfo($"引擎已升级到 {ReadEngineVersion(engineDir) ?? latest}，正在重启…");
@@ -2220,17 +2386,22 @@ internal sealed class HarnessForm : Form
         updateCts.CancelAfter(TimeSpan.FromSeconds(UpdateTimeoutSeconds));
 
         var output = new StringBuilder();
+        // stdout 与 stderr 的回调分属两个独立的线程池线程，StringBuilder 不是线程安全的。
+        // 之前直接 AppendLine，日志会错乱甚至抛异常——而这个异常发生在管道读取线程上，
+        // 无人接管会直接终止进程。
+        var outputGate = new object();
         Process? proc = null;
+        var succeeded = false;
         try
         {
             proc = new Process { StartInfo = psi };
             proc.OutputDataReceived += (_, e) =>
             {
-                if (e.Data is not null) output.AppendLine(e.Data);
+                if (e.Data is not null) lock (outputGate) output.AppendLine(e.Data);
             };
             proc.ErrorDataReceived += (_, e) =>
             {
-                if (e.Data is not null) output.AppendLine(e.Data);
+                if (e.Data is not null) lock (outputGate) output.AppendLine(e.Data);
             };
 
             if (!proc.Start())
@@ -2241,15 +2412,21 @@ internal sealed class HarnessForm : Form
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
 
-            await proc.WaitForExitAsync(updateCts.Token);
-
-            if (updateCts.Token.IsCancellationRequested && !ct.IsCancellationRequested)
+            try { await proc.WaitForExitAsync(updateCts.Token); }
+            catch (OperationCanceledException)
             {
-                try { proc.Kill(entireProcessTree: true); } catch { }
-                SetInfo("更新超时，已跳过");
+                // WaitForExitAsync 在超时时是**抛异常**而不是正常返回。
+                // 之前把"更新超时"写成 await 之后判断 updateCts.Token.IsCancellationRequested，
+                // 那一支永远走不到——pnpm 跑满 10 分钟被取消时用户什么反馈都收不到。
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                // ct 也被取消 = 用户主动取消（关窗/又点了一次启动），不必打扰。
+                if (!ct.IsCancellationRequested) SetInfo("更新超时，已跳过");
+                return;
             }
-            else if (proc.ExitCode == 0)
+
+            if (proc.ExitCode == 0)
             {
+                succeeded = true;
                 SetInfo("插件已更新到最新");
             }
             else
@@ -2257,21 +2434,13 @@ internal sealed class HarnessForm : Form
                 SetInfo($"更新部分失败（{proc.ExitCode}），继续启动");
             }
         }
-        catch (OperationCanceledException)
-        {
-            // 用户取消（关窗/新一次启动）：必须杀掉 pnpm，否则进程泄漏到后台
-            if (proc is not null)
-            {
-                try { proc.Kill(entireProcessTree: true); } catch { }
-            }
-        }
         finally
         {
             try { proc?.Dispose(); } catch { }
-            AppendUpdateLog(output.ToString());
-            // 记下"跑过了"，否则每次点「启动」都要付一次 pnpm 的网络往返。
-            // 想每次都跑：删掉 %LOCALAPPDATA%\DeepSeekHarness\lastPluginUpdate.txt
-            StampPluginUpdate();
+            lock (outputGate) AppendUpdateLog(output.ToString());
+            // 只在真的更新成功时才盖戳记。启动失败、超时、用户取消都不该算"跑过了"：
+            // 否则一次网络故障会让 20 小时内都不再重试，只能等用户手动删这个文件。
+            if (succeeded) StampPluginUpdate();
         }
     }
 
@@ -2443,14 +2612,14 @@ internal sealed class HarnessForm : Form
                 issues.Add("profile 未初始化（首次点「启动」会自动完成）");
 
             // 端口：只有被占才算问题；空闲时不必占一行。
-            if (IsPortListening(DefaultPort))
+            if (await IsPortListeningAsync(DefaultPort))
             {
                 if (await ProbeServerAsync(DefaultPort))
                     sb.AppendLine($"✓ 端口 {DefaultPort}：DSH 正在运行");
                 else
                 {
                     issues.Add($"端口 {DefaultPort} 被其他程序占用");
-                    var hint = DescribeDynamicPortRange(DefaultPort);
+                    var hint = await DescribeDynamicPortRangeAsync(DefaultPort);
                     if (hint is not null) notes.Add(hint);
                 }
             }
@@ -2517,12 +2686,15 @@ internal sealed class HarnessForm : Form
             }
 
             // 恢复入口只在真有快照时才提，且不打扰"没问题"的情况。
+            // Yes/No 的默认按钮必须落在「否」：Yes 的动作是**用旧快照覆盖当前配置**，
+            // 环境一切正常时用户习惯性回车/顺手一点，不该触发回滚——这是脚枪。
             var footer = latestBackup is null
                 ? string.Empty
-                : "\n\n（点「是」可从最新配置备份恢复；点「否」关闭）";
-            var restore = MessageBox.Show(head + footer, "环境检测",
+                : "\n\n（仅当确实要回滚配置时才点「是」——会用最新快照覆盖当前配置；「否」= 只关闭）";
+            var restore = MessageBox.Show(this, head + footer, "环境检测",
                 latestBackup is null ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
-                issues.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                issues.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2);
             if (restore == DialogResult.Yes && latestBackup is not null)
                 RestoreLatestBackup(latestBackup);
         }
@@ -2542,7 +2714,7 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private void RestoreLatestBackup(string snapshotDir)
     {
-        var confirm = MessageBox.Show(
+        var confirm = MessageBox.Show(this,
             $"用这份快照覆盖当前配置？\n\n快照：{Path.GetFileName(snapshotDir)}\n" +
             $"目标：{Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}\\.dsh\\\n\n" +
             "只覆盖快照里存在的文件（.credentials.yaml、settings.yaml、各 profile 的 cordis*.yml 等），\n" +
@@ -2556,11 +2728,11 @@ internal sealed class HarnessForm : Form
         var count = ConfigBackup.Restore(snapshotDir);
         if (count < 0)
         {
-            MessageBox.Show("恢复失败，可能原因：引擎正在运行占用了配置文件。\n请先点「停止」再试。",
+            MessageBox.Show(this, "恢复失败，可能原因：引擎正在运行占用了配置文件。\n请先点「停止」再试。",
                 "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
-        MessageBox.Show(
+        MessageBox.Show(this,
             $"已从快照恢复 {count} 个配置文件。\n\n请点「停止」再点「启动」重启引擎使其生效。",
             "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
@@ -2670,6 +2842,27 @@ internal sealed class HarnessForm : Form
         finally { try { client?.Dispose(); } catch { } }
     }
 
+    /// <summary>
+    /// <see cref="IsTcpOpen"/> 的异步版。**轮询与等待路径一律走这个**：
+    /// 同步版靠 Task.WaitAny 阻塞调用线程，而它在启动等待循环里每 250 ms 调一次
+    /// （回环端口被防火墙 DROP 时每次都等满超时），等于把 UI 线程卡掉近一半时间。
+    /// 这里直接给 ConnectAsync 挂超时，await 期间线程完全释放。
+    /// </summary>
+    private static async Task<bool> IsTcpOpenAsync(string host, int port, int timeoutMs,
+                                                    CancellationToken ct = default)
+    {
+        var client = new TcpClient();
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeoutMs);
+            await client.ConnectAsync(host, port, cts.Token);
+            return client.Connected;
+        }
+        catch { return false; }
+        finally { try { client.Dispose(); } catch { } }
+    }
+
     private static bool ProcessHasExited(Process process)
     {
         // 进程对象可能已被 StopHarnessProcessesAsync / FormClosing 释放，
@@ -2740,16 +2933,24 @@ internal sealed class HarnessForm : Form
         var url = authenticatedUrl ?? TryReadUrlFile();
         if (url is null)
         {
-            MessageBox.Show("当前没有可用的认证链接，请点击“启动”获取。", "DeepSeek Harness");
+            MessageBox.Show(this, "当前没有可用的认证链接，请点击“启动”获取。", "DeepSeek Harness");
             return;
         }
         OpenBrowser(url);
     }
 
-    private static void OpenBrowser(string url)
+    private void OpenBrowser(string url)
     {
-        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
-        catch (Exception ex) { MessageBox.Show($"无法打开浏览器：{ex.Message}", "DeepSeek Harness"); }
+        // Process 对象持有内核句柄，拿到即收、不等 GC；
+        // 弹窗挂到主窗体上，避免跑到别的窗口后面看不见。
+        try
+        {
+            using var _ = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed) MessageBox.Show(this, $"无法打开浏览器：{ex.Message}", "DeepSeek Harness");
+        }
     }
 
     private string? TryReadUrlFile()
@@ -2813,7 +3014,7 @@ internal sealed class HarnessForm : Form
         e.Graphics.FillEllipse(brush, 4, 4, 28, 28);
     }
 
-    private void ShowError(string title, string message) => MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+    private void ShowError(string title, string message) => MessageBox.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
 
     /// <summary>
     /// 进程级资源的收尾。LocalHttp / 字体 / ToolTip 都是长时间存活的对象，

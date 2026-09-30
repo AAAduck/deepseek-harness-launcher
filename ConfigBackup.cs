@@ -18,7 +18,10 @@ namespace DeepSeekHarness;
 /// </summary>
 internal static class ConfigBackup
 {
-    /// <summary>保留的最近快照数。每个快照只有几十 KB，留几份成本极低。</summary>
+    /// <summary>
+    /// 保留的最近快照数。每个快照只有几十 KB，留几份成本极低。
+    /// 注意其中含 .credentials.yaml 的明文副本——backup-info.txt 里已写明"勿外传"。
+    /// </summary>
     private const int KeepSnapshots = 8;
 
     internal static string BackupRoot => Path.Combine(LocalAppDir, "config-backups");
@@ -131,7 +134,9 @@ internal static class ConfigBackup
                 $"引擎: {EngineVersionAtBackup()}\n" +
                 $"文件: {files.Count} 个\n" +
                 "恢复方法：把这里的文件按相同相对路径覆盖回 %USERPROFILE%\\.dsh\\ " +
-                "（覆盖前建议先关掉引擎）\n",
+                "（覆盖前建议先关掉引擎）\n" +
+                "注意：快照内含 .credentials.yaml（明文密钥，且随快照保留多份），" +
+                "整个 config-backups 目录请勿外传、勿贴进截图。\n",
                 new UTF8Encoding(false));
 
             File.WriteAllText(manifestPath,
@@ -198,16 +203,23 @@ internal static class ConfigBackup
         try
         {
             if (!Directory.Exists(snapshotDir)) return -1;
+            var root = Path.GetFullPath(DshHome);
             var restored = 0;
             foreach (var src in Directory.GetFiles(snapshotDir, "*", SearchOption.AllDirectories))
             {
                 var rel = Path.GetRelativePath(snapshotDir, src);
                 if (rel.Equals("backup-info.txt", StringComparison.OrdinalIgnoreCase)) continue;
                 var dst = Path.Combine(DshHome, rel);
+                // 纵深防御：恢复是往用户配置目录**覆盖写入**，路径必须仍在 $DSH_HOME 内。
+                // 快照目录由本程序生成、正常不会越界，但一旦目录被外部改动过，
+                // 一个 "../" 就可能写到别处去。
+                var full = Path.GetFullPath(dst);
+                if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    continue;
                 try
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                    File.Copy(src, dst, overwrite: true);
+                    Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                    File.Copy(src, full, overwrite: true);
                     restored++;
                 }
                 catch { }

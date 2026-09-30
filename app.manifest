@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.1.0.0" name="DeepSeekHarness.app" />
+  <assemblyIdentity version="1.2.0.0" name="DeepSeekHarness.app" />
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
@@ -26,12 +26,11 @@
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- 与窗体上的 AutoScaleMode.Dpi 配合：系统 DPI 变化时由 WinForms 按比例
-           重排控件，而不是让 Windows 把整个窗口位图拉伸（后者会让中文变糊）。 -->
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">System</dpiAwareness>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
-      <!-- 长路径感知。启动器自己已经给删除引擎目录的调用加了 \\?\ 前缀来绕过
-           MAX_PATH，这里是第二道保险：让不经过那条路径的托管 IO 也能处理长路径。 -->
+      <!-- DPI 感知不在这里声明：UseWindowsForms 生成的 ApplicationConfiguration.Initialize()
+           会调用 Application.SetHighDpiMode，两处同时声明会打架（编译期报 WFAC010）。
+           语义由 DeepSeekHarness.csproj 的 ApplicationHighDpiMode 决定，取值 SystemAware
+           与原先这里的 <dpiAwareness>System</dpiAwareness> 等价。
+           长路径感知仍留在清单里：它没有对应的 API，只能在这里声明。 -->
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>
