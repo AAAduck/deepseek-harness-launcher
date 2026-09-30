@@ -16,10 +16,13 @@ namespace DeepSeekHarness;
 /// </summary>
 internal sealed class EngineVersionsForm : Form
 {
+    private readonly Label title = new();
     private readonly ListView list = new();
     private readonly Label hint = new();
     private readonly Button activateButton = new();
     private readonly Button deleteButton = new();
+    private readonly Button closeButton = new();
+    private readonly Button refreshButton = new();
     private readonly Func<string, string?> activateVersion;
     private readonly Action<string> deleteVersion;
     private readonly Func<IReadOnlyList<EngineVersionEntry>> listVersions;
@@ -35,25 +38,28 @@ internal sealed class EngineVersionsForm : Form
 
         AutoScaleMode = AutoScaleMode.Dpi;
         Text = "引擎版本管理";
-        ClientSize = new Size(560, 330);
-        MinimumSize = new Size(520, 300);
+        // 初始尺寸按"通常只有 1–3 个版本"来定：列表留 86px（表头 + 约 3 行），再多滚动。
+        // 但窗口是**可缩放**的，所以下面用 ApplyResponsiveLayout 让内容跟着变：
+        // 只设 Anchor 不够——那个小箭头按钮当初只按宽度重算 x，纵向仍然是写死的常量，
+        // 所以上下拉伸时按钮纹丝不动。真正自适应的做法见 ApplyResponsiveLayout。
+        ClientSize = new Size(560, 250);
+        MinimumSize = new Size(420, 210);
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false;
         MinimizeBox = false;
         BackColor = Color.White;
         Font = new Font("Microsoft YaHei UI", 9f);
 
-        var title = new Label
-        {
-            Text = "本机已安装的 DSH 引擎版本",
-            Location = new Point(16, 12),
-            Size = new Size(400, 20),
-            Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold)
-        };
+        title.Text = "本机已安装的 DSH 引擎版本";
+        title.Location = new Point(16, 10);
+        // AutoSize 而非硬编码宽度：窗口变窄时固定宽度会溢出客户区。
+        title.AutoSize = true;
+        title.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+        title.Anchor = AnchorStyles.Top | AnchorStyles.Left;
         Controls.Add(title);
 
-        list.Location = new Point(16, 38);
-        list.Size = new Size(528, 226);
+        list.Location = new Point(16, 34);
+        list.Size = new Size(528, 86);
         list.View = View.Details;
         list.FullRowSelect = true;
         list.MultiSelect = false;
@@ -65,52 +71,145 @@ internal sealed class EngineVersionsForm : Form
         list.Columns.Add("安装时间", 150);
         list.SelectedIndexChanged += (_, _) => UpdateButtons();
         list.DoubleClick += (_, _) => ActivateSelected();
-        list.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(list);
 
-        hint.Location = new Point(16, 272);
+        hint.Location = new Point(16, 126);
         hint.Size = new Size(528, 34);
         hint.ForeColor = Color.FromArgb(108, 114, 126);
-        hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(hint);
 
-        activateButton = NewButton("切换到此版本", 16, Color.FromArgb(34, 170, 85));
+        activateButton = NewButton("切换到此版本", Color.FromArgb(34, 170, 85));
         activateButton.Click += (_, _) => ActivateSelected();
         Controls.Add(activateButton);
 
-        deleteButton = NewButton("删除", 132, Color.FromArgb(224, 69, 62));
+        deleteButton = NewButton("删除", Color.FromArgb(224, 69, 62));
         deleteButton.Click += (_, _) => DeleteSelected();
         Controls.Add(deleteButton);
 
-        var closeButton = NewButton("关闭", 248, Color.FromArgb(114, 122, 143));
+        closeButton = NewButton("关闭", Color.FromArgb(114, 122, 143));
         closeButton.Click += (_, _) => Close();
         Controls.Add(closeButton);
 
-        var refreshButton = NewButton("刷新", 364, Color.FromArgb(58, 124, 240));
+        refreshButton = NewButton("刷新", Color.FromArgb(58, 124, 240));
         refreshButton.Click += (_, _) => Reload();
         Controls.Add(refreshButton);
-
         CancelButton = closeButton;
+
+        // 真正自适应的布局：列表吃掉中间的剩余高度，提示与按钮锚在底部。
+        Resize += (_, _) =>
+        {
+            ApplyResponsiveLayout();
+            LayoutDump.Capture($"版本管理 {ClientSize.Width}x{ClientSize.Height}", this,
+                title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
+        };
+        ApplyResponsiveLayout();
+        DumpLayoutIfRequested();
 
         Reload();
     }
 
-    private Button NewButton(string text, int x, Color backColor)
+    /// <summary>
+    /// DSH_LAYOUT_DUMP=1 时在多个尺寸下各排一次并记录几何，用来验证"拉伸后内容是否跟着走"。
+    /// 只靠肉眼看窗口是验证不了这件事的。
+    /// 每个尺寸记录两次（重排前、重排后）会翻倍，所以按"几何真正变化"才再记一次。
+    /// </summary>
+    private void DumpLayoutIfRequested()
+    {
+        if (!LayoutDump.Enabled) return;
+        Shown += (_, _) =>
+        {
+            var sizes = new[] { new Size(560, 250), new Size(560, 380), new Size(780, 300), new Size(430, 214) };
+            foreach (var size in sizes)
+            {
+                ClientSize = size;
+                ApplyResponsiveLayout();
+                LayoutDump.Capture($"版本管理 高={size.Height}", this,
+                    title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
+            }
+            Close();
+        };
+    }
+
+    private Button NewButton(string text, Color backColor)
     {
         var button = new Button
         {
             Text = text,
-            Location = new Point(x, 312),
             Size = new Size(108, 30),
             FlatStyle = FlatStyle.Flat,
             BackColor = backColor,
             ForeColor = Color.White,
             Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold),
-            Cursor = Cursors.Hand
+            Cursor = Cursors.Hand,
+            AccessibleName = text
         };
         button.FlatAppearance.BorderSize = 0;
         return button;
     }
+
+    private const int ButtonHeight = 30;
+    private const int HintHeight = 34;
+    /// <summary>左右留白。刻意不叫 Margin：那是 Form 的继承成员，同名会遮蔽并触发 CS0108。</summary>
+    private const int SidePad = 16;
+    private const int BottomPad = 14;
+    private const int Gap = 8;
+    private const int ListTop = 34;
+
+    /// <summary>
+    /// 让内容跟着窗口尺寸走。
+    ///
+    /// 只靠 Anchor 不够：ListView 锚 Left|Right 能横向拉伸，但纵向我把它锚成了 Top，
+    /// 于是拉高窗口时列表不动、下方留白；按钮更是只按宽度重算 x，纵向写死常量，
+    /// 所以"上下拉伸没反应"。这里统一按当前 ClientSize 重算：
+    ///   列表高度 = 客户区高 - 列表顶 - 提示与按钮占位（它们锚在底部）
+    ///   提示与按钮的 y 由客户区高反推，永远贴着底边。
+    /// </summary>
+    private void ApplyResponsiveLayout()
+    {
+        var bottomArea = HintHeight + BottomPad + ButtonHeight + BottomPad / 2 + 8;
+        var listHeight = Math.Max(56, ClientSize.Height - ListTop - bottomArea);
+
+        list.Location = new Point(SidePad, ListTop);
+        list.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), listHeight);
+
+        var hintY = list.Bottom + 8;
+        hint.Location = new Point(SidePad, hintY);
+        hint.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), HintHeight);
+
+        var rowY = ClientSize.Height - ButtonHeight - BottomPad;
+        LayoutButtons(rowY);
+    }
+
+    /// <summary>
+    /// 四个按钮在底部均分并居中。宽度按各按钮文字实测，超宽时压缩间隙。
+    /// 窗口比"刚好放下"还窄时退化为左对齐贴边，不重叠。
+    /// </summary>
+    private void LayoutButtons(int rowY)
+    {
+        var buttons = new Button[] { activateButton, deleteButton, closeButton, refreshButton };
+
+        var widths = buttons.Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        var total = widths.Sum() + Gap * (buttons.Length - 1);
+        var available = ClientSize.Width - SidePad * 2;
+        if (total > available && buttons.Length > 1)
+        {
+            var shrink = (int)Math.Ceiling((total - available) / (double)(buttons.Length - 1));
+            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(72, widths[i] - shrink);
+            total = widths.Sum() + Gap * (buttons.Length - 1);
+        }
+
+        var x = Math.Max(SidePad, (ClientSize.Width - total) / 2);
+        for (var i = 0; i < buttons.Length; i++)
+        {
+            buttons[i].Size = new Size(widths[i], ButtonHeight);
+            buttons[i].Location = new Point(x, rowY);
+            x += widths[i] + Gap;
+        }
+    }
+
+    /// <summary>供布局自检遍历的控件清单（与 Resize 里记录的是同一组）。</summary>
+    internal Control[] DumpControls() =>
+        new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
 
     private void Reload()
     {

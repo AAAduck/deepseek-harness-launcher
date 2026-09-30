@@ -106,7 +106,6 @@ internal sealed class HarnessForm : Form
         // 注意：本机是 96 DPI / 100% 缩放，这条改动在这里无法验证，只能保证方向正确。
         AutoScaleMode = AutoScaleMode.Dpi;
         Text = "DeepSeek Harness 控制台";
-        SetFixedClientSize(ClientWidth, TargetClientHeight);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -177,8 +176,7 @@ internal sealed class HarnessForm : Form
         // 8 × 52 + 7 × 8 = 472px，可用 496px。所以折叠机制被整个删掉了——
         // 能一行放下就不需要它，少一个交互状态也少一处出错的地方。
         //
-        // 尺寸统一是刻意的：主按钮不再特殊，同高（34 逻辑像素）、同字体、同宽。
-        const int RowH = 34;
+        // 尺寸统一是刻意的：主按钮不再特殊，同高（BottomRowHeight）、同字体、同宽。
 
         startButton = NewActionButton("启动", "启动 Harness 引擎并打开控制台。回车键等效",
             Color.FromArgb(34, 170, 85));
@@ -200,21 +198,44 @@ internal sealed class HarnessForm : Form
 
         LayoutBottomRow(rowHeight: BottomRowHeight);
 
+        // 尺寸约束放在最后：SetFixedClientSize 要用"Size - ClientSize"算边框与标题栏，
+        // 而那个差值取决于 FormBorderStyle。之前它在 FormBorderStyle 之前调用，
+        // 算出的边框宽度是错的（自检抓出客户区被压到 197px 宽）。
+        SetFixedClientSize(ClientWidth, TargetClientHeight);
+
+        // 尺寸自检：记录设置前后来定位宽度被谁改小（曾经的坑：句柄未创建时设尺寸会被钳小）。
+        if (LayoutDump.Enabled)
+        {
+            LayoutDump.Capture($"构造完成 Size={Size.Width}x{Size.Height}", this, startButton, upgradeButton);
+        }
+
         // 布局自检：DSH_LAYOUT_DUMP=1 时把窗口与按钮的实际几何写进 layout-dump.txt 并退出。
         // 加这个是因为靠截图/自动化去验证 Windows 布局既慢又不可靠（试过 UIAutomation 与
         // PrintWindow，都拿不到稳定结果），而布局对不对是可以直接测量的事实——
-        // 它已经抓出过"按钮溢出客户区"和"居中把行推出边界"两个真问题。
+        // 它已经抓出过"按钮溢出客户区""居中把行推出边界""MinimumSize 与 ClientSize 自相矛盾"
+        // 以及"边框差值算错导致客户区被压缩"四个真问题。
         Shown += (_, _) =>
         {
             // 客户区尺寸要等窗口真正显示后才稳定（之前 Set 的值可能被 DPI 换算与屏幕边界改写），
             // 所以这里按最终尺寸重排一次。
             LayoutBottomRow(rowHeight: BottomRowHeight);
+
+            // 自检入口：DSH_LAYOUT_DUMP=1 时在几个尺寸下各排一次并记录几何，然后退出。
             if (Environment.GetEnvironmentVariable("DSH_LAYOUT_DUMP") == "1")
             {
-                DumpLayout("显示后");
+                foreach (var width in new[] { ClientSize.Width, 480, 700 })
+                {
+                    ClientSize = new Size(width, ClientSize.Height);
+                    LayoutBottomRow(rowHeight: BottomRowHeight);
+                    DumpLayout($"客户区={ClientSize.Width}");
+                }
                 Close();
+                return;
             }
         };
+
+        // 两个对话框平时要点按钮才出现，靠 DSH_LAYOUT_TEST=1 的独立入口验证
+        // （见 Program.RunLayoutSelfTest），不走主窗体的 Shown。
 
         startButton.Click += async (_, _) =>
         {
@@ -851,20 +872,6 @@ internal sealed class HarnessForm : Form
     private static bool IsPortListening(int port) => IsTcpOpen("127.0.0.1", port, 200);
 
     /// <summary>
-    /// 复刻旧实现的返回结构，供「环境」按钮列出当前监听端口。
-    /// 注意本方法会分配整张 TCP 表，只在手动检测路径上调用，不要放进轮询循环。
-    /// </summary>
-    private static IEnumerable<int> ListeningPorts()
-    {
-        try
-        {
-            return IPGlobalProperties.GetIPGlobalProperties()
-                .GetActiveTcpListeners().Select(x => x.Port).Distinct().ToArray();
-        }
-        catch { return Array.Empty<int>(); }
-    }
-
-    /// <summary>
     /// Windows 在 Hyper-V / WSL / Docker Desktop 启用后会预留一大段动态端口范围
     /// （典型 49152–65535）。出网连接会随机占用这段里的端口，同时保持 4 分钟
     /// TIME_WAIT，于是"端口莫名被占"且 netstat 里找不到可疑程序。
@@ -1215,62 +1222,43 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private void SetFixedClientSize(int width, int height)
     {
-        MinimumSize = Size.Empty;   // 先解除约束，否则设 ClientSize 会被旧的最小值挡住
+        // 顺序是踩出来的，注释留着免得下次又踩：
+        //  ① 先清空 Min/Max。它们在 AutoScaleMode.Dpi + 高 DPI 下按逻辑单位换算，
+        //     残留旧值会把窗口挤得远小于目标。
+        //  ② 设 ClientSize——**必须设两次**：第一次发生在窗口句柄创建之前，
+        //     WinForms 那时用默认边框算 Size-ClientSize 并把窗口钳小
+        //     （实测 560 的目标被压成客户区 197）；第一次设完句柄就建好了，
+        //     第二次才是按真实边框生效的那次，也才能算出正确的边框差值。
+        //  ③ 用真实差值锁死宽高。
+        //
+        // 宽度也锁：这个窗体的版式（面板 424px + 两侧留白）本来就按固定宽度设计，
+        // 放开宽度只会让按钮行在窄窗口下挤出边界。锁定比"允许拉伸但可能破版"可靠。
+        MinimumSize = Size.Empty;
         MaximumSize = Size.Empty;
-        ClientSize = new Size(width, height);
-        var chromeW = Size.Width - ClientSize.Width;
-        var chromeH = Size.Height - ClientSize.Height;
-        var window = new Size(width + chromeW, height + chromeH);
+
+        ClientSize = new Size(width, height);   // 第一次：建立窗口句柄
+        ClientSize = new Size(width, height);   // 第二次：按真实边框生效
+
+        var chromeW = Math.Max(0, Size.Width - ClientSize.Width);
+        var chromeH = Math.Max(0, Size.Height - ClientSize.Height);
+        var window = new Size(ClientSize.Width + chromeW, ClientSize.Height + chromeH);
         MinimumSize = window;
         MaximumSize = window;
     }
 
     /// <summary>
-    /// 把窗口与底部按钮的实际几何写进 layout-dump.txt，供 DSH_LAYOUT_DUMP=1 自检。
-    /// 用文件而不是 Console：本程序是 WinExe，没有控制台，WriteLine 会直接消失
-    /// （这正是我第一版自检看不到任何输出的原因）。
-    /// 用来确认"按钮没溢出、没重叠、没跑出客户区"——这些是能量化的，不必靠肉眼看截图。
+    /// 主窗体的布局自检（复用 LayoutDump 的公共实现）。
+    /// 除了按钮几何，这里还额外记录 DPI 与 AutoScale 信息——本机 DeviceDpi 报 120 而系统是 96，
+    /// 正是靠这几个字段才定位到"逻辑尺寸被 1.25 倍换算后溢出客户区"。
     /// </summary>
     private void DumpLayout(string label)
     {
-        try
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine($"[{label}] ClientSize={ClientSize.Width}x{ClientSize.Height} " +
-                          $"Min={MinimumSize.Width}x{MinimumSize.Height} Max={MaximumSize.Width}x{MaximumSize.Height} " +
-                          $"AutoScaleMode={AutoScaleMode} AutoScaleFactor={AutoScaleFactor} " +
-                          $"DeviceDpi={DeviceDpi} LogicalToDeviceUnits(560)={LogicalToDeviceUnits(560)}");
-            var all = new Control[] { startButton, stopButton, restartButton,
-                                      refreshButton, envButton, foldersButton, versionsButton, upgradeButton };
-            foreach (var b in all)
-            {
-                if (b is not Button btn) continue;
-                var right = btn.Left + btn.Width;
-                var bottom = btn.Top + btn.Height;
-                var flags = new List<string>();
-                if (right > ClientSize.Width) flags.Add("右溢出");
-                if (bottom > ClientSize.Height) flags.Add("下溢出");
-                if (btn.Left < 0 || btn.Top < 0) flags.Add("负坐标");
-                sb.AppendLine($"  {(btn.Visible ? "可见" : "隐藏")} {btn.Text,-4} " +
-                              $"x={btn.Left,4} y={btn.Top,4} w={btn.Width,3} h={btn.Height,2} " +
-                              $"右={right,4} 下={bottom,4} {(flags.Count > 0 ? "✗ " + string.Join(",", flags) : "✓")}");
-            }
-            var visible = all.OfType<Button>().Where(b => b.Visible).ToList();
-            for (var i = 0; i < visible.Count; i++)
-            for (var j = i + 1; j < visible.Count; j++)
-            {
-                if (visible[i].Bounds.IntersectsWith(visible[j].Bounds))
-                    sb.AppendLine($"  ✗ 重叠: {visible[i].Text} 与 {visible[j].Text}");
-            }
-            if (fontsDistinct(visible)) sb.AppendLine("  ✗ 可见按钮的字体/高度不一致");
-            File.WriteAllText(
-                Path.Combine(LocalAppDir, "layout-dump.txt"),
-                sb.ToString(), new UTF8Encoding(false));
-
-            static bool fontsDistinct(List<Button> bs) =>
-                bs.Select(b => b.Height).Distinct().Count() > 1;
-        }
-        catch { }
+        if (!LayoutDump.Enabled) return;
+        LayoutDump.Capture(
+            $"{label} Dpi={DeviceDpi} Scale={AutoScaleFactor} Min={MinimumSize.Width}x{MinimumSize.Height}",
+            this,
+            startButton, stopButton, restartButton,
+            refreshButton, envButton, foldersButton, versionsButton, upgradeButton);
     }
 
     /// <summary>
@@ -2431,139 +2419,122 @@ internal sealed class HarnessForm : Form
         lamp.Invalidate();
         try
         {
+            // ── 报告正文 ────────────────────────────────────────────────────────
+            // 组织原则：默认只列"会影响能否使用"的结论，一切正常的项一行带过。
+            // 之前那份把路径、监听端口全表、操作指南都塞了进来，读的人得自己筛。
+            // 三条判据：① 能不能跑 ② 有没有风险 ③ 出问题去哪儿查。
             var sb = new StringBuilder();
-            sb.AppendLine("【环境检测报告】");
-            sb.AppendLine();
+            var issues = new List<string>();      // 需要用户处理的问题
+            var notes = new List<string>();       // 值得知道的提醒（不是错误）
 
-            sb.AppendLine(Environment.Is64BitOperatingSystem
-                ? "✓ 系统：Windows 10/11 x64（符合要求）"
-                : "✗ 系统：32 位 Windows（不支持，请换 64 位系统）");
-
+            // ① 必需组件。只报"能否用"，不报路径——路径属于排查时才需要的信息。
             string? nodeExe = null;
             try { nodeExe = await ResolveNodeAsync(CancellationToken.None); }
-            catch (Exception ex) { sb.AppendLine("✗ Node.js：" + ex.Message.Split('\n')[0]); }
+            catch (Exception ex) { issues.Add("Node.js：" + ex.Message.Split('\n')[0]); }
+
             if (nodeExe is not null)
             {
-                var v = await GetToolVersionAsync(nodeExe, "--version");
-                sb.AppendLine($"✓ Node.js：{v?.Trim() ?? "未知"}（{Path.GetDirectoryName(nodeExe)}）");
+                var nodeVersion = (await GetToolVersionAsync(nodeExe, "--version"))?.Trim();
                 var npm = FindToolBeside(nodeExe, "npm.cmd") ?? FindTool("npm.cmd");
-                sb.AppendLine(npm is null ? "✗ npm：未找到（npm 随 Node 安装）" : $"✓ npm：{npm}");
+                if (npm is null)
+                    issues.Add("npm 未找到（npm 随 Node 一起安装，建议重装 Node.js）");
+                else
+                    sb.AppendLine($"✓ Node.js {nodeVersion ?? "?"}　npm 就绪");
             }
 
-            // 引擎现在是固定目录安装，不再是 npx 哈希缓存。
             var engine = ReadEngineVersion(engineDir);
             if (engine is null)
-            {
-                sb.AppendLine("✗ DSH 引擎：未安装");
-                sb.AppendLine("    解决：点击「开始」会自动装到固定目录（只此一次，约 1–2 分钟）");
-            }
+                issues.Add("DSH 引擎未安装（点「开始」会自动安装，约 1–2 分钟）");
             else
+                sb.AppendLine($"✓ DSH 引擎 {engine}");
+
+            var profileReady = File.Exists(Path.Combine(webProfileDir, "package.json"));
+            if (!profileReady)
+                issues.Add("profile 未初始化（首次点「开始」会自动完成）");
+
+            // 端口：只有被占才算问题；空闲时不必占一行。
+            if (IsPortListening(DefaultPort))
             {
-                sb.AppendLine($"✓ DSH 引擎：{engine}");
-                sb.AppendLine($"    位置：{engineDir}");
-                sb.AppendLine("    升级：面板里的「升级」按钮；版本切换/删除：旁边的「版本管理」");
+                if (await ProbeServerAsync(DefaultPort))
+                    sb.AppendLine($"✓ 端口 {DefaultPort}：DSH 正在运行");
+                else
+                {
+                    issues.Add($"端口 {DefaultPort} 被其他程序占用");
+                    var hint = DescribeDynamicPortRange(DefaultPort);
+                    if (hint is not null) notes.Add(hint);
+                }
             }
 
-            // 版本锁与回滚：这两项直接对应"以插件为主"的取舍，必须能一眼看到。
+            // ② 可选组件。缺失只提醒，不算问题——它们只影响插件更新。
+            var pnpm = ResolvePnpmPath(nodeExe);
+            var corepack = ResolveCorepackPath(nodeExe);
+            if (pnpm is null && corepack is null)
+                notes.Add("pnpm 未安装，插件更新会被跳过（npm install -g pnpm 可补上）");
+
+            // ③ 风险项：版本锁、可回退版本、插件兼容性。
             var pinnedNow = ReadPinnedEngineVersion();
-            sb.AppendLine(pinnedNow is not null
-                ? $"🔒 引擎版本已锁定：{pinnedNow}（升级被禁用；清空 engine-version.txt 解除）"
-                : $"○ 引擎未锁定（升级时跟随最新版）。想钉住版本就把版本号写进：{engineVersionPinFile}");
+            if (pinnedNow is not null)
+                sb.AppendLine($"🔒 引擎已锁定 {pinnedNow}（升级被禁用）");
 
-            var oldEngine = ReadEngineVersion(engineOldDir);
-            if (oldEngine is not null)
-                sb.AppendLine($"↩ 可回退的上一个引擎：{oldEngine}（在 engine.old；插件不兼容时可换回）");
-
-            // 插件对引擎版本的要求，与实际引擎对不对得上——这正是"升级后插件还能不能用"的判据。
-            // 注意只有 dsh 那一族随引擎版本走，cordis/schemastery 等有自己的版本号，
-            // 那些项是按"当前已装版本"判定的，与升级无关。
             var reqs = CollectPluginRequirements(webProfileDir);
             if (reqs.Count > 0 && engine is not null)
             {
                 var (unknown, bad) = CheckPluginCompatibility(engine, webProfileDir);
-                if (bad.Count == 0)
-                    sb.AppendLine($"✓ 插件兼容性：{reqs.Count} 项要求均满足" +
-                                  (unknown > 0 ? $"（{unknown} 项无法判定）" : string.Empty));
+                if (bad.Count == 0 && unknown == 0)
+                    sb.AppendLine($"✓ 插件兼容性：{reqs.Count} 项要求全部满足");
+                else if (bad.Count == 0)
+                    sb.AppendLine($"✓ 插件兼容性：{reqs.Count} 项中 {unknown} 项无法判定，未见冲突");
                 else
-                    sb.AppendLine($"⚠ 插件兼容性：{bad.Count} 项不满足（共 {reqs.Count} 项要求）");
-                foreach (var b in bad.Take(8)) sb.AppendLine("    · " + b);
-                if (bad.Count > 8) sb.AppendLine($"    …另有 {bad.Count - 8} 项");
+                {
+                    // 不满足的明细要全部列出——这正是用户需要据此行动的信息。
+                    sb.AppendLine($"⚠ 插件兼容性：{bad.Count} 项不满足");
+                    foreach (var b in bad) sb.AppendLine("    · " + b);
+                }
             }
+
             if (Directory.Exists(engineStageDir))
-                sb.AppendLine("⚠ 存在未完成的安装残留：engine.tmp（下次安装会自动清掉）");
+                notes.Add("存在未完成的安装残留 engine.tmp（下次安装会自动清理）");
 
-            var pnpm = ResolvePnpmPath(nodeExe);
-            if (pnpm is null)
-            {
-                var corepack = ResolveCorepackPath(nodeExe);
-                sb.AppendLine("✗ pnpm：未找到（可选，仅影响插件更新）");
-                sb.AppendLine(corepack is null
-                    ? "    解决：npm install -g pnpm"
-                    : "    解决：corepack enable pnpm（已检测到 corepack）");
-            }
-            else
-            {
-                var v = await GetToolVersionAsync(pnpm, "--version");
-                sb.AppendLine($"✓ pnpm：{v?.Trim() ?? "?"}（{pnpm}）");
-            }
+            var oldEngine = ReadEngineVersion(engineOldDir);
+            if (oldEngine is not null)
+                notes.Add($"可回退到 {oldEngine}（在 engine.old）");
 
-            var profile = webProfileDir;
-            sb.AppendLine(File.Exists(Path.Combine(profile, "package.json"))
-                ? "✓ profile：已初始化"
-                : "✗ profile：未初始化（首次点击「开始」会自动初始化）");
-
-            if (IsPortListening(DefaultPort))
-            {
-                sb.AppendLine($"⚠ 端口 {DefaultPort} 已被占用，可能已有 DSH 在运行");
-                var hint = DescribeDynamicPortRange(DefaultPort);
-                if (hint is not null) sb.AppendLine("    " + hint.Replace("\n", "\n    "));
-            }
-            else
-            {
-                sb.AppendLine($"✓ 端口 {DefaultPort} 空闲");
-            }
-
-            // 状态栏只显示一个端口，说不清"到底谁在占用"；这里把本机监听端口列出来，
-            // 排查"端口被占"时不用再去开命令行。
-            var listening = ListeningPorts().OrderBy(x => x).ToArray();
-            sb.AppendLine();
-            sb.AppendLine($"本机 TCP 监听端口（{listening.Length} 个）：{string.Join(", ", listening)}");
-
-            // 配置备份状态 + 一键恢复。
-            // 实测 DSH 的 settings 迁移会丢掉不匹配 profile 条目 id 的配置段
-            // （jet-hub 账号列表、llm-pi-ai 的自定义供应商都中过招），
-            // 所以这里既报状态，也给一条不用手动翻目录的恢复路径。
-            sb.AppendLine();
             var latestBackup = ConfigBackup.LatestSnapshot();
-            if (latestBackup is null)
+            if (latestBackup is not null)
+                notes.Add($"配置备份最新一份：{Directory.GetCreationTime(latestBackup):MM-dd HH:mm}");
+            else
+                notes.Add("尚无配置备份（点「开始」会自动生成）");
+
+            // ── 汇总 ────────────────────────────────────────────────────────────
+            var head = new StringBuilder();
+            if (issues.Count == 0)
             {
-                sb.AppendLine($"○ 配置备份：还没有快照（点「开始」或「重启」会自动生成，存于 {ConfigBackup.BackupRoot}）");
+                head.AppendLine("环境正常，可以启动。");
             }
             else
             {
-                var info = Path.Combine(latestBackup, "backup-info.txt");
-                var when = Directory.GetCreationTime(latestBackup);
-                sb.AppendLine($"✓ 配置备份：最新一份 {when:yyyy-MM-dd HH:mm}（{Path.GetFileName(latestBackup)}）");
-                if (File.Exists(info))
-                {
-                    foreach (var line in File.ReadAllLines(info).Where(l => l.StartsWith("原因")))
-                        sb.AppendLine("    " + line.Trim());
-                }
-                sb.AppendLine($"    位置：{ConfigBackup.BackupRoot}");
+                head.AppendLine($"发现 {issues.Count} 个问题：");
+                foreach (var issue in issues) head.AppendLine("  ✗ " + issue);
+            }
+            head.AppendLine();
+            head.Append(sb);
+
+            if (notes.Count > 0)
+            {
+                head.AppendLine();
+                head.AppendLine("其他：");
+                foreach (var note in notes) head.AppendLine("  ○ " + note);
             }
 
-            var restore = MessageBox.Show(sb.ToString(), "环境检测", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-            if (restore == DialogResult.Yes)
-            {
-                if (latestBackup is null)
-                {
-                    MessageBox.Show("还没有可恢复的备份快照。", "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                else
-                {
-                    RestoreLatestBackup(latestBackup);
-                }
-            }
+            // 恢复入口只在真有快照时才提，且不打扰"没问题"的情况。
+            var footer = latestBackup is null
+                ? string.Empty
+                : "\n\n（点「是」可从最新配置备份恢复；点「否」关闭）";
+            var restore = MessageBox.Show(head + footer, "环境检测",
+                latestBackup is null ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
+                issues.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            if (restore == DialogResult.Yes && latestBackup is not null)
+                RestoreLatestBackup(latestBackup);
         }
         catch (Exception ex)
         {

@@ -23,6 +23,17 @@ internal static class Program
         // 用户拿不到任何可反馈的信息，也没法区分是缺 Node、缺引擎还是别的。
         try
         {
+            ApplicationConfiguration.Initialize();
+
+            // 布局自检入口：只开两个对话框、在多个尺寸下记录几何、退出。不经过主窗体。
+            // 加这个是因为主窗体在 DSH_LAYOUT_DUMP=1 下会先自己退出，对话框根本没机会被打开；
+            // 而"拉伸对话框时内容不动"正是要验证的那件事，靠肉眼看窗口验证不了。
+            if (Environment.GetEnvironmentVariable("DSH_LAYOUT_TEST") == "1")
+            {
+                RunLayoutSelfTest();
+                return;
+            }
+
             // 没有单实例保护时，点两次图标会出现两个启动器，然后：
             // 第二个实例的 StopHarnessProcessesAsync 会按命令行正则命中第一个实例的引擎
             // 并整树杀掉（IsHarnessCommand 只排除 DeepSeekHarness.exe，不排除"别人启的 dsh"），
@@ -33,7 +44,6 @@ internal static class Program
                 return;
             }
 
-            ApplicationConfiguration.Initialize();
             Application.Run(new HarnessForm());
         }
         catch (Exception ex)
@@ -48,6 +58,53 @@ internal static class Program
         {
             try { singleInstanceMutex?.ReleaseMutex(); } catch { }
             try { singleInstanceMutex?.Dispose(); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 打开两个对话框，在若干尺寸下各排一次并记录几何，然后退出。
+    /// DSH_LAYOUT_TEST=1 触发；用于验证"拉伸窗口时内容是否真的跟着走"。
+    /// </summary>
+    private static void RunLayoutSelfTest()
+    {
+        try
+        {
+            var dump = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DeepSeekHarness", "layout-dump.txt");
+            if (File.Exists(dump)) File.Delete(dump);
+        }
+        catch { }
+
+        using (var versions = new EngineVersionsForm(
+                   () => Array.Empty<EngineVersionEntry>(),
+                   _ => null,
+                   _ => { }))
+        {
+            versions.Show();
+            Application.DoEvents();
+            foreach (var size in new[] { new Size(560, 250), new Size(560, 380), new Size(780, 300), new Size(440, 214) })
+            {
+                versions.ClientSize = size;
+                Application.DoEvents();
+                LayoutDump.Capture($"版本管理 客户区={versions.ClientSize.Width}x{versions.ClientSize.Height}",
+                    versions, versions.DumpControls());
+            }
+            versions.Close();
+        }
+
+        using (var folders = new FoldersForm())
+        {
+            folders.Show();
+            Application.DoEvents();
+            foreach (var size in new[] { new Size(660, 286), new Size(660, 420), new Size(920, 320), new Size(470, 226) })
+            {
+                folders.ClientSize = size;
+                Application.DoEvents();
+                LayoutDump.Capture($"目录 客户区={folders.ClientSize.Width}x{folders.ClientSize.Height}",
+                    folders, folders.DumpControls());
+            }
+            folders.Close();
         }
     }
 

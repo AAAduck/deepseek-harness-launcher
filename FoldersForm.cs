@@ -12,10 +12,13 @@ namespace DeepSeekHarness;
 /// </summary>
 internal sealed class FoldersForm : Form
 {
+    private readonly Label title = new();
     private readonly ListView list = new();
     private readonly Label hint = new();
     private readonly Button openButton = new();
     private readonly Button copyButton = new();
+    private readonly Button closeButton = new();
+    private readonly Button refreshButton = new();
 
     /// <summary>一个相关位置。File 类条目在资源管理器里用"选中"而不是"打开"。</summary>
     private sealed record Entry(string Name, string Path, string Note, bool IsFile);
@@ -24,25 +27,27 @@ internal sealed class FoldersForm : Form
     {
         AutoScaleMode = AutoScaleMode.Dpi;
         Text = "DeepSeek Harness 相关目录";
-        ClientSize = new Size(660, 396);
-        MinimumSize = new Size(600, 340);
+        // 目录列表初始给 168px（表头 + 约 5–6 行）：本机有 17 个真实位置，多露几行实用。
+        // 窗口可缩放，尺寸变化由 ApplyResponsiveLayout 接管（列表吃剩余高度，底部锚定）。
+        ClientSize = new Size(660, 286);
+        MinimumSize = new Size(460, 220);
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false;
         MinimizeBox = false;
         BackColor = Color.White;
         Font = new Font("Microsoft YaHei UI", 9f);
 
-        var title = new Label
-        {
-            Text = "双击任意一行即可在资源管理器里打开",
-            Location = new Point(16, 12),
-            Size = new Size(500, 20),
-            Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold)
-        };
+        title.Text = "双击任意一行即可在资源管理器里打开";
+        title.Location = new Point(16, 12);
+        // 用 AutoSize 而不是硬编码 500px 宽：窗口拉到最窄时 500px 的标签会溢出客户区
+        // （布局自检在 470px 宽度下抓到的）。
+        title.AutoSize = true;
+        title.Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
+        title.Anchor = AnchorStyles.Top | AnchorStyles.Left;
         Controls.Add(title);
 
-        list.Location = new Point(16, 38);
-        list.Size = new Size(628, 292);
+        list.Location = new Point(16, 36);
+        list.Size = new Size(628, 168);
         list.View = View.Details;
         list.FullRowSelect = true;
         list.MultiSelect = false;
@@ -55,42 +60,67 @@ internal sealed class FoldersForm : Form
         list.Columns.Add("说明", 170);
         list.SelectedIndexChanged += (_, _) => UpdateButtons();
         list.DoubleClick += (_, _) => OpenSelected();
-        list.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(list);
 
-        hint.Location = new Point(16, 336);
+        hint.Location = new Point(16, 210);
         hint.Size = new Size(628, 18);
         hint.ForeColor = Color.FromArgb(108, 114, 126);
-        hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(hint);
 
-        openButton = NewButton("在资源管理器中打开", 16, Color.FromArgb(34, 170, 85), 150);
+        openButton = NewButton("在资源管理器中打开", Color.FromArgb(34, 170, 85));
         openButton.Click += (_, _) => OpenSelected();
         Controls.Add(openButton);
 
-        copyButton = NewButton("复制路径", 174, Color.FromArgb(58, 124, 240), 94);
+        copyButton = NewButton("复制路径", Color.FromArgb(58, 124, 240));
         copyButton.Click += (_, _) => CopySelectedPath();
         Controls.Add(copyButton);
 
-        var closeButton = NewButton("关闭", 400, Color.FromArgb(114, 122, 143), 94);
+        closeButton = NewButton("关闭", Color.FromArgb(114, 122, 143));
         closeButton.Click += (_, _) => Close();
         Controls.Add(closeButton);
 
-        var refreshButton = NewButton("刷新", 502, Color.FromArgb(114, 122, 143), 94);
+        refreshButton = NewButton("刷新", Color.FromArgb(114, 122, 143));
         refreshButton.Click += (_, _) => Reload();
         Controls.Add(refreshButton);
 
         CancelButton = closeButton;
+
+        // 与"版本管理"同一套自适应：列表吃掉中间的剩余高度，提示与按钮锚在底部。
+        // 只设 Anchor 不够——列表锚 Top 时拉高窗口它不动，按钮更是纵向写死。
+        Resize += (_, _) =>
+        {
+            ApplyResponsiveLayout();
+            LayoutDump.Capture($"目录 {ClientSize.Width}x{ClientSize.Height}", this,
+                title, list, hint, openButton, copyButton, closeButton, refreshButton);
+        };
+        ApplyResponsiveLayout();
+        DumpLayoutIfRequested();
         Reload();
     }
 
-    private Button NewButton(string text, int x, Color backColor, int width)
+    /// <summary>DSH_LAYOUT_DUMP=1 时在多个尺寸下各排一次并记录几何，验证拉伸是否真的自适应。</summary>
+    private void DumpLayoutIfRequested()
+    {
+        if (!LayoutDump.Enabled) return;
+        Shown += (_, _) =>
+        {
+            foreach (var size in new[] { new Size(660, 286), new Size(660, 400), new Size(900, 320), new Size(470, 226) })
+            {
+                ClientSize = size;
+                ApplyResponsiveLayout();
+                LayoutDump.Capture($"目录 {size.Width}x{size.Height}", this,
+                    title, list, hint, openButton, copyButton, closeButton, refreshButton);
+            }
+            Close();
+        };
+    }
+
+    private Button NewButton(string text, Color backColor)
     {
         var button = new Button
         {
             Text = text,
-            Location = new Point(x, 358),
-            Size = new Size(width, 28),
+            Size = new Size(120, 28),
             FlatStyle = FlatStyle.Flat,
             BackColor = backColor,
             ForeColor = Color.White,
@@ -101,6 +131,61 @@ internal sealed class FoldersForm : Form
         button.FlatAppearance.BorderSize = 0;
         return button;
     }
+
+    /// <summary>
+    /// 让内容跟着窗口尺寸走：列表吃掉中间的剩余高度，提示与按钮永远贴底。
+    /// 之前按钮只按宽度重算 x、纵向写死，所以上下拉伸毫无反应。
+    /// </summary>
+    private void ApplyResponsiveLayout()
+    {
+        const int listTop = 36;
+        const int hintHeight = 18;
+        const int buttonHeight = 28;
+        const int bottomPad = 14;
+        const int margin = 16;
+        const int gap = 8;
+
+        var bottomArea = hintHeight + 8 + buttonHeight + bottomPad;
+        var listHeight = Math.Max(52, ClientSize.Height - listTop - bottomArea);
+
+        list.Location = new Point(margin, listTop);
+        list.Size = new Size(Math.Max(80, ClientSize.Width - margin * 2), listHeight);
+
+        hint.Location = new Point(margin, list.Bottom + 8);
+        hint.Size = new Size(Math.Max(80, ClientSize.Width - margin * 2), hintHeight);
+
+        LayoutButtons(ClientSize.Height - buttonHeight - bottomPad, margin, gap, buttonHeight);
+    }
+
+    /// <summary>
+    /// 四个按钮在底部均分并居中；窗口比"刚好放下"还窄时压缩宽度并退化为贴边，不重叠。
+    /// </summary>
+    private void LayoutButtons(int rowY, int margin, int gap, int buttonHeight)
+    {
+        var buttons = new Button[] { openButton, copyButton, closeButton, refreshButton };
+
+        var widths = buttons.Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        var total = widths.Sum() + gap * (buttons.Length - 1);
+        var available = ClientSize.Width - margin * 2;
+        if (total > available && buttons.Length > 1)
+        {
+            var shrink = (int)Math.Ceiling((total - available) / (double)(buttons.Length - 1));
+            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(72, widths[i] - shrink);
+            total = widths.Sum() + gap * (buttons.Length - 1);
+        }
+
+        var x = Math.Max(margin, (ClientSize.Width - total) / 2);
+        for (var i = 0; i < buttons.Length; i++)
+        {
+            buttons[i].Size = new Size(widths[i], buttonHeight);
+            buttons[i].Location = new Point(x, rowY);
+            x += widths[i] + gap;
+        }
+    }
+
+    /// <summary>供布局自检遍历的控件清单。</summary>
+    internal Control[] DumpControls() =>
+        new Control[] { title, list, hint, openButton, copyButton, closeButton, refreshButton };
 
     /// <summary>
     /// 收集所有相关位置。只返回真实存在的，按"常用的排前面"排序。
