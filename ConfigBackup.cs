@@ -108,7 +108,10 @@ internal static class ConfigBackup
             var durableChanged = hashes.Any(kv =>
                 !volatileFiles.Contains(kv.Key) &&
                 (!previous.TryGetValue(kv.Key, out var old) || !string.Equals(old, kv.Value, StringComparison.Ordinal)));
-            var setChanged = hashes.Count != previous.Count;
+            // 键集合双向对比，而不是只比数量：同一轮里"一增一减、数量恰好不变"
+            // 时（换 profile、改 patch 文件名），只比 hashes.Count != previous.Count 会漏拍。
+            var setChanged = hashes.Keys.Except(previous.Keys, StringComparer.OrdinalIgnoreCase).Any() ||
+                             previous.Keys.Except(hashes.Keys, StringComparer.OrdinalIgnoreCase).Any();
 
             if (previous.Count > 0 && !durableChanged && !setChanged)
                 return null;   // 只有易变文件动过（或什么都没变），不占用快照名额

@@ -29,8 +29,19 @@ if not exist "%STAGED%" (
 
 echo 按任意键开始更新（浏览器里的会话不用关）...
 pause >nul
+rem 只按映像名杀启动器（taskkill 无法按登录会话过滤，可能命中其他会话的启动器实例；
+rem 强杀不走 FormClosing，所以对方的引擎与会话不受影响，重开窗口即可）。
 taskkill /im DeepSeekHarness.exe /f >nul 2>&1
-timeout /t 2 /nobreak >nul
+rem 等进程真的退出（最多 10 秒），比固定 timeout 2 稳——复制失败分支仍在兜底。
+set /a _w=0
+:poll_exit
+tasklist /fi "imagename eq DeepSeekHarness.exe" | find /i "DeepSeekHarness.exe" >nul 2>&1
+if errorlevel 1 goto exited
+if %_w% GEQ 10 goto exited
+timeout /t 1 /nobreak >nul
+set /a _w+=1
+goto poll_exit
+:exited
 copy /y "%STAGED%" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
 if errorlevel 1 (
   echo 复制到 bin\Release 失败：目标 exe 可能仍被占用。

@@ -74,6 +74,11 @@ internal static class Program
     /// </summary>
     private static void RunLayoutSelfTest()
     {
+        // 自检必须真的落盘：LayoutDump.Capture 只认 DSH_LAYOUT_DUMP=1，
+        // 只设 DSH_LAYOUT_TEST 的话会"跑了不写、白忙一场"。这里就地补上
+        //（只影响本进程，不改外部环境）。
+        Environment.SetEnvironmentVariable("DSH_LAYOUT_DUMP", "1");
+
         try
         {
             var dump = Path.Combine(
@@ -115,7 +120,11 @@ internal static class Program
         }
     }
 
-    /// <summary>Local\ 作用域 = 每个登录会话一个实例（多用户各自跑一份，互不干扰）。</summary>
+    /// <summary>
+    /// Local\ 作用域 = 每个登录会话一个实例。进程清扫侧另有限定
+    /// （IsHarnessCommand 宽松分支只认 %USERPROFILE% 下的路径），会话之间不会互杀引擎；
+    /// 但 3080 端口是整机唯一的，同机多用户实际仍只能有一个引擎在跑。
+    /// </summary>
     private static bool TryAcquireSingleInstance()
     {
         try
@@ -145,20 +154,27 @@ internal static class Program
     {
         try
         {
+            // 首个实例可能还在构造窗口（MainWindowHandle 暂为 0）：只查一次会"找到进程
+            // 却提不起窗"然后静默退出，用户看到的仍是"双击没反应"。轮询 3 秒兜住这个窗口期；
+            // 正常情况第一轮就命中，不会增加延迟。
             // Process 对象持有内核句柄，不 Dispose 要等 GC 才释放——这里必须显式收掉，
             // 漏掉的那几个会一直挂在进程表里。
-            var candidates = Process.GetProcessesByName("DeepSeekHarness");
-            foreach (var process in candidates)
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < deadline)
             {
-                using (process)
+                foreach (var process in Process.GetProcessesByName("DeepSeekHarness"))
                 {
-                    if (process.Id == Environment.ProcessId) continue;
-                    var handle = process.MainWindowHandle;
-                    if (handle == IntPtr.Zero) continue;
-                    if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
-                    SetForegroundWindow(handle);
-                    return;
+                    using (process)
+                    {
+                        if (process.Id == Environment.ProcessId) continue;
+                        var handle = process.MainWindowHandle;
+                        if (handle == IntPtr.Zero) continue;
+                        if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
+                        SetForegroundWindow(handle);
+                        return;
+                    }
                 }
+                Thread.Sleep(100);
             }
         }
         catch { }
@@ -184,10 +200,20 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(CrashLogPath)!);
-            File.AppendAllText(
-                CrashLogPath,
-                $"=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n{ex}\n\n",
-                new UTF8Encoding(false));
+            var entry = $"=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n{ex}\n\n";
+            var existing = File.Exists(CrashLogPath)
+                ? File.ReadAllText(CrashLogPath, Encoding.UTF8)
+                : string.Empty;
+            var combined = existing + entry;
+            // 崩溃循环会把它无限撑大：超限时从最近一条旧记录的表头切起，
+            // 保留"上一次 + 这一次"（单条本身超限时只能整条留着——与
+            // update-log 的截断策略同一取舍：宁可留超长记录也不留无头片段）。
+            if (Encoding.UTF8.GetByteCount(combined) > 256 * 1024)
+            {
+                var head = existing.LastIndexOf("=== ", StringComparison.Ordinal);
+                combined = head >= 0 ? existing[head..] + entry : entry;
+            }
+            File.WriteAllText(CrashLogPath, combined, new UTF8Encoding(false));
         }
         catch { }
     }

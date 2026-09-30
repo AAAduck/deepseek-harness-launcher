@@ -84,6 +84,12 @@ internal sealed class HarnessForm : Form
     /// <summary>web profile 目录。此前这个路径在多处各写了一遍，容易写歪，统一到这里。</summary>
     private static readonly string webProfileDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
+    /// <summary>
+    /// 当前用户主目录。宽松进程匹配（IsHarnessCommand）只认它之下的路径——
+    /// 互斥体是 Local\（每登录会话一个），管不到别的会话，不加这道限定就会把
+    /// 另一个会话里的引擎整树杀掉。
+    /// </summary>
+    private static readonly string userHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     private Process? dshProcess;
     private CancellationTokenSource? startCts;
@@ -529,7 +535,11 @@ internal sealed class HarnessForm : Form
         if (!process.Start()) throw new InvalidOperationException("无法启动 DSH 引擎。");
         dshProcess = process;
         // 文件 tail 替代原来的管道事件：认证链接捕获、进度行、recentOutput 摘要都走它。
-        _ = EngineTailLoopAsync(process, tailToken);
+        // 文件 tail 放到后台线程跑：循环体每 250ms 要开一次日志文件读增量，
+        // 留在 UI 线程上时（async 方法沿 WinForms 上下文恢复）一次磁盘卡顿
+        // （engine 目录被 Defender 实时扫描正是实测会卡的地方）就直接变成界面顿挫。
+        // HandleProcessLine 里所有 UI 改动本来就走 BeginInvoke，切到后台无需其他改动。
+        _ = Task.Run(() => EngineTailLoopAsync(process, tailToken));
 
         var started = DateTime.UtcNow;
         var deadline = started + TimeSpan.FromSeconds(StartTimeoutSeconds);
@@ -976,6 +986,13 @@ internal sealed class HarnessForm : Form
                     p.Name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase) ||
                     p.Name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase);
         if (!isNode && !isNpx) return false;
+
+        // 宽松匹配只认**本用户**的残留：另一个登录会话里的引擎 / npx 缓存命令行
+        // 同样含 @deepseek-ai/dsh，不加这道限定会把别人会话的进程整树杀掉
+        // （互斥体是 Local\ 每会话一个，管不到别的会话）。一切用户态路径
+        // （LOCALAPPDATA、.dsh、npm 全局目录）都在 %USERPROFILE% 之下。
+        // 误杀别人进程的代价远大于漏杀一个残留——真残留占着端口有启动前报错兜底。
+        if (userHomeDir.Length > 0 && !c.Contains(userHomeDir, StringComparison.OrdinalIgnoreCase)) return false;
 
         if (c.Contains("@deepseek-ai/dsh", StringComparison.OrdinalIgnoreCase) ||
             c.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase)) return true;
@@ -1636,6 +1653,9 @@ internal sealed class HarnessForm : Form
     private static bool IsSafeVersionToken(string? version) =>
         !string.IsNullOrWhiteSpace(version) &&
         version.Length <= 64 &&
+        // 空格并不在 Path.GetInvalidFileNameChars 里，而安装失败的报错文案承诺了
+        // "不能含空白"——文案说到的就要真检查（纵深防御，成本一行）。
+        !version.Any(char.IsWhiteSpace) &&
         version == Path.GetFileName(version) &&
         !version.Contains("..", StringComparison.Ordinal) &&
         version.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
@@ -2043,7 +2063,8 @@ internal sealed class HarnessForm : Form
 
     /// <summary>
     /// 判定 candidateVersion 是否满足声明的范围。支持的形式：
-    /// ">=0.1.7-rc.1"、"&gt;=0.1.7-rc.1 &lt;0.3.0-0"、"^4.0.1"、"A || B"。
+    /// ">=0.1.7-rc.1"、"&gt;=0.1.7-rc.1 &lt;0.3.0-0"、"^4.0.1"、"~1.2.3"、
+    /// 裸版本号（= 精确匹配，同 npm 语义）、"A || B"。
     /// 三态返回：true 满足 / false 明确不满足 / null 无法判定。
     ///
     /// 这里必须把"明确不满足"和"无法判定"分开：之前只要有一个 token 判定不出来
@@ -2103,9 +2124,26 @@ internal sealed class HarnessForm : Form
             return c.Major == 0 && c.Minor == 0 && c.Build == v.Build;
         }
 
-        // 裸版本号：当作"至少这个版本"，semver 范围里的常见宽松写法
+        if (token.StartsWith('~'))
+        {
+            // tilde：>= 基准，且不越过 minor 位（~1.2.3 → >=1.2.3 <1.3.0）。
+            // 基准只写了两段（~1.2）时 ParseVersion 解析不了，按"无法判定"返回——
+            // 三态里 unknown 的方向是安全的（提示"未能判定"，而不是误判成满足）。
+            var basis = token[1..].Trim();
+            var cmp = CompareVersionStrings(candidate, basis);
+            if (cmp is null) return null;
+            if (cmp < 0) return false;
+            var v = ParseVersion(basis);
+            var c = ParseVersion(candidate);
+            if (v is null || c is null) return null;
+            return c.Major == v.Major && c.Minor == v.Minor;
+        }
+
+        // 裸版本号 = **精确匹配**。npm/semver 里 "1.2.3" 的含义是"恰好这个版本"，
+        // 不是"至少这个版本"：之前按 >= 解释，peerDependencies 写死 "0.1.5" 时
+        // 引擎 0.9.0 会被误判成"满足"——护栏恰好在危险方向上漏报。
         var bare = CompareVersionStrings(candidate, token);
-        return bare is null ? null : bare >= 0;
+        return bare is null ? null : bare == 0;
     }
 
     /// <summary>
@@ -2199,6 +2237,7 @@ internal sealed class HarnessForm : Form
 
     private static async Task<string?> GetLatestEngineVersionAsync(string node, CancellationToken ct)
     {
+        Process? proc = null;
         try
         {
             var npm = ResolveNpmPath(node);
@@ -2225,15 +2264,31 @@ internal sealed class HarnessForm : Form
                 psi.Environment["PATH"] = nodeDir + ";" + path;
             ConfigureOptionalProxy(psi);
 
-            using var proc = new Process { StartInfo = psi };
+            proc = new Process { StartInfo = psi };
             if (!proc.Start()) return null;
-            var outTask = proc.StandardOutput.ReadToEndAsync(queryCts.Token);
-            await proc.WaitForExitAsync(queryCts.Token);
+
+            // 与 RunCmdAsync 同一套纪律（理由见那里的注释，此处此前是反面教材）：
+            // ① stderr 必须读掉——npm 往里写多了管道写满，子进程自己会卡死；
+            // ② 不给 ReadToEndAsync 传 token——取消后剩余数据没人读；
+            // ③ 超时/取消必须 Kill 整棵树——只 Dispose 会留下后台挂着的孤儿 npm。
+            var outTask = proc.StandardOutput.ReadToEndAsync();
+            var errTask = proc.StandardError.ReadToEndAsync();
+            try { await proc.WaitForExitAsync(queryCts.Token); }
+            catch (OperationCanceledException)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                try { await outTask; } catch { }
+                try { await errTask; } catch { }
+                return null;
+            }
+
             var text = (await outTask).Trim();
+            try { await errTask; } catch { }
             if (text.Length == 0) return null;
             return text.Split('\n').Last().Trim();
         }
         catch { return null; }
+        finally { try { proc?.Dispose(); } catch { } }
     }
 
     /// <summary>
@@ -2588,10 +2643,13 @@ internal sealed class HarnessForm : Form
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "DeepSeekHarness");
             Directory.CreateDirectory(logDir);
-            File.AppendAllText(
-                Path.Combine(logDir, "startup-log.txt"),
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n",
-                new UTF8Encoding(false));
+            var path = Path.Combine(logDir, "startup-log.txt");
+            // 读-改-写而不是 AppendAllText：与 update-log 同一条截断策略，
+            // 超过上限按整条记录从头部滚动（此前它无限增长，刷新反复失败时会一直胖下去）。
+            // 调用点都是低频事件（失败/切换/归档），整读整写不构成负担。
+            var existing = File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : string.Empty;
+            var combined = existing + $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n";
+            File.WriteAllText(path, TrimLogTail(combined), new UTF8Encoding(false));
         }
         catch { }
     }
@@ -2616,7 +2674,7 @@ internal sealed class HarnessForm : Form
             // 必须按"整条记录"为单位从头部滚动，不能按字符截断：
             // ① 字符截断会把多字节汉字劈成半个，写出乱码；
             // ② 截断点落在记录中间时，表头被切掉，剩下的日志无法判断是哪次跑的。
-            File.WriteAllText(logFile, TrimUpdateLog(existing + record.ToString()), new UTF8Encoding(false));
+            File.WriteAllText(logFile, TrimLogTail(existing + record.ToString()), new UTF8Encoding(false));
         }
         catch { }
     }
@@ -2625,8 +2683,9 @@ internal sealed class HarnessForm : Form
     /// 超过 256 KB 时只保留末尾约 128 KB，且必须从一条记录的开头切起。
     /// 单条记录本身就超过 128 KB 时，保留该记录的最后 128 KB——
     /// 此时确实无法保证记录完整，但总比留下一个无头片段更有用。
+    /// update-log 与 startup-log 共用（截断策略必须一致，别只改一处）。
     /// </summary>
-    private static string TrimUpdateLog(string text)
+    private static string TrimLogTail(string text)
     {
         const int MaxBytes = 256 * 1024;
         const int KeepBytes = 128 * 1024;
@@ -2676,7 +2735,9 @@ internal sealed class HarnessForm : Form
 
     private async Task RunEnvCheckAsync()
     {
-        if (closing || IsDisposed) return;
+        // busy 也挡：环境检测会改状态文案（"检测中"会覆盖"启动中"）并弹模态报告，
+        // 与进行中的启动/升级互相踩。按钮侧由 EnterBusy 一并禁用（双保险）。
+        if (busy || closing || IsDisposed) return;
         status.Text = "检测中";
         status.ForeColor = WarnColor;
         SetInfo("正在检测环境...");
@@ -3025,6 +3086,9 @@ internal sealed class HarnessForm : Form
     private void ApplyWindowIcon()
     {
         // 让窗口图标与 DeepSeekHarness.exe 的图标一致（含标题栏和任务栏）。
+        // ExtractAssociatedIcon 返回的 Icon **刻意不释放**：与静态字体同一策略——
+        // 它被 Form.Icon 持有、窗体整个存活期都要用，销毁流程里提前释放会抛
+        // ObjectDisposedException。只在构造时取一次、进程级一份，泄漏量可忽略。
         try
         {
             var exeIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -3081,6 +3145,9 @@ internal sealed class HarnessForm : Form
         upgradeButton.Enabled = false;
         // 引擎运行期间不允许切换版本：切换必须先停引擎，让用户在这里点会与启动流程打架。
         versionsButton.Enabled = false;
+        // 「环境」在忙碌期间也禁用：它会改写状态文案并弹模态报告，
+        // 与进行中的启动/升级互相踩（此前只有方法开头一道守卫，按钮还亮着）。
+        envButton.Enabled = false;
         active.Text = text;
         // 忙碌时按钮文字变成"启动中/重启中"，读屏就再也读不出它是哪个按钮了；
         // busyText 本身自描述，直接作为 AccessibleName。
@@ -3108,6 +3175,7 @@ internal sealed class HarnessForm : Form
         restartButton.Enabled = true;
         upgradeButton.Enabled = true;
         versionsButton.Enabled = true;
+        envButton.Enabled = true;
         // 主按钮的文字/颜色随运行状态变，这里是唯一会在状态变化后被调用的地方。
         ApplyPrimaryActionLabel();
     }
@@ -3122,8 +3190,10 @@ internal sealed class HarnessForm : Form
     private void ShowError(string title, string message) => MessageBox.Show(this, message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
 
     /// <summary>
-    /// 进程级资源的收尾。LocalHttp / 字体 / ToolTip 都是长时间存活的对象，
-    /// 此前没有任何一处释放它们。这里先置 closing，避免刷新逻辑再去用已释放的 HttpClient。
+    /// 窗体级资源的收尾。Timer 与 ToolTip 是本窗体创建的，随窗体释放；
+    /// LocalHttp（静态 HttpClient）与静态字体是**进程级**对象，刻意不在此释放——
+    /// 后台任务与后续销毁流程仍可能引用它们。这里先置 closing，
+    /// 让 1.5 秒刷新与后台循环不再发起新请求、不再碰界面。
     /// </summary>
     protected override void Dispose(bool disposing)
     {
