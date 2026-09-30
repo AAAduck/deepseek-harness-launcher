@@ -61,6 +61,8 @@ internal sealed class HarnessForm : Form
     private readonly Button upgradeButton;
     private readonly Button versionsButton;
     private readonly Button foldersButton;
+    /// <summary>动作组右侧的小箭头，负责展开/收起启动、停止、重启。</summary>
+    // 折叠机制已移除：8 个按钮统一尺寸后能排成一行，不再需要展开/收起状态。
     private readonly Button refreshButton;
     private readonly Button envButton;
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1500 };
@@ -104,9 +106,7 @@ internal sealed class HarnessForm : Form
         // 注意：本机是 96 DPI / 100% 缩放，这条改动在这里无法验证，只能保证方向正确。
         AutoScaleMode = AutoScaleMode.Dpi;
         Text = "DeepSeek Harness 控制台";
-        ClientSize = new Size(560, 265);
-        MinimumSize = new Size(560, 265);
-        MaximumSize = new Size(560, 265);
+        SetFixedClientSize(ClientWidth, TargetClientHeight);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -158,7 +158,6 @@ internal sealed class HarnessForm : Form
 
         // 文案必须与真实行为一致：插件更新现在发生在引擎启动「之后」（并行/后台），
         // 且改的是 profile 的 node_modules，所以生效时机是下一次启动。
-        // 实测这个 9pt 下宽 164px；"（下次生效）"移到 tooltip 里，给右侧按钮腾空间。
         autoUpdateCheckbox.Text = "启动后更新插件";
         autoUpdateCheckbox.Checked = LoadAutoUpdateSetting();
         autoUpdateCheckbox.AutoSize = true;
@@ -168,47 +167,71 @@ internal sealed class HarnessForm : Form
         autoUpdateCheckbox.CheckedChanged += (_, _) => SaveAutoUpdateSetting();
         panel.Controls.Add(autoUpdateCheckbox);
 
-        // 引擎不再自动跟随最新版：升级只在这个按钮被点击时发生。
-        // 按钮放在面板内，避免动到已排好的 5 个主按钮几何（窗体尺寸固定 560×265）。
+        // ── 底部一行：8 个按钮全部同尺寸排成一行 ─────────────────────────────────
+        // 演化过程（每一步都由实测数据推动，不是拍脑袋）：
+        //  ① 最初 6 个主按钮各 94px 挤一行（右边界 524/560），调用频率天差地别的操作占同样宽度；
+        //  ② 加目录/版本/升级后彻底排不下，做过"折叠 + 向下展开"；
+        //  ③ 但那样主按钮只有 2 个字却占了 324px 宽（还用了 10pt），比旁边按钮大 6 倍——
+        //     把主按钮缩到与其余按钮完全一致后，8 个按钮反而能一行放下。
+        // 实测（9pt 粗体）：所有两字按钮文字都是 32px，加 20px 内边距 = 52px；
+        // 8 × 52 + 7 × 8 = 472px，可用 496px。所以折叠机制被整个删掉了——
+        // 能一行放下就不需要它，少一个交互状态也少一处出错的地方。
         //
-        // 这一行三个小按钮的坐标是按实测文字宽度算出来的，不是估的：
-        // 复选框实测宽 164px、起点 x=50 → 右边界 214；面板右边界 446。
-        // 可用区间 222..446，三个 72px 按钮 + 8px 间距正好放得下。
-        // 底部那一行 6 个主按钮已经排满（右边界 524），所以新按钮加在这里，不加宽窗体。
-        // 「升级引擎」缩成「升级」是为此腾的空间，完整含义放在 AccessibleName 与 tooltip 里。
-        foldersButton = NewPanelButton("目录", "打开 DeepSeek Harness 相关目录",
-            new Point(238, 105), Color.FromArgb(58, 124, 240));
-        foldersButton.TabIndex = 7;
-        foldersButton.Click += (_, _) => OpenFoldersWindow();
-        panel.Controls.Add(foldersButton);
+        // 尺寸统一是刻意的：主按钮不再特殊，同高（34 逻辑像素）、同字体、同宽。
+        const int RowH = 34;
 
-        versionsButton = NewPanelButton("版本管理", "管理已安装的引擎版本：切换、删除",
-            new Point(318, 105), Color.FromArgb(88, 94, 104));
-        versionsButton.TabIndex = 6;
-        versionsButton.Click += (_, _) => OpenEngineVersions();
-        panel.Controls.Add(versionsButton);
+        startButton = NewActionButton("启动", "启动 Harness 引擎并打开控制台。回车键等效",
+            Color.FromArgb(34, 170, 85));
+        stopButton = NewActionButton("停止", "停止引擎并释放端口",
+            Color.FromArgb(224, 69, 62));
+        restartButton = NewActionButton("重启", "结束当前引擎并重新启动",
+            Color.FromArgb(238, 148, 32));
+        refreshButton = NewActionButton("刷新", "重新检测引擎状态", Color.FromArgb(58, 124, 240));
+        envButton = NewActionButton("环境", "检测 Node、npm、pnpm、引擎与端口", Color.FromArgb(114, 122, 143));
+        foldersButton = NewActionButton("目录", "打开 DeepSeek Harness 相关目录", Color.FromArgb(58, 124, 240));
+        versionsButton = NewActionButton("版本", "管理已安装的引擎版本：切换、删除", Color.FromArgb(88, 94, 104));
+        upgradeButton = NewActionButton("升级", "升级 DSH 引擎到 npm 上的最新版本", Color.FromArgb(114, 122, 143));
 
-        upgradeButton = NewPanelButton("升级", "升级 DSH 引擎到 npm 上的最新版本",
-            new Point(398, 105), Color.FromArgb(114, 122, 143));
-        upgradeButton.TabIndex = 2;
-        upgradeButton.Click += async (_, _) => await RunEngineUpgradeAsync();
-        panel.Controls.Add(upgradeButton);
+        Controls.AddRange(new Control[]
+        {
+            startButton, stopButton, restartButton,
+            refreshButton, envButton, foldersButton, versionsButton, upgradeButton
+        });
 
-        startButton = NewButton("开始", "启动 Harness 引擎并打开控制台。回车键等效", 22, Color.FromArgb(34, 170, 85));
-        restartButton = NewButton("重启", "结束当前引擎并重新启动", 124, Color.FromArgb(238, 148, 32));
-        stopButton = NewButton("停止", "停止引擎并释放端口", 226, Color.FromArgb(224, 69, 62));
-        refreshButton = NewButton("刷新", "重新检测引擎状态", 328, Color.FromArgb(58, 124, 240));
-        envButton = NewButton("环境", "检测 Node、npm、pnpm、引擎与端口", 430, Color.FromArgb(114, 122, 143));
-        Controls.AddRange(new Control[] { startButton, restartButton, stopButton, refreshButton, envButton });
+        LayoutBottomRow(rowHeight: BottomRowHeight);
 
-        startButton.Click += async (_, _) => await RunStartAsync(startButton, "启动中", reuseExisting: true);
+        // 布局自检：DSH_LAYOUT_DUMP=1 时把窗口与按钮的实际几何写进 layout-dump.txt 并退出。
+        // 加这个是因为靠截图/自动化去验证 Windows 布局既慢又不可靠（试过 UIAutomation 与
+        // PrintWindow，都拿不到稳定结果），而布局对不对是可以直接测量的事实——
+        // 它已经抓出过"按钮溢出客户区"和"居中把行推出边界"两个真问题。
+        Shown += (_, _) =>
+        {
+            // 客户区尺寸要等窗口真正显示后才稳定（之前 Set 的值可能被 DPI 换算与屏幕边界改写），
+            // 所以这里按最终尺寸重排一次。
+            LayoutBottomRow(rowHeight: BottomRowHeight);
+            if (Environment.GetEnvironmentVariable("DSH_LAYOUT_DUMP") == "1")
+            {
+                DumpLayout("显示后");
+                Close();
+            }
+        };
+
+        startButton.Click += async (_, _) =>
+        {
+            // 主按钮随状态切换语义：运行中点它是「停止」，否则是「启动」。
+            if (isOn) await StopClickedAsync();
+            else await RunStartAsync(startButton, "启动中", reuseExisting: true);
+        };
         restartButton.Click += async (_, _) => await RunStartAsync(restartButton, "重启中", reuseExisting: false);
         stopButton.Click += async (_, _) => await StopClickedAsync();
         refreshButton.Click += async (_, _) => await RefreshStatusAsync();
         envButton.Click += async (_, _) => await RunEnvCheckAsync();
+        foldersButton.Click += (_, _) => OpenFoldersWindow();
+        versionsButton.Click += (_, _) => OpenEngineVersions();
+        upgradeButton.Click += async (_, _) => await RunEngineUpgradeAsync();
         refreshTimer.Tick += async (_, _) => await RefreshStatusAsync();
 
-        // 键盘可达性：回车 = 开始，Esc = 停止（破坏性最小的那个）。
+        // 键盘可达性：回车 = 启动，Esc = 停止（破坏性最小的那个）。
         AcceptButton = startButton;
         CancelButton = stopButton;
         ApplyAccessibility();
@@ -1094,24 +1117,182 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>
-    /// 面板内那一排小按钮（目录 / 版本管理 / 升级）。三者几何一致，抽出来避免三份重复代码。
+    /// 底部那 8 个按钮：几何由 LayoutBottomRow 统一排，这里只定外观。
+    /// 全部同高、同字体、同内边距——主按钮不再特殊（它曾经 324px 宽、10pt，
+    /// 比旁边按钮大出 6 倍）。宽度先给占位值，布局时按实测文字改写。
     /// </summary>
-    private Button NewPanelButton(string text, string accessibleName, Point location, Color backColor)
+    private Button NewActionButton(string text, string accessibleName, Color backColor)
     {
         var button = new Button
         {
             Text = text,
-            Location = location,
-            Size = new Size(72, 26),
+            Size = new Size(52, BottomRowHeight),
             FlatStyle = FlatStyle.Flat,
             BackColor = backColor,
             ForeColor = Color.White,
             Font = BoldFont,
             Cursor = Cursors.Hand,
-            AccessibleName = accessibleName
+            AccessibleName = accessibleName,
+            AutoEllipsis = true   // 万一某处字体比预期宽，宁可显示省略号也不要裁掉半个字
         };
         button.FlatAppearance.BorderSize = 0;
         return button;
+    }
+
+    private const int BottomRowHeight = 34;
+    private const int SideMargin = 22;
+    /// <summary>
+    /// 期望的客户区高度。窗体固定尺寸，这个值决定整体高度。
+    /// 注意 MinimumSize/MaximumSize 用的是**窗口**尺寸（含标题栏与边框），
+    /// 直接拿客户区高度去设会让客户区少掉标题栏那几十像素——展开行/按钮行因此溢出过。
+    /// 所以下面用 SetFixedClientSize 一次性把三者算自洽。
+    /// </summary>
+    private const int TargetClientHeight = 232;
+    /// <summary>窗体宽度固定不变。</summary>
+    private const int ClientWidth = 560;
+
+    /// <summary>
+    /// 把 8 个按钮排成一行：各自宽度按实测文字 + 相同内边距，整体居中。
+    ///
+    /// 为什么不写死 94px：中文两字按钮在 9pt 粗体下实测 32px，三字 48px，
+    /// 写死宽度要么浪费空间要么把长文案挤到省略号。按文字量算，改文案时布局自己会跟着走。
+    /// 宽度用**实际 ClientSize** 而不是常量：本机 DeviceDpi 报 120（1.25 倍），
+    /// 逻辑 560 会被换算成设备 700 并因此被屏幕截断，写死常量就会算歪。
+    /// </summary>
+    /// <summary>
+    /// 把 8 个按钮排成一行：宽度按实测文字 + 相同内边距，整体居中，垂直方向贴近底边。
+    ///
+    /// 刻意不依赖写死的 y / 客户区高度常量：本机 DeviceDpi 报 120（1.25 倍），
+    /// 逻辑尺寸会被换算成设备尺寸并可能被屏幕截断，写死就会算歪（自检抓出过"按钮排到 202
+    /// 而客户区只有 188"）。所以行位置由**实际 ClientSize** 反推，并在窗口显示后重排一次。
+    /// </summary>
+    private void LayoutBottomRow(int rowHeight)
+    {
+        var buttons = new List<Button>
+        {
+            startButton, stopButton, restartButton,
+            refreshButton, envButton, foldersButton, versionsButton, upgradeButton
+        };
+        var gap = 8;
+
+        var widths = buttons.Select(b => TextWidth(b.Text, b.Font) + 20).ToList();
+        var total = widths.Sum() + gap * (buttons.Count - 1);
+
+        // 超出可用宽度时按比例压缩间隙，保证一定放得下。下界 2px：
+        // 压到 0 会让按钮粘在一起，不如交给 AutoEllipsis 处理文字。
+        var available = ClientSize.Width - 8;
+        if (total > available)
+            gap = Math.Max(2, gap - (int)Math.Ceiling((total - available) / (double)(buttons.Count - 1)));
+        total = widths.Sum() + gap * (buttons.Count - 1);
+
+        var x = Math.Max(4, (ClientSize.Width - total) / 2);
+        // 贴底留 12px；不设下限——下限会把行推出客户区（自检抓到过"排到 194 而只高 188"）。
+        // 高度不够是窗体尺寸的问题，已经由下面的 MinimumSize 用窗口尺寸正确表达。
+        var rowY = Math.Max(120, ClientSize.Height - rowHeight - 12);
+
+        for (var i = 0; i < buttons.Count; i++)
+        {
+            buttons[i].Size = new Size(widths[i], rowHeight);
+            buttons[i].Location = new Point(x, rowY);
+            x += widths[i] + gap;
+        }
+        bottomRowY = rowY;
+    }
+
+    private int bottomRowY = 168;
+
+    private static int TextWidth(string text, Font font) =>
+        TextRenderer.MeasureText(text, font).Width;
+
+    /// <summary>
+    /// 把客户区固定为指定尺寸，并让 MinimumSize/MaximumSize 与之一致。
+    ///
+    /// 这里必须用"差值"而不是直接赋值：Size/ClientSize 之间的关系是
+    /// ClientSize = Size - 边框 - 标题栏，而边框宽度随主题与 DPI 变化。
+    /// 早先写成 MinimumSize = new Size(宽, 客户区高)，等于要求窗口高度小于客户区高度，
+    /// 结果客户区被压到 188px，底部按钮行整个溢出（自检抓到的）。
+    /// 先设 ClientSize，再按 Size 与 ClientSize 的实际差值补齐，就不会算歪。
+    /// </summary>
+    private void SetFixedClientSize(int width, int height)
+    {
+        MinimumSize = Size.Empty;   // 先解除约束，否则设 ClientSize 会被旧的最小值挡住
+        MaximumSize = Size.Empty;
+        ClientSize = new Size(width, height);
+        var chromeW = Size.Width - ClientSize.Width;
+        var chromeH = Size.Height - ClientSize.Height;
+        var window = new Size(width + chromeW, height + chromeH);
+        MinimumSize = window;
+        MaximumSize = window;
+    }
+
+    /// <summary>
+    /// 把窗口与底部按钮的实际几何写进 layout-dump.txt，供 DSH_LAYOUT_DUMP=1 自检。
+    /// 用文件而不是 Console：本程序是 WinExe，没有控制台，WriteLine 会直接消失
+    /// （这正是我第一版自检看不到任何输出的原因）。
+    /// 用来确认"按钮没溢出、没重叠、没跑出客户区"——这些是能量化的，不必靠肉眼看截图。
+    /// </summary>
+    private void DumpLayout(string label)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"[{label}] ClientSize={ClientSize.Width}x{ClientSize.Height} " +
+                          $"Min={MinimumSize.Width}x{MinimumSize.Height} Max={MaximumSize.Width}x{MaximumSize.Height} " +
+                          $"AutoScaleMode={AutoScaleMode} AutoScaleFactor={AutoScaleFactor} " +
+                          $"DeviceDpi={DeviceDpi} LogicalToDeviceUnits(560)={LogicalToDeviceUnits(560)}");
+            var all = new Control[] { startButton, stopButton, restartButton,
+                                      refreshButton, envButton, foldersButton, versionsButton, upgradeButton };
+            foreach (var b in all)
+            {
+                if (b is not Button btn) continue;
+                var right = btn.Left + btn.Width;
+                var bottom = btn.Top + btn.Height;
+                var flags = new List<string>();
+                if (right > ClientSize.Width) flags.Add("右溢出");
+                if (bottom > ClientSize.Height) flags.Add("下溢出");
+                if (btn.Left < 0 || btn.Top < 0) flags.Add("负坐标");
+                sb.AppendLine($"  {(btn.Visible ? "可见" : "隐藏")} {btn.Text,-4} " +
+                              $"x={btn.Left,4} y={btn.Top,4} w={btn.Width,3} h={btn.Height,2} " +
+                              $"右={right,4} 下={bottom,4} {(flags.Count > 0 ? "✗ " + string.Join(",", flags) : "✓")}");
+            }
+            var visible = all.OfType<Button>().Where(b => b.Visible).ToList();
+            for (var i = 0; i < visible.Count; i++)
+            for (var j = i + 1; j < visible.Count; j++)
+            {
+                if (visible[i].Bounds.IntersectsWith(visible[j].Bounds))
+                    sb.AppendLine($"  ✗ 重叠: {visible[i].Text} 与 {visible[j].Text}");
+            }
+            if (fontsDistinct(visible)) sb.AppendLine("  ✗ 可见按钮的字体/高度不一致");
+            File.WriteAllText(
+                Path.Combine(LocalAppDir, "layout-dump.txt"),
+                sb.ToString(), new UTF8Encoding(false));
+
+            static bool fontsDistinct(List<Button> bs) =>
+                bs.Select(b => b.Height).Distinct().Count() > 1;
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 展开/收起动作按钮组：向下多长出一行放「重启」。
+    ///
+    /// 窗体是固定尺寸的，所以要改三处且必须自洽：ClientSize 是客户区，
+    /// MinimumSize/MaximumSize 是**窗口**尺寸（含标题栏与边框）。
+    /// 之前把 MinimumSize 设成了 560x258 而 ClientSize 只有 560x214——
+    /// 最小值比实际还大，窗口被反而挤小，展开行因此溢出客户区。
+    /// 正确的做法是先把 ClientSize 落到目标值，再按算出来的窗口尺寸设最小/最大。
+    /// </summary>
+    /// <summary>
+    /// 主按钮的文字随状态变，永远是"当前该点的那个"：未运行→启动，运行中→停止。
+    /// 「停止」和「重启」也各自独立可见可点，所以不需要折叠机制。
+    /// </summary>
+    private void ApplyPrimaryActionLabel()
+    {
+        startButton.Text = isOn ? "停止" : "启动";
+        startButton.BackColor = isOn ? Color.FromArgb(224, 69, 62) : Color.FromArgb(34, 170, 85);
+        startButton.AccessibleName = isOn
+            ? "停止引擎并释放端口"
+            : "启动 Harness 引擎并打开控制台。回车键等效";
     }
 
     /// <summary>
@@ -2543,24 +2724,6 @@ internal sealed class HarnessForm : Form
 
     // ---- 链接与界面 ---------------------------------------------------------
 
-    private Button NewButton(string text, string accessibleName, int x, Color backColor)
-    {
-        var button = new Button
-        {
-            Text = text,
-            Location = new Point(x, 168),
-            Size = new Size(94, 46),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = backColor,
-            ForeColor = Color.White,
-            Font = ButtonFont,
-            Cursor = Cursors.Hand,
-            AccessibleName = accessibleName
-        };
-        button.FlatAppearance.BorderSize = 0;
-        return button;
-    }
-
     /// <summary>
     /// 无障碍与键盘可达性。屏幕阅读器读不出"开始/重启/停止"这种两字按钮是干什么的，
     /// 而状态与提示文字的变化（"正在启动…""启动失败"）此前也不会被主动播报。
@@ -2659,9 +2822,6 @@ internal sealed class HarnessForm : Form
     private void EndBusy()
     {
         busy = false;
-        startButton.Text = "开始";
-        restartButton.Text = "重启";
-        stopButton.Text = "停止";
         upgradeButton.Text = "升级";
         startButton.AccessibleName = "启动 Harness 引擎并打开控制台。回车键等效";
         restartButton.AccessibleName = "结束当前引擎并重新启动";
@@ -2678,6 +2838,8 @@ internal sealed class HarnessForm : Form
         stopButton.Enabled = isOn;
         upgradeButton.Enabled = true;
         versionsButton.Enabled = true;
+        // 主按钮的文字/颜色随运行状态变，这里是唯一会在状态变化后被调用的地方。
+        ApplyPrimaryActionLabel();
     }
 
     private void DrawLamp(object? sender, PaintEventArgs e)
