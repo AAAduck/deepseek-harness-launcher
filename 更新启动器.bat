@@ -27,6 +27,27 @@ if not exist "%STAGED%" (
   exit /b 1
 )
 
+rem ── SHA256 完整性校验（防 staging 目录被写坏或替换）──────────────────────
+rem 发布时把 exe 和它的 .sha256 文件一起放进 update-staging\。
+rem 没有 .sha256 文件时跳过校验（兼容旧流程），有则必须比对通过才继续。
+set "SHA256FILE=%STAGED%.sha256"
+if exist "%SHA256FILE%" (
+  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 ^| findstr /v "hash"') do set "COMPUTED=%%a"
+  rem 去掉空格（certutil 输出有空格分隔符）
+  set "COMPUTED=%COMPUTED: =%"
+  set /p EXPECTED=<"%SHA256FILE%"
+  if /i not "%COMPUTED%"=="%EXPECTED%" (
+    echo.
+    echo ✗ SHA256 校验失败，staging 文件可能已损坏或被替换。
+    echo   期望：%EXPECTED%
+    echo   实际：%COMPUTED%
+    echo   请重新放入正确的 DeepSeekHarness.exe 和 .sha256 文件。
+    pause
+    exit /b 1
+  )
+  echo ✓ SHA256 校验通过
+)
+
 echo 按任意键开始更新（浏览器里的会话不用关）...
 pause >nul
 rem 只按映像名杀启动器（taskkill 无法按登录会话过滤，可能命中其他会话的启动器实例；

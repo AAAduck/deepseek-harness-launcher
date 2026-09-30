@@ -153,7 +153,7 @@ internal static class ConfigBackup
             PruneOldSnapshots();
             return target;
         }
-        catch { return null; }
+        catch (Exception ex) { Swallow.Quiet(ex, "config-snapshot"); return null; }
     }
 
     /// <summary>
@@ -211,7 +211,7 @@ internal static class ConfigBackup
                 try { old.Delete(recursive: true); } catch { }
             }
         }
-        catch { }
+        catch (Exception ex) { Swallow.Quiet(ex, "prune-snapshots"); }
     }
 
     /// <summary>
@@ -306,6 +306,6 @@ internal static class ConfigBackup
             }
             return restored;
         }
-        catch { return -1; }
+        catch (Exception ex) { Swallow.Quiet(ex, "config-restore"); return -1; }
     }
 }

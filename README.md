@@ -151,9 +151,10 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
    ```powershell
    dotnet publish DeepSeekHarness.csproj -c Release -p:OutDir=D:\tmp\dsh-pub\bin\ -o D:\tmp\dsh-pub\out
    ```
-3. **放进暂存目录**（脚本从这里取件）：
+3. **放进暂存目录**（脚本从这里取件；同时生成 SHA256 校验文件，脚本覆盖前会比对）：
    ```powershell
    Copy-Item D:\tmp\dsh-pub\out\DeepSeekHarness.exe "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe" -Force
+   certutil -hashfile "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe" SHA256 | Select-Object -Skip 1 -First 1 | ForEach-Object { $_.Replace(' ','') } | Out-File "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe.sha256" -Encoding ascii
    ```
 4. **双击 `更新启动器.bat`，按任意键**。脚本依次：按映像名强杀旧启动器（绝不碰 node）→
    覆盖 `bin\Release\net8.0-windows\win-x64\` 与脚本旁的桌面副本 → 启动新实例。
@@ -164,7 +165,8 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - 复用路径不会跑本轮插件后台更新（本来它也只是"下次启动生效"，无碍）；
 - 脚本只按映像名杀启动器这一个进程；引擎版本要变的话，更新完在新窗口点「升级」；
 - 复制失败分支（目标仍被占用）不伤引擎与会话：确认旧进程退干净后重跑脚本即可；
-- 单实例互斥保证新旧实例不会重叠争抢引擎与 `web-url.txt`（脚本先杀后起，顺序天然正确）。
+- 单实例互斥保证新旧实例不会重叠争抢引擎与 `web-url.txt`（脚本先杀后起，顺序天然正确）；
+- `.sha256` 文件可选：放了就校验，没放就跳过（兼容旧流程）。
 
 ## 已知限制
 
@@ -184,6 +186,30 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
   `/api/*` 对任何 HTTP 头形式（Bearer / Cookie / query）一律 401——认证是浏览器端握手。
   所以启动器只能确认"这台 3080 上跑的确实是 DSH"，无法确认链接里的 token 还有效。
 
+以下几条是已实现的增强（1.4.0 起），记录设计意图，供后续维护参考：
+
+- **token DPAPI 加密落盘**：`web-url.txt` 里的认证链接现在经 `ProtectedData.Protect`
+  （CurrentUser 作用域）加密后写入，只有同一个 Windows 用户能解开。旧版明文文件读取时
+  自动升级为加密格式，用户无感。配置快照仍备份 `.credentials.yaml` 明文（还原需要），
+  提示不变：**这两个目录勿贴进截图或共享给别人**。
+- **`更新启动器.bat` SHA256 校验**：把 exe 放进 `update-staging\` 时同时放一个
+  `.sha256` 文件，脚本覆盖前自动比对。校验失败会中止并提示，防止 staging 文件被写坏
+  或替换。没有 `.sha256` 文件时跳过校验（兼容旧流程）。
+- **代理探测正负分开缓存**：探到 7897 开着 → 永久缓存，之后零成本；探不到 → 负缓存
+  60 秒后重探。四条调用路径（启动/装引擎/升级/查版本）在一次启动内不会重复探测，
+  而"启动器开着才打开代理"的用户最多多等 60 秒。
+- **低频路径异常统一日志**：配置快照、恢复、引擎归档、孤儿锁清理等低频关键路径的
+  静默 `catch { }` 改为经 `Swallow.Quiet(ex, context)` 记录到 startup-log，
+  同一异常源每小时只记一条。磁盘满、权限被撤这类系统性问题不再完全无信号。
+- **`engine.migrating` 定时归档**：`RefreshStatusAsync`（每 1.5 秒）挂一个每小时一次的
+  节流器，长期只复用不重启的用户也能在 1 小时内自动归档 `engine.migrating`，
+  不再需要点「重启」才能释放那 214 MB。
+- **PID 复用 StartTime 校验**：`StopHarnessProcessesCore` 与 `StopEngineForExit` 杀进程前，
+  先比对 `Process.StartTime` 与 WMI 快照里的 `CreationDate`。PID 被系统复用时
+  StartTime 必然不同，直接跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
+- **引擎日志截断保留尾部**：每次真启动时把 `engine-stdio.log` 截断到末尾 8 MB
+  （在第一个完整换行符处切开，避免截断多字节 UTF-8 字符），日志体量从此有界。
+
 ## 文件说明
 
 - `HarnessForm.cs`：主界面、进程管理、端口检测、认证 URL 捕获（engine-stdio.log 增量 tail）、
@@ -191,6 +217,12 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - `EngineVersionsForm.cs`：引擎版本管理窗口（列表 / 切换 / 删除）。列举与删除都放后台线程，
   窗口因此能在遍历 2.5 万个 `node_modules` 文件时保持响应。
 - `FoldersForm.cs`：相关目录一览窗口。
+- `DpapiFile.cs`：DPAPI（CurrentUser 作用域）文件加密/解密。认证链接（`web-url.txt`）含完整
+  token，明文落盘时任何能读 `%LOCALAPPDATA%` 的进程都能拿到；加密后只有同一 Windows 用户
+  能解开。旧版明文文件读取时自动升级为加密格式，用户无感。
+- `Swallow.cs`：低频路径异常统一日志（`Swallow.Quiet(ex, context)`）。同一异常源
+  每小时只写一条 startup-log，磁盘满/权限消失等系统性问题不再完全静默；
+  高频路径（刷新、tail 循环）保持零开销静默。
 - `ConfigBackup.cs`：配置快照（启动前与升级前自动拍摄、按文件哈希去重、一键恢复）。
   快照判定（`NeedsSnapshot`）与恢复路径守卫（`IsWithinRoot`）是纯函数，有单测。
   `engine.old` 的归档不在这个窗口里做——那是**写操作**，而列举版本是只读操作，
@@ -221,6 +253,7 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
   恒为真会让关窗时把所有进程整树杀掉）——所以**改一条时记得连另一条一起看**。
 - `更新启动器.bat`：标准更新入口，随时可执行（1.3.0 起 Web 会话不中断；首次迁移例外见
   「更新启动器本体」）。按映像名只杀启动器（不碰 node）、
-  从 `%LOCALAPPDATA%\DeepSeekHarness\update-staging\` 取新 exe 覆盖 `bin\Release` 与脚本旁副本、
-  拉起新实例（自动复用仍在运行的引擎；复用不可用时自动重拉并打开新认证链接）。
+  从 `%LOCALAPPDATA%\DeepSeekHarness\update-staging\` 取新 exe（有 `.sha256` 则校验）、
+  覆盖 `bin\Release` 与脚本旁副本、拉起新实例（自动复用仍在运行的引擎；
+  复用不可用时自动重拉并打开新认证链接）。
 - `DeepSeekHarness.exe`：构建产物，约 155 MB，不入库。从 [GitHub Releases](https://github.com/AAAduck/deepseek-harness-launcher/releases) 下载，或自行构建。

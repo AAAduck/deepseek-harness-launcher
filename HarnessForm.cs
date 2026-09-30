@@ -358,7 +358,7 @@ internal sealed class HarnessForm : Form
         // 这里只碰 engine.old 与 engine.<版本>，**不碰 engine**，所以引擎在跑也安全。
         // 放在 EnterBusy 之后：busy 已禁用「版本」，不会与版本管理的扫描并发。
         // 放后台线程：同名槽的清理是 2.5 万文件的递归删除，不能挂在 UI 线程上。
-        try { await Task.Run(MigrateEngineOldToSlot); } catch { }
+        try { await Task.Run(MigrateEngineOldToSlot); } catch (Exception ex) { Swallow.Quiet(ex, "migrate-engine-old"); }
 
         Task? pluginTask = null;
         try
@@ -575,7 +575,7 @@ internal sealed class HarnessForm : Form
         try
         {
             Directory.CreateDirectory(LocalAppDir);
-            if (File.Exists(engineStdioLog)) File.Delete(engineStdioLog);
+            TruncateEngineLog();   // 截断保留尾部 8 MB，避免日志无限膨胀
         }
         catch { }
 
@@ -716,7 +716,8 @@ internal sealed class HarnessForm : Form
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(urlFile)!);
-            File.WriteAllText(urlFile, url, new UTF8Encoding(false));
+            // DPAPI 加密落盘：token 只有当前 Windows 用户能解开，其他进程拿到文件也没用。
+            DpapiFile.WriteAllText(urlFile, url);
         }
         catch { }
 
@@ -899,6 +900,14 @@ internal sealed class HarnessForm : Form
             }
             lamp.Invalidate();
             UpdateButtons();
+
+            // engine.migrating 定时归档：长期只复用不重启的用户，残留会永久占着 214 MB。
+            // 每小时后台检查一次（有才动，没有零成本）。busy 时跳过，与启动路径互斥。
+            if (!busy && DateTime.UtcNow - lastMigrateAttemptAt > MigrateThrottle)
+            {
+                lastMigrateAttemptAt = DateTime.UtcNow;
+                _ = Task.Run(MigrateEngineOldToSlot);
+            }
         }
         catch (Exception ex)
         {
@@ -947,7 +956,16 @@ internal sealed class HarnessForm : Form
         foreach (var id in all.OrderByDescending(x => x))
         {
             // Process 对象持有内核句柄，用完即收、不等 GC（与 Program.ActivateExistingWindow 同一纪律）。
-            try { using var victim = Process.GetProcessById(id); victim.Kill(entireProcessTree: true); } catch { }
+            // PID 复用防护：GetProcessById 之后比对 StartTime，PID 被系统复用时 StartTime 必然不同。
+            // 此时跳过不杀——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
+            if (!records.TryGetValue(id, out var expected)) continue;
+            try
+            {
+                using var victim = Process.GetProcessById(id);
+                if (victim.StartTime != expected.StartTime) continue;
+                victim.Kill(entireProcessTree: true);
+            }
+            catch { }
         }
         try { dshProcess?.Dispose(); } catch { }
         dshProcess = null;
@@ -975,7 +993,13 @@ internal sealed class HarnessForm : Form
         {
             foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
             {
-                try { using var victim = Process.GetProcessById(record.Id); victim.Kill(entireProcessTree: true); }
+                // PID 复用防护：同 StopHarnessProcessesCore，StartTime 不同即跳过。
+                try
+                {
+                    using var victim = Process.GetProcessById(record.Id);
+                    if (victim.StartTime != record.StartTime) continue;
+                    victim.Kill(entireProcessTree: true);
+                }
                 catch { }
             }
         }
@@ -1023,6 +1047,13 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private static Dictionary<int, ProcessRecord>? processRecordCache;
     private static DateTime processRecordCacheAt = DateTime.MinValue;
+    /// <summary>
+    /// engine.migrating 定时归档的节流器：RefreshStatusAsync 每 1.5 秒跑一次，
+    /// 这里挂一个每小时一次的 check，确保长期只复用不重启的用户也不会让
+    /// engine.migrating 永久占着约 214 MB。
+    /// </summary>
+    private static DateTime lastMigrateAttemptAt = DateTime.MinValue;
+    private static readonly TimeSpan MigrateThrottle = TimeSpan.FromHours(1);
 
     private static Dictionary<int, ProcessRecord> GetProcessRecords()
     {
@@ -1033,12 +1064,17 @@ internal sealed class HarnessForm : Form
         var result = new Dictionary<int, ProcessRecord>();
         try
         {
-            using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name, CommandLine FROM Win32_Process");
+            using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name, CommandLine, CreationDate FROM Win32_Process");
             foreach (ManagementObject item in searcher.Get())
             {
                 var id = Convert.ToInt32(item["ProcessId"]);
                 var parent = Convert.ToInt32(item["ParentProcessId"]);
-                result[id] = new ProcessRecord(id, parent, item["Name"] as string ?? string.Empty, item["CommandLine"] as string ?? string.Empty);
+                // PID 复用防护：StartTime 用于在 Kill 前比对——PID 被系统复用时 StartTime 必然不同。
+                // WMI 的 CreationDate 是 FILETIME（UTC），转成 DateTime 供后续比较。
+                var startTime = item["CreationDate"] is string creationStr
+                    ? ManagementDateTimeConverter.ToDateTime(creationStr)
+                    : DateTime.MinValue;
+                result[id] = new ProcessRecord(id, parent, item["Name"] as string ?? string.Empty, item["CommandLine"] as string ?? string.Empty, startTime);
             }
         }
         catch { }
@@ -1185,7 +1221,7 @@ internal sealed class HarnessForm : Form
             if (GetProcessRecords().Values.Any(IsHarnessCommand)) return;
             File.Delete(lockPath);
         }
-        catch { }
+        catch (Exception ex) { Swallow.Quiet(ex, "clear-orphan-lock"); }
     }
 
     private static async Task WaitForPortToCloseAsync(int port, TimeSpan timeout, CancellationToken ct)
@@ -1875,10 +1911,7 @@ internal sealed class HarnessForm : Form
 
             ArchiveClaimedDir();
         }
-        catch (Exception ex)
-        {
-            AppendStartupLog("认领 engine.old 失败：" + ex.Message);
-        }
+        catch (Exception ex) { Swallow.Quiet(ex, "migrate-engine-old"); }
     }
 
     /// <summary>归档要依次做的两步。</summary>
@@ -1933,10 +1966,7 @@ internal sealed class HarnessForm : Form
             Directory.Move(engineMigratingDir, slot);
             AppendStartupLog($"已把上一版本 {oldVersion} 归档为可切换版本");
         }
-        catch (Exception ex)
-        {
-            AppendStartupLog("归档 engine.migrating 失败：" + ex.Message);
-        }
+        catch (Exception ex) { Swallow.Quiet(ex, "archive-claimed-dir"); }
     }
 
     /// <summary>
@@ -2009,7 +2039,7 @@ internal sealed class HarnessForm : Form
                 return;
             }
         }
-        catch { }
+        catch (Exception ex) { Swallow.Quiet(ex, "recover-engine-swap"); }
     }
 
     /// <summary>
@@ -2288,7 +2318,9 @@ internal sealed class HarnessForm : Form
         var nums = new int[4];
         for (var i = 0; i < parts.Length; i++)
             if (!int.TryParse(parts[i], out nums[i])) return null;
-        return new Version(nums[0], nums[1], nums[2], nums.Length > 3 ? nums[3] : 0);
+        // 第四段以**输入**有没有为准。此前误写成 nums.Length（恒为 4，条件永真）——
+        // 结果恰好正确（三段输入时 nums[3] 默认 0），但那是靠数组默认值兜底，不是判断本身对。
+        return new Version(nums[0], nums[1], nums[2], parts.Length > 3 ? nums[3] : 0);
     }
 
     /// <summary>S1 &gt; S2 → 1；相等 → 0；S1 &lt; S2 → -1；无法比较 → null。</summary>
@@ -2925,9 +2957,10 @@ internal sealed class HarnessForm : Form
     /// 和每次启动都更新，实际没有区别。手动点「启动」也受这个节流约束，
     /// 需要强制刷新时删掉戳记文件即可。
     /// </summary>
-    private int PluginUpdateCooldownHours => 20;
+    // 与"上次成功更新"比较的冷却时长。不依赖任何实例状态，用 const 而不是实例属性。
+    private const int PluginUpdateCooldownHours = 20;
 
-    private string PluginUpdateStampFile => Path.Combine(LocalAppDir, "lastPluginUpdate.txt");
+    private static string PluginUpdateStampFile => Path.Combine(LocalAppDir, "lastPluginUpdate.txt");
 
     private void StampPluginUpdate()
     {
@@ -2950,7 +2983,7 @@ internal sealed class HarnessForm : Form
         catch { return null; }
     }
 
-    private static void AppendStartupLog(string text)
+    internal static void AppendStartupLog(string text)
     {
         try
         {
@@ -3263,7 +3296,6 @@ internal sealed class HarnessForm : Form
             }
 
             var text = (await outTask) + (await errTask);
-            try { await errTask; } catch { }
             var first = text.Split('\n').FirstOrDefault();
             return string.IsNullOrWhiteSpace(first) ? null : first.Trim();
         }
@@ -3284,6 +3316,11 @@ internal sealed class HarnessForm : Form
     /// 都会去连一次 127.0.0.1:7897 并等满超时（实测 150–206 ms）；而绝大多数机器
     /// 上那个端口并不存在，等于每次启动白付一笔。现在只有用户明确设过代理变量
     /// （说明他确实在用本地代理）才做这次探测。
+    ///
+    /// 探测结果正负分开缓存（见 <see cref="ShouldProbeLocalProxy"/> 与 <see cref="IsLocalProxyOpen"/>）：
+    ///   探到了 → 永久缓存（代理开着是稳定状态，之后零成本）；
+    ///   探不到 → 负缓存 60 秒。四条调用路径挤在一次启动里，60 秒窗口消掉重复探测；
+    ///   而"启动器开着才打开代理"的用户最多多等 60 秒。
     /// </summary>
     private static void ConfigureOptionalProxy(ProcessStartInfo psi)
     {
@@ -3299,7 +3336,7 @@ internal sealed class HarnessForm : Form
         }
 
         if (!ShouldProbeLocalProxy()) return;
-        if (!IsTcpOpen("127.0.0.1", ProxyPort)) return;
+        if (!IsLocalProxyOpen()) return;
         psi.Environment["NODE_USE_ENV_PROXY"] = "1";
         psi.Environment["HTTP_PROXY"] = $"http://127.0.0.1:{ProxyPort}";
         psi.Environment["HTTPS_PROXY"] = $"http://127.0.0.1:{ProxyPort}";
@@ -3328,6 +3365,27 @@ internal sealed class HarnessForm : Form
         }
         localProxyProbeWanted = probe;
         return probe;
+    }
+
+    // ── 7897 探测结果缓存（正负分开）──────────────────────────────────────────
+    private static bool? localProxyOpen;        // true=探到了（永久缓存）；false/null=探不到
+    private static DateTime localProxyOpenAt;   // 上次探测时间（负缓存 TTL 用）
+    private static readonly TimeSpan NegativeCacheTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// 127.0.0.1:7897 是否开放，带正负分开缓存。
+    /// 探到了永久缓存；探不到缓存 60 秒后重探。
+    /// </summary>
+    private static bool IsLocalProxyOpen()
+    {
+        if (localProxyOpen == true) return true;
+        if (localProxyOpen == false && DateTime.UtcNow - localProxyOpenAt < NegativeCacheTtl)
+            return false;
+
+        var open = IsTcpOpen("127.0.0.1", ProxyPort);
+        localProxyOpen = open;
+        localProxyOpenAt = DateTime.UtcNow;
+        return open;
     }
 
     private static bool IsTcpOpen(string host, int port, int timeoutMs = 150)
@@ -3459,15 +3517,39 @@ internal sealed class HarnessForm : Form
         }
     }
 
+    /// <summary>
+    /// 启动新引擎前截断日志：保留文件末尾 8 MB，其余丢弃。
+    /// 引擎 stdio 文件化后，日志由 cmd 以追加句柄持有、引擎运行期间持续增长。
+    /// 不做轮转的话，长期复用（数周不重启）会让它膨胀到 GB 级。
+    /// 这里在**每次真启动**（到得了 StartHarnessAsync 的路径）时截断，保留尾部供排查。
+    /// </summary>
+    private static void TruncateEngineLog()
+    {
+        const long MaxKeepBytes = 8L * 1024 * 1024;
+        if (!File.Exists(engineStdioLog)) return;
+        var info = new FileInfo(engineStdioLog);
+        if (info.Length <= MaxKeepBytes) return;
+
+        // 保留末尾 8 MB。注意不能按字节硬切——可能截断多字节 UTF-8 序列的中间。
+        // 所以先按字节读，再从第一个完整换行符之后开始保留。
+        var buffer = new byte[MaxKeepBytes];
+        using (var fs = new FileStream(engineStdioLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            fs.Seek(-MaxKeepBytes, SeekOrigin.End);
+            var read = fs.Read(buffer, 0, buffer.Length);
+            // 找第一个完整行：跳过可能被截断的半个 UTF-8 字符（行首的不完整字节）
+            var firstNewLine = Array.IndexOf(buffer, (byte)'\n', 0, read);
+            if (firstNewLine < 0) firstNewLine = 0;   // 没找到换行（极端情况），从头保留
+            File.WriteAllBytes(engineStdioLog, buffer[(firstNewLine + 1)..read]);
+        }
+    }
+
     private string? TryReadUrlFile()
     {
-        try
-        {
-            if (!File.Exists(urlFile)) return null;
-            var value = File.ReadAllText(urlFile).Trim();
-            return AuthUrlRegex.IsMatch(value) ? AuthUrlRegex.Match(value).Value : null;
-        }
-        catch { return null; }
+        // DPAPI 解密 + 旧版明文自动升级，全部封装在 DpapiFile.ReadAllText 里。
+        var value = DpapiFile.ReadAllText(urlFile);
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        return AuthUrlRegex.IsMatch(value) ? AuthUrlRegex.Match(value).Value : null;
     }
 
     private void TryDeleteUrlFile()
@@ -3557,5 +3639,5 @@ internal sealed class HarnessForm : Form
         try { return new Uri(url).Port; } catch { return null; }
     }
 
-    private sealed record ProcessRecord(int Id, int ParentId, string Name, string CommandLine);
+    private sealed record ProcessRecord(int Id, int ParentId, string Name, string CommandLine, DateTime StartTime);
 }
