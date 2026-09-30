@@ -89,4 +89,91 @@ public class ProcessMatchTests
         // 无关进程会被整树杀掉（误杀远重于漏杀）。
         Assert.False(Match("node.exe", $@"""{UserHome}\tools\dsh"" web"));
     }
+
+    [Fact]
+    public void 端口收窄_这条用例是它唯一的护栏_整行删掉它必须红()
+    {
+        // 注意上一条其实**测不到端口**：那条命令行里 dsh 后面紧跟一个引号，
+        // 宽泛正则要求 dsh 与 web 之间只能有空白，所以它在正则那一步就已经出局了。
+        // 把端口那行整条删掉，那条用例照样绿——守卫其实没被钉住。
+        // 这条补上：路径无空格（node 常见形状，正则会命中）+ 命令行里没有任何端口。
+        Assert.False(Match("node.exe", $@"{UserHome}\tools\dsh web"));
+    }
+
+    [Fact]
+    public void 端口只是前缀相同的另一个端口_不命中_否则会误杀用户自己的进程()
+    {
+        // 真实误杀面：端口收窄原先写成 c.Contains("3080")，于是 "30801" 也算命中。
+        // 用户在 %USERPROFILE% 下自己装一份 dsh 跑在 30801 是很正常的形态
+        // （路径无空格 → 命令行不加引号 → 宽泛正则照样命中），
+        // 结果点一次「停止」就把用户自己的进程整树杀掉。
+        Assert.False(Match("node.exe", $@"{UserHome}\tools\dsh web --port {Port}1"));
+    }
+
+    [Theory]
+    [InlineData(@"C:\x\dsh web --port 3080", true)]      // 空格分隔
+    [InlineData(@"C:\x\dsh web --port=3080", true)]     // 等号分隔
+    [InlineData(@"C:\x\dsh web 3080", true)]             // 裸端口
+    [InlineData(@"C:\x\dsh web --port 30801", false)]    // 前缀相同的别的端口
+    [InlineData(@"C:\x\dsh web --port 3080x", false)]    // 紧跟字母
+    [InlineData(@"C:\x\dsh web --port 80", false)]       // 完全不同的端口
+    [InlineData(@"C:\x\node_modules\@deepseek-ai\dsh@0.1.5-rc.2\lib\bin.js", false)]  // 版本号里的数字不算
+    [InlineData(@"C:\x\dsh@0.1.5-rc.2 web", false)]     // 同上
+    // \w/\d 必须是 ASCII 语义，但**方向**要选对：默认 .NET 的 \w 含 Unicode，
+    // 于是"端口紧邻一个汉字"会被判成没提端口 → 漏杀真残留（这条收窄是"宁可漏、
+    // 不可误杀"，但漏也不能漏得莫名其妙）。ECMAScript 把它反转成命中，方向正确。
+    // 真正的分界仍然是数字/字母：30801、3080x 都必须被放过。
+    [InlineData(@"C:\x\dsh web --port 3080的进程", true)]
+    [InlineData(@"C:\x\dsh web --port ８", false)]       // 全角数字不是端口（\d 退化为 ASCII）
+    public void 端口必须是完整的数字token(string commandLine, bool expected)
+    {
+        Assert.Equal(expected, HarnessForm.MentionsLauncherPort(commandLine, Port));
+    }
+
+    [Fact]
+    public void 空命令行在端口收窄处也不命中()
+    {
+        Assert.False(HarnessForm.MentionsLauncherPort(string.Empty, Port));
+    }
+
+    [Fact]
+    public void 空命令行_不命中()
+    {
+        // 纯函数必须自己挡脏输入。此前靠 WMI 侧的 ?? string.Empty 兜着，
+        // 意味着单独调用它时一个 null 就能把整个查杀流程炸掉。
+        Assert.False(Match("node.exe", string.Empty));
+    }
+
+    [Fact]
+    public void 空引擎目录_不命中_否则任何进程都会被当成自己的引擎()
+    {
+        // 灾难性的输入：c.Contains("") 恒为 true，于是系统上**每一个**进程
+        // 都会被判定成"本启动器装的引擎"并整树杀掉。原实现没有任何防线。
+        Assert.False(HarnessForm.MatchesHarnessCommand("notepad.exe", @"C:\notes\x.txt", string.Empty, UserHome, Port));
+    }
+
+    [Fact]
+    public void 空用户目录_不放行所有用户_归属不清就不动手()
+    {
+        // 原判断写成 `userHomeDir.Length > 0 && !c.Contains(userHomeDir)`：
+        // 空串时这道收窄被**跳过**，恰好把"归属不清就不动手"的既定语义反转成
+        // "放行所有用户"。这里钉住的是修正后的语义。
+        Assert.False(HarnessForm.MatchesHarnessCommand("node.exe",
+            @"C:\Users\someone-else\x\node_modules\@deepseek-ai\dsh\lib\bin.js web --port 3080",
+            EngineDir, string.Empty, Port));
+    }
+
+    [Fact]
+    public void 空用户目录也照样认得出本启动器自己装的引擎_这条是回归钉子()
+    {
+        // USERPROFILE 缺失 / 用户配置文件 hive 未加载 / 受限容器里，
+        // GetFolderPath(UserProfile) 返回空串是文档写明的行为。
+        // engineDir 这条精确匹配**不需要** userHomeDir：命令行里带着本启动器的
+        // 引擎目录本身就是确定性的证据。曾经把"userHomeDir 为空就返回 false"
+        // 提到函数开头，结果在这类机器上连自己的引擎都杀不掉——残留引擎占住端口、
+        // 孤儿 node_modules.lock 永远清不掉。这条用例就是防那个回归再来的。
+        Assert.True(HarnessForm.MatchesHarnessCommand("node.exe",
+            $@"""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"" web --no-open --host 127.0.0.1 --port {Port}",
+            EngineDir, string.Empty, Port));
+    }
 }

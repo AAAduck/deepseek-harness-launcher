@@ -24,6 +24,18 @@ internal static class ConfigBackup
     /// </summary>
     private const int KeepSnapshots = 8;
 
+    /// <summary>
+    /// 会被引擎例行改写、不该消耗快照名额的文件。
+    ///
+    /// 提成成员而不是留在 <see cref="CreateSnapshot"/> 的方法体里，是因为单测必须能
+    /// 引用**同一份**清单。此前测试只能手抄一份副本，于是"生产把某个文件加进/移出
+    /// 易变集"这类改动会让测试全绿通过——恰好是本类最该防的那种静默漂移。
+    /// 注意别把成员取名成 <c>Volatile</c>：<c>System.Threading</c> 在隐式 using 里，
+    /// 同名会把本类内的 <c>Volatile.Read(...)</c> 变成 CS0119。
+    /// </summary>
+    internal static readonly ISet<string> VolatileConfigFiles =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".credentials.yaml" };
+
     internal static string BackupRoot => Path.Combine(LocalAppDir, "config-backups");
 
     private static string LocalAppDir => Path.Combine(
@@ -93,7 +105,7 @@ internal static class ConfigBackup
             // 只有"稳定文件"变了才值得新建快照。这类文件是真正的用户配置：
             // patch / settings / profile 清单，改动都出自主观操作。
             // 易变文件（凭据）单独排除在外——它的例行轮换不该消耗快照名额。
-            var volatileFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".credentials.yaml" };
+            // 清单取自共享成员，测试引用的也是它，避免"生产改了、测试没红"的静默漂移。
 
             var previous = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (File.Exists(manifestPath))
@@ -105,7 +117,7 @@ internal static class ConfigBackup
                 }
             }
 
-            if (!NeedsSnapshot(hashes, previous, volatileFiles))
+            if (!NeedsSnapshot(hashes, previous, VolatileConfigFiles))
                 return null;   // 只有易变文件动过（或什么都没变），不占用快照名额
 
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
@@ -205,18 +217,45 @@ internal static class ConfigBackup
     /// <summary>
     /// 目标路径是否真的落在 <paramref name="rootFullPath"/> 目录**之内**。纯函数、可单测——
     /// 它是恢复动作唯一的纵深防御：判错了不会报错，只会把用户的配置写到别处去。
-    /// 三个边界都要成立：前缀相同、root 后面紧跟一个分隔符（否则 <c>C:\a\bc</c> 会被
-    /// <c>C:\a\b</c> 误判成在内部）、且候选路径不是 root 自己。
+    /// 三条边界都要成立：两边的 <c>..</c> 都被规范化掉、前缀相同、且前缀之后紧跟一个
+    /// 分隔符（否则 <c>C:\a\bc</c> 会被 <c>C:\a\b</c> 误判成在内部）。
+    /// root 自己不算"内部"（长度相等，在第二条被挡掉）；root 必须写成完整目录路径。
     /// </summary>
     internal static bool IsWithinRoot(string candidateFullPath, string rootFullPath)
     {
         if (string.IsNullOrEmpty(candidateFullPath) || string.IsNullOrEmpty(rootFullPath)) return false;
-        if (!candidateFullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase)) return false;
-        if (candidateFullPath.Length <= rootFullPath.Length) return false;
+
+        // 规范化必须在这里做，不能指望调用方。原实现只比"前缀 + 第 N 位是分隔符"，
+        // 对 `C:\Users\me\.dsh\..\evil\x` 这类未展开的 `..` 会判成 true——
+        // 而本文件 Restore 处的注释点名的正是"一个 `../` 就可能写到别处去"这个场景。
+        // 当时之所以没出事，纯粹因为 Restore 恰好在调用前做了 Path.GetFullPath；
+        // 一旦这个守卫被复用到没规范化的路径上（将来支持从压缩包恢复之类），
+        // 它就会静默放行。纵深防御不能靠调用点的自觉。
+        string root, candidate;
+        try
+        {
+            // root 必须是完整目录路径。`C:`（盘符相对）经 GetFullPath 会变成
+            // "盘符 + 当前盘目录"，结论跟着进程工作目录变；相对路径同理（按 CWD 展开）。
+            // 守卫不该接受这类输入。
+            if (!Path.IsPathFullyQualified(rootFullPath)) return false;
+            root = Path.GetFullPath(rootFullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            candidate = Path.GetFullPath(candidateFullPath);
+            // TrimEnd 把 root 削空只可能发生在 root 写成 `\` 或 `\\` 的时候。
+            // 此时**绝不能**拿候选路径自己的盘符根去补：那等于把"必须在这个根里"
+            // 变成"必须在任意盘里"，检查直接作废。宁可拒——这形状本来就传错了。
+            if (root.Length == 0) return false;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            return false;   // 非法字符 / 非法语法：谈不上"在不在 root 之内"
+        }
+
+        if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return false;
+        if (candidate.Length <= root.Length) return false;
         // 注意：这里必须比 Path.DirectorySeparatorChar，不能用 char.IsSeparator——
         // 后者判的是 Unicode「分隔符」类别（空格类），对 '\' 返回 false，
         // 会让这道守卫把**所有**路径都判成越界（恢复动作全量跳过，且不报错）。
-        var next = candidateFullPath[rootFullPath.Length];
+        var next = candidate[root.Length];
         return next == Path.DirectorySeparatorChar || next == Path.AltDirectorySeparatorChar;
     }
 

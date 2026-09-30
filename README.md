@@ -105,7 +105,7 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
 
 | 变量 | 作用 |
 |---|---|
-| `HTTP_PROXY` / `HTTPS_PROXY` | 让 node/npm 走代理（Node 24+ 需配合内置的 `NODE_USE_ENV_PROXY`，启动器会自动加） |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 让 node/npm/pnpm 走代理（Node 24+ 需配合内置的 `NODE_USE_ENV_PROXY`，启动器会自动加；装引擎、升级引擎、更新插件三条路径都会带上） |
 | `DSH_FORCE_LOCAL_PROXY=1` | 强制探测本机 `127.0.0.1:7897` 代理。默认只在系统里存在任何代理线索时才探测——没有代理的机器上，这次探测会白等一个 150 ms 超时，所以默认跳过 |
 
 
@@ -131,6 +131,8 @@ dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
 只测"判错了不报错"的那几处决策：杀哪些进程、要不要拍配置快照、恢复路径是否越界、
 semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局自检。
 改动这几个函数前先跑一遍，绿了再改。
+
+覆盖的分支与用例是**一一对应**的，改匹配规则前先看注释里写的事故与误伤面。
 
 ## 更新启动器本体（标准流程：随时跑 `更新启动器.bat`，Web 会话不中断）
 
@@ -191,6 +193,10 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - `FoldersForm.cs`：相关目录一览窗口。
 - `ConfigBackup.cs`：配置快照（启动前与升级前自动拍摄、按文件哈希去重、一键恢复）。
   快照判定（`NeedsSnapshot`）与恢复路径守卫（`IsWithinRoot`）是纯函数，有单测。
+  `engine.old` 的归档不在这个窗口里做——那是**写操作**，而列举版本是只读操作，
+  挂在只读路径上会让两个并发的后台扫描同时对同一个 `engine.<版本>` 槽"删除 + 改名"。
+  归档因此移到了点「启动/重启」的主流程里（而不是引擎安装那条支路上：
+  引擎随启动器存活时启动流程会走复用分支直接返回，挂在支路上等于形同虚设）。
 - `LayoutDump.cs`：布局自检（`DSH_LAYOUT_DUMP=1` / `DSH_LAYOUT_TEST=1` 时把真实几何写入 `layout-dump.txt`）。
   自检只在 `Program.cs` 的 `DSH_LAYOUT_TEST=1` 入口里驱动，两个对话框不再各自挂 `Shown` 处理器。
 - `Program.cs`：程序入口、单实例互斥、启动异常兜底（写 `crash-log.txt`）。
@@ -198,10 +204,17 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
   DPI 感知不在清单里声明——它由 csproj 的 `ApplicationHighDpiMode` 给出（取值 `SystemAware`），
   与 `UseWindowsForms` 生成的 `ApplicationConfiguration.Initialize()` 保持单一来源。
 - `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。含 `InternalsVisibleTo`：
-  只对配套测试工程开放几个 internal 纯函数；同时把 `tests\` 排除出本项目的 `**/*.cs` 通配。
-- `tests\DeepSeekHarness.Tests\`：xunit 单测（54 条）。刻意只覆盖"判错了不报错"的决策：
-  进程匹配内核（杀谁）、快照判定、恢复路径守卫、semver 范围判定。
+  只对配套测试工程开放几个 internal 纯函数；同时用 `DefaultItemExcludes` 把整个 `tests\`
+  从默认通配里摘掉（只挡 `.cs` 的话，测试工程的 bin/obj 产物仍会被逐个求值，
+  将来谁在 `tests\` 下放个 `.resx` 还会被编进启动器资源）。
+- `tests\DeepSeekHarness.Tests\`：xunit 单测（114 条）。刻意只覆盖"判错了不报错"的决策：
+  两条杀进程路径（点「停止」与关窗清扫）、端口收窄、快照判定、恢复路径守卫、
+  版本号白名单、semver 范围判定。
   这几处的共同点是错了不会有任何报错，只在用户眼前发生——所以必须有测试钉住。
+  几条用例是**专门为了让别的用例变红**而存在的，例如端口收窄那条：把它整行删掉，
+  必须有用例失败，否则说明它压根没被测住。
+  两条杀进程路径曾分叉过一次（空 `engineDir` 护栏只补在了一条上，`Contains("")`
+  恒为真会让关窗时把所有进程整树杀掉）——所以**改一条时记得连另一条一起看**。
 - `更新启动器.bat`：标准更新入口，随时可执行（1.3.0 起 Web 会话不中断；首次迁移例外见
   「更新启动器本体」）。按映像名只杀启动器（不碰 node）、
   从 `%LOCALAPPDATA%\DeepSeekHarness\update-staging\` 取新 exe 覆盖 `bin\Release` 与脚本旁副本、

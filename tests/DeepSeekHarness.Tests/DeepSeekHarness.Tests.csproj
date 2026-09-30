@@ -13,6 +13,11 @@
     <!-- 主程序集引用了 WinForms：进程匹配内核挂在 HarnessForm 上，
          加载该类型的静态初始化（字体/HttpClient）需要 WindowsDesktop 运行时。 -->
     <UseWindowsForms>true</UseWindowsForms>
+    <!-- 必须与主工程的 PlatformTarget 一致（那边写死 x64）。不写的话本工程是 AnyCPU，
+         在 Windows-on-ARM 上 testhost 会以 ARM64 进程启动，加载 x64 的
+         DeepSeekHarness.dll 直接 BadImageFormatException——而且只在运行期炸，
+         编译期毫无提示，排查成本很高。 -->
+    <PlatformTarget>x64</PlatformTarget>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
@@ -20,10 +25,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 版本与本机 NuGet 缓存一致，dotnet restore 可离线完成。 -->
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <!-- 版本与本机 NuGet 缓存一致，dotnet restore 可离线完成。
+         PrivateAssets="all" 是必需的：这三个包是测试宿主本身，绝不能顺着
+         ProjectReference 传染给主工程（主工程是 WinExe，被塞进测试 SDK 就跑不起来了）。 -->
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" PrivateAssets="all" />
     <PackageReference Include="xunit" Version="2.9.2" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

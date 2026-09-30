@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Management;
 using System.Net;
 using System.Net.Http;
@@ -47,6 +48,20 @@ internal sealed class HarnessForm : Form
     private static readonly Regex AnsiRegex = new(
         "\u001b\\[[0-9;?]*[ -/]*[@-~]",
         RegexOptions.Compiled);
+    /// <summary>
+    /// 命令行里"独立的数字 token"。端口收窄专用：必须**整体**等于本启动器的端口才算数。
+    /// 前后都不允许紧邻数字、小数点或任何单词字符，于是 "30801" 被当成一个整体而不是
+    /// "3080"，"3080x" 也不会被截成 "3080"。
+    ///
+    /// <b>ECMAScript 标志不能去掉</b>：.NET 默认的 <c>\w</c>/<c>\d</c> 含 Unicode——
+    /// 实测 <c>\w</c> 匹配「的」、<c>\d</c> 匹配全角「０」。那会让"端口紧邻一个汉字"
+    /// 被判成"没提端口"，也就是**漏杀真残留**：而这条收窄的失手方向不该是这个。
+    /// ECMAScript 下两者退化为 ASCII，端口紧邻汉字照样命中（这才是想要的），
+    /// 真正的分界仍然落在数字与字母上——30801、3080x 都会被放过。
+    /// </summary>
+    private static readonly Regex PortTokenRegex = new(
+        @"(?<![\w.])[0-9]{1,5}(?![\w.])",
+        RegexOptions.Compiled | RegexOptions.ECMAScript);
     private static readonly HttpClient LocalHttp = new(new HttpClientHandler { UseProxy = false })
     {
         Timeout = TimeSpan.FromSeconds(2)
@@ -280,6 +295,10 @@ internal sealed class HarnessForm : Form
         {
             Activate();
             await RefreshStatusAsync();
+            // await 之后窗体可能已经被关掉并释放（refreshTimer 是本窗体创建的，
+            // 已在 Dispose 里 Dispose）。async void 里对已释放对象调 Start() 会抛
+            // ObjectDisposedException，且**无人接管**——整个启动器当场崩掉。
+            if (closing || IsDisposed) return;
             _ = RunStartAsync(startButton, "启动中", reuseExisting: true);
             refreshTimer.Start();
         };
@@ -307,12 +326,34 @@ internal sealed class HarnessForm : Form
         startCts = cts;
         EnterBusy(active, busyText);
 
+        // 插件开关只在这里读一次。原来是读两次：UpdatePluginsAfterStartAsync 在创建时
+        // 读一次，本方法在 await startTask（最长十几秒）之后又读一次——而复选框在这期间
+        // 一直可点（EnterBusy 没禁它）。用户中途取消勾选，第二次读就会走到
+        // "跳过 AwaitQuietlyAsync" 那条路，把一个还在跑 pnpm 的任务丢在身后。
+        var autoUpdate = autoUpdateCheckbox.Checked;
+
         // 在动任何东西之前先给配置拍一份快照。实测 DSH 的 settings 迁移会丢掉
         // 不匹配 profile 条目 id 的配置段（jet-hub 账号、llm-pi-ai 供应商都中过招），
         // 备份必须发生在"可能被改写"之前，事后再备份就晚了。
         // 内容没变化时不会重复生成，所以正常启动几乎零成本。
         ConfigBackup.CreateSnapshot(reuseExisting ? "启动前" : "重启前");
 
+        // engine.old 的归档放在这里，而不是"打开版本管理窗口"时。
+        //
+        // 为什么不在"列举版本"里做：归档是改名 +（同名槽时）递归删除，是**写操作**；
+        // 列举版本是只读操作。写操作挂在只读路径上，一旦对话框被重复打开就会有两个
+        // 后台扫描同时对同一个 engine.<版本> 槽"删除 + 改名"。
+        //
+        // 为什么必须在 reuseExisting 早退**之前**：1.3.0 起引擎随启动器退出而存活，
+        // 所以"引擎还活着"是常态，RunStartAsync 会在探到可用的 web-url.txt 后直接
+        // 复用并 return，根本走不到 StartHarnessAsync。挂在引擎安装路径上等于
+        // "只有引擎没起来时才归档"——那 README 承诺的"下次启动归档"就是假的。
+        // 这里只碰 engine.old 与 engine.<版本>，**不碰 engine**，所以引擎在跑也安全。
+        // 放在 EnterBusy 之后：busy 已禁用「版本」，不会与版本管理的扫描并发。
+        // 放后台线程：同名槽的清理是 2.5 万文件的递归删除，不能挂在 UI 线程上。
+        try { await Task.Run(MigrateEngineOldToSlot); } catch { }
+
+        Task? pluginTask = null;
         try
         {
             if (reuseExisting)
@@ -341,11 +382,11 @@ internal sealed class HarnessForm : Form
             // 首启/刚升级时重建窗口最长，并发就是真实的踩踏风险。
             // 插件的生效时机本就是「下次启动」，这里没有语义损失。
             var startTask = StartHarnessAsync(cts.Token);
-            var pluginTask = UpdatePluginsAfterStartAsync(startTask, cts.Token);
+            pluginTask = UpdatePluginsAfterStartAsync(startTask, cts.Token, autoUpdate);
             await startTask;
             if (cts.IsCancellationRequested) return;
 
-            if (autoUpdateCheckbox.Checked)
+            if (autoUpdate)
             {
                 status.Text = "更新中";
                 status.ForeColor = WarnColor;
@@ -367,7 +408,24 @@ internal sealed class HarnessForm : Form
         }
         finally
         {
-            if (ReferenceEquals(startCts, cts)) EndBusy();
+            // 本操作是这次 CTS 的所有者（见 CancelPendingStart 的注释）。
+            // EndBusy 仍只在"我还是当前那次操作"时调用，避免覆盖后来者接管的状态。
+            if (ReferenceEquals(startCts, cts))
+            {
+                startCts = null;
+                EndBusy();
+            }
+            // pluginTask 有可能还挂在后台（取消时 startTask 先结束、它后收尾）。
+            // 那就不能在这儿释放 cts——不是"会抛"，而是它后续还要读 ct，
+            // 依据一个已经被别人 Dispose 掉的对象。改由它自己在结束时释放。
+            if (pluginTask is not null && !pluginTask.IsCompleted)
+                _ = pluginTask.ContinueWith(
+                    _ => { try { cts.Dispose(); } catch { } },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            else
+                try { cts.Dispose(); } catch { }
             if (!closing && !IsDisposed) await RefreshStatusAsync();
         }
     }
@@ -377,11 +435,13 @@ internal sealed class HarnessForm : Form
     /// 再动 profiles\node_modules（详见 RunStartAsync 里的顺序说明）。
     /// 引擎启动失败/取消则本轮直接跳过——更新失败信息只走 startTask 自己的异常路径，
     /// 且这样收口后本任务永不带未观察异常退场。
-    /// 未勾选复选框时立刻返回，避免无谓的 pnpm 往返。
+    /// <paramref name="autoUpdate"/> 由调用方在建任务时就读定，**不要在这里重读复选框**：
+    /// 调用方在 await startTask 之后还要用同一个值决定要不要等本任务收尾，
+    /// 两边读的不一致就会把一个还在跑的任务丢在身后。
     /// </summary>
-    private async Task UpdatePluginsAfterStartAsync(Task startTask, CancellationToken ct)
+    private async Task UpdatePluginsAfterStartAsync(Task startTask, CancellationToken ct, bool autoUpdate)
     {
-        if (!autoUpdateCheckbox.Checked) return;
+        if (!autoUpdate) return;
 
         try { await startTask; }
         catch { return; }
@@ -443,13 +503,24 @@ internal sealed class HarnessForm : Form
         }
     }
 
+    /// <summary>
+    /// 取消进行中的启动/升级。**只 Cancel，不在这里 Dispose**。
+    ///
+    /// CTS 的所有权归**创建它的那个操作**（RunStartAsync / RunEngineUpgradeAsync），
+    /// 由它的 finally 释放。理由不是"提前 Dispose 会抛异常"——实测 net8 上对已释放的
+    /// CTS 做 Register / CreateLinkedTokenSource 都不抛（只有 Token.WaitHandle 与
+    /// Cancel() 会），所以拿"会 ObjectDisposedException"当理由是错的。
+    /// 真正的理由有两条：
+    ///   ① 旧代码的 finally **从不释放** CTS，正常跑完一次就永久泄漏一个；
+    ///   ② 谁拥有谁释放，这条纪律让"释放时机"只有一个地方说了算。本函数的注释
+    ///      曾经给出一个在 net8 上不成立的前提，会误导下一个改这里的人。
+    /// </summary>
     private void CancelPendingStart()
     {
         var cts = startCts;
         startCts = null;
         if (cts is null) return;
         try { cts.Cancel(); } catch { }
-        try { cts.Dispose(); } catch { }
     }
 
     private async Task StartHarnessAsync(CancellationToken ct)
@@ -910,12 +981,32 @@ internal sealed class HarnessForm : Form
     /// 与 IsHarnessCommand 同样必须先排除桌面客户端：它的引擎宿主命令行里
     /// 也含 @deepseek-ai/dsh，但那是客户端自己的，不是我们启动的。
     /// </summary>
-    private bool IsEngineProcess(ProcessRecord p)
+    private bool IsEngineProcess(ProcessRecord p) =>
+        MatchesEngineProcess(p.Name, p.CommandLine, engineDir);
+
+    /// <summary>
+    /// 退出清扫的匹配内核（纯函数、可单测）。它与 <see cref="MatchesHarnessCommand"/>
+    /// 是**两条彼此独立的杀进程路径**（这里=关窗，那边=点「停止」），两者只有一条交集：
+    /// 都绝不能碰桌面客户端的引擎宿主。改其中一个时别忘了另一个——它们已经分叉过一次了。
+    ///
+    /// 判据刻意比「停止」那条窄：只认命令行里带本启动器引擎目录的进程，不做宽松兜底。
+    /// 关窗时宁可漏掉一个陌生残留（下次启动的端口探测会给出明确报错兜住），
+    /// 也不能整树杀掉一个和本启动器毫无关系的进程。
+    ///
+    /// 空串护栏与 <see cref="MatchesHarnessCommand"/> 同源、同样关键：
+    /// <c>commandLine.Contains("")</c> 恒为 true，engineDir 一旦为空，
+    /// **每一个进程**都会在此被判成"我们的引擎"、在关窗时被整树杀掉。
+    /// WMI 取值处已把 null 兜成空串，所以这些是契约护栏而非现实风险——
+    /// 但它护的正是代价最高的那条分支。
+    /// </summary>
+    internal static bool MatchesEngineProcess(string name, string commandLine, string engineDir)
     {
-        if (p.Name.Equals("DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
-        if (p.CommandLine.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
-        if (p.CommandLine.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
-        return p.CommandLine.Contains(engineDir, StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(commandLine)) return false;
+        if (string.IsNullOrEmpty(engineDir)) return false;
+        if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
+        if (commandLine.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
+        if (commandLine.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
+        return commandLine.Contains(engineDir, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -972,7 +1063,19 @@ internal sealed class HarnessForm : Form
     internal static bool MatchesHarnessCommand(
         string name, string commandLine, string engineDir, string userHomeDir, int port)
     {
-        if (name.Equals("DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
+        // 静态形式而不是 name.Equals(...)/c.Contains(...)：本函数要按契约接受任意输入，
+        // 之前它只在 WMI 取值处被保证非空，于是测试传 null 就直接 NRE——
+        // 纯函数连"脏输入不会炸"都做不到，就更谈不上被钉住。
+        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(commandLine)) return false;
+
+        // 空 engineDir 是灾难性的输入：c.Contains("") 恒为 true，于是**任何进程**都会被
+        // 当成"本启动器装的引擎"而整树杀掉。与其指望调用方永远传对，不如在这里挡住。
+        // 生产上 Path.Combine 几乎不可能给出空串（GetFolderPath 返回空时得到的是相对
+        // 路径 "DeepSeekHarness\engine"），所以这条是**契约护栏**而非现实风险——
+        // 但它保护的是"判错即整树杀进程"这种代价最高的分支，留着不亏。
+        if (string.IsNullOrEmpty(engineDir)) return false;
+
+        if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
         var c = commandLine;
 
         // —— 绝不能杀的目标：DSH 桌面客户端（Electron）自己的引擎宿主 ——
@@ -1003,19 +1106,56 @@ internal sealed class HarnessForm : Form
         // （互斥体是 Local\ 每会话一个，管不到别的会话）。一切用户态路径
         // （LOCALAPPDATA、.dsh、npm 全局目录）都在 %USERPROFILE% 之下。
         // 误杀别人进程的代价远大于漏杀一个残留——真残留占着端口有启动前报错兜底。
-        if (userHomeDir.Length > 0 && !c.Contains(userHomeDir, StringComparison.OrdinalIgnoreCase)) return false;
+        //
+        // **这道收窄必须待在这里、不能提到函数开头**。上面那条 engineDir 精确匹配
+        // 不需要 userHomeDir：命令行里带着本启动器的引擎目录，本身就是确定性的证据。
+        // 要是把"userHomeDir 为空就返回 false"提到最前面，在 USERPROFILE 缺失 /
+        // 用户配置文件 hive 未加载 / 受限容器这类机器上（本项目自己的文档就说
+        // GetFolderPath 无法确定时返回空串），就变成**连自己的引擎都杀不掉**：
+        // 残留引擎占住端口、孤儿 node_modules.lock 永远清不掉。
+        //
+        // 空串这里也必须拒：原来的写法是 `userHomeDir.Length > 0 && !c.Contains(...)`，
+        // 空串时这道收窄被**跳过**，恰好把"归属不清就不动手"的既定语义反转成
+        // "放行所有用户"——那正是本函数最不能犯的错。
+        if (string.IsNullOrEmpty(userHomeDir) ||
+            !c.Contains(userHomeDir, StringComparison.OrdinalIgnoreCase)) return false;
 
         if (c.Contains("@deepseek-ai/dsh", StringComparison.OrdinalIgnoreCase) ||
             c.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase)) return true;
 
         // 两条宽松正则只为兜早期 npx / dsh.cmd 时代留下的残留。再收窄一道：
-        // 命令行必须还出现本启动器的端口，否则一个碰巧提到 "dsh" 的 node/cmd 进程
-        // 也会被整树杀掉——误杀别人进程的代价远大于漏杀一个残留
-        // （真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
-        if (!c.Contains(port.ToString(), StringComparison.Ordinal)) return false;
+        // 命令行里必须出现**恰好等于**本启动器端口的独立数字 token，否则一个碰巧
+        // 提到 "dsh" 的 node/cmd 进程也会被整树杀掉——误杀别人进程的代价远大于漏杀
+        // 一个残留（真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
+        //
+        // 这里必须是 token 级匹配而不是子串匹配：子串写法（c.Contains("3080")）会把
+        // "--port 30801" 也算命中——用户在 %USERPROFILE% 下自己装一份 dsh 跑在 30801
+        // 是很正常的形态（路径无空格 → 命令行不加引号 → 宽泛正则照样命中），
+        // 结果就是点一次「停止」把用户自己的进程整树杀掉。这是真实的误杀面。
+        if (!MentionsLauncherPort(c, port)) return false;
 
         return Regex.IsMatch(c, @"(?i)(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b") ||
                Regex.IsMatch(c, @"(?i)\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b");
+    }
+
+    /// <summary>
+    /// 命令行里是否出现了一个**恰好等于** <paramref name="port"/> 的独立数字 token。
+    /// 抽成具名函数是因为"端口收窄"是这个判断里最容易改坏的一环：
+    /// 它必须认得 `--port 3080`、`--port=3080` 与裸 `3080`，但**不能**把 `30801`、
+    /// `0.3080`、或版本号 `0.1.5` 里的数字误当成端口。
+    ///
+    /// 注意这条只**收紧不放宽**：新写法命中的集合是旧子串写法的子集——
+    /// 端口作为独立 token 出现的命令行两边都命中，只有"端口仅以更长数字的一部分
+    /// 出现"（`--port 30801`）才被新写法放过。而那恰恰是旧写法会误杀的那种。
+    /// </summary>
+    internal static bool MentionsLauncherPort(string commandLine, int port)
+    {
+        // 它被单测直接调用、也是 internal 表面，按上面那条同样的纪律自己挡脏输入。
+        if (string.IsNullOrEmpty(commandLine)) return false;
+        var want = port.ToString(CultureInfo.InvariantCulture);
+        foreach (Match m in PortTokenRegex.Matches(commandLine))
+            if (string.Equals(m.Value, want, StringComparison.Ordinal)) return true;
+        return false;
     }
 
     /// <summary>
@@ -1660,8 +1800,11 @@ internal sealed class HarnessForm : Form
     /// 版本号必须是一个纯粹的目录名片段：它会被拼成 <c>engine.&lt;版本&gt;</c>
     /// 再交给 ForceDeleteDirectory 递归删除。来源虽是真实目录名（风险很低），
     /// 但删除不可逆，这里作为纵深防御卡一道。
+    /// internal（而非 private）是为了能被单测直接钉住：它守着的正是"递归删除"，
+    /// 而这五条约束里任何一条被"顺手简化"掉，测试都会红——比如去掉空白检查后
+    /// 带空格的版本号会进得来，而报错文案仍然承诺着"不能含空白"。
     /// </summary>
-    private static bool IsSafeVersionToken(string? version) =>
+    internal static bool IsSafeVersionToken(string? version) =>
         !string.IsNullOrWhiteSpace(version) &&
         version.Length <= 64 &&
         // 空格并不在 Path.GetInvalidFileNameChars 里，而安装失败的报错文案承诺了
@@ -1730,13 +1873,15 @@ internal sealed class HarnessForm : Form
     /// 递归遍历一遍 node_modules（本机实测 2.5 万个文件），两个版本就是几万次
     /// FileInfo.Length。同步做在 UI 线程上，"版本管理"窗口会冻结数秒并被 Windows
     /// 判为未响应——而那时对话框还没画出来，连沙漏都看不到。
+    ///
+    /// 本方法及其下游是**纯只读**的：目录改名（engine.old 归档）已移到启动路径，
+    /// 这里只剩 Directory.GetDirectories + 统计大小。
     /// </summary>
     internal Task<IReadOnlyList<EngineVersionEntry>> GetInstalledEngineVersionsAsync() =>
         Task.Run(() => GetInstalledEngineVersionsCore());
 
     private IReadOnlyList<EngineVersionEntry> GetInstalledEngineVersionsCore()
     {
-        MigrateEngineOldToSlot();
         var result = new List<EngineVersionEntry>();
 
         var activeVersion = ReadEngineVersion(engineDir);
@@ -1868,10 +2013,37 @@ internal sealed class HarnessForm : Form
             // 刻意**不删**换下来的 engine.old：升级后发现插件不兼容时，
             // 把 engine 删掉、engine.old 改名回来即可完整回退到上一个能用的版本。
             // 代价是引擎目录占双份（实测每份约 214 MB），换来的是可回退。
+            //
+            // 第三步失败必须**当场**把 engine.old 搬回去，不能只留给下次启动的
+            // RecoverEngineSwap：否则这一轮用户手上就是"引擎凭空消失"，
+            // 要等到下次双击才自愈。搬回去的写法与 ActivateEngineVersionAsync 里
+            // 处理 engineStageDir 的那一段刻意保持一致——同一个坑修一次不够，
+            // 两条路径都得堵上。
             ForceDeleteDirectory(engineOldDir);
             if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineOldDir);
-            Directory.Move(engineStageDir, engineDir);
-            SetInfo($"引擎已就绪：{staged}（上一版本保留在 engine.old，可回退）");
+            try
+            {
+                Directory.Move(engineStageDir, engineDir);
+            }
+            catch
+            {
+                try
+                {
+                    if (Directory.Exists(engineOldDir)) Directory.Move(engineOldDir, engineDir);
+                }
+                catch (Exception rollbackEx)
+                {
+                    AppendStartupLog("替换引擎失败且回退也失败：" + rollbackEx.Message);
+                }
+                // 无论回滚成不成功，staging 都是这一轮的残骸，必须清掉。
+                // Directory.Move 抛的是 IOException / UnauthorizedAccessException，
+                // 不是 OperationCanceledException，所以下面那个 catch 里的清理
+                // **不会**覆盖到这里——而回滚成功时留下的是一份完整有效的 214 MB，
+                // 用户界面却一切正常，最容易被彻底忘掉。
+                try { ForceDeleteDirectory(engineStageDir); } catch { }
+                throw;
+            }
+            SetInfo($"引擎已就绪：{staged}（上一版本已保留，可在「版本管理」里切回）");
         }
         catch (OperationCanceledException)
         {
@@ -2213,9 +2385,13 @@ internal sealed class HarnessForm : Form
                 var at = name.LastIndexOf('@');
                 if (at <= 0 || at == name.Length - 1) continue;
                 var version = name[(at + 1)..];
-                // 目录名可能是 1.2.3 或 1.2.3_<peer-hash> 形式
-                var underscore = version.IndexOf('(');
-                if (underscore >= 0) version = version[..underscore];
+                // pnpm 的 peer 变体目录名在版本号后面还会跟一段后缀，两代命名法都见过：
+                //   `dsh@1.2.3_react@18.3.1`（新版）与 `dsh@1.2.3(react@18.3.1)`（旧版）。
+                // 原先只切了圆括号那一种，于是新版命名下会把 "1.2.3_react@18.3.1"
+                // 整段当成版本号交给 semver 去比 —— 比不出来只能落进"无法判定"。
+                // 这里两种都切掉，取到的才是干净版本号。
+                var suffix = version.IndexOfAny(new[] { '(', '_' });
+                if (suffix >= 0) version = version[..suffix];
                 if (version.Length > 0) return version;
             }
             return null;
@@ -2415,11 +2591,27 @@ internal sealed class HarnessForm : Form
         catch (Exception ex)
         {
             if (!closing && !IsDisposed)
-                ShowError("引擎升级失败", ex.Message + "\n\n当前引擎未被改动，仍可正常使用。");
+            {
+                // 不能对所有异常都无脑追加"当前引擎未被改动"：替换引擎的第二步已经把
+                // engine 改名成了 engine.old，若随后的顶上与回滚都失败，磁盘上就**没有**
+                // 引擎目录了，而用户读到的却是"仍可正常使用"——一句明确的假话，
+                // 他会直接去点「启动」，然后撞上一次 214 MB 的重装。
+                ShowError("引擎升级失败", Directory.Exists(engineDir)
+                    ? ex.Message + "\n\n当前引擎未被改动，仍可正常使用。"
+                    : ex.Message +
+                      "\n\n⚠ 引擎目录当前不存在（替换与回滚都没成功）。" +
+                      "下次启动会自动重新安装，约 214 MB、1–2 分钟；历史对话在盘上，不会丢。");
+            }
         }
         finally
         {
-            if (ReferenceEquals(startCts, cts)) EndBusy();
+            // 与 RunStartAsync 同一纪律：CTS 由创建它的操作负责释放。
+            if (ReferenceEquals(startCts, cts))
+            {
+                startCts = null;
+                EndBusy();
+            }
+            try { cts.Dispose(); } catch { }
             if (!closing && !IsDisposed) await RefreshStatusAsync();
         }
     }
@@ -2478,11 +2670,12 @@ internal sealed class HarnessForm : Form
     /// （`Unknown option: 'frozen-lockfile'`），会让更新每次都直接失败；
     /// update 本来就会改写 lockfile，无需该参数。
     /// </summary>
-    private static ProcessStartInfo? NewPnpmUpdateStartInfo(string profile)
+    private static ProcessStartInfo? NewPnpmUpdateStartInfo(string profile, string? nodePath = null)
     {
         string fileName;
         string arguments;
-        var pnpm = ResolvePnpmPath();
+        // 优先用与被选中 node.exe 同目录的那套 pnpm/corepack，保证 node/npm/pnpm 是同一次安装。
+        var pnpm = ResolvePnpmPath(nodePath);
         if (pnpm is not null)
         {
             fileName = pnpm;
@@ -2490,12 +2683,12 @@ internal sealed class HarnessForm : Form
         }
         else
         {
-            var corepack = ResolveCorepackPath();
+            var corepack = ResolveCorepackPath(nodePath);
             if (corepack is null) return null;
             fileName = corepack;
             arguments = "pnpm update --reporter=append-only";
         }
-        return new ProcessStartInfo
+        var psi = new ProcessStartInfo
         {
             FileName = fileName,
             Arguments = arguments,
@@ -2507,6 +2700,16 @@ internal sealed class HarnessForm : Form
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8
         };
+        // PATH 与代理此前只有 npm 那几条路径配了，pnpm 这条独缺——于是"引擎装得上、
+        // 插件却更新不了"（换机器最容易复现：node 装在非标准目录，PATH 里没有它）。
+        // 与 StartHarnessAsync / InstallEngineAsync 保持同一套做法。
+        var nodeDir = nodePath is null ? null : Path.GetDirectoryName(nodePath);
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(nodeDir) &&
+            !path.Split(';', StringSplitOptions.RemoveEmptyEntries).Contains(nodeDir, StringComparer.OrdinalIgnoreCase))
+            psi.Environment["PATH"] = nodeDir + ";" + path;
+        ConfigureOptionalProxy(psi);
+        return psi;
     }
 
     /// <summary>
@@ -2555,7 +2758,13 @@ internal sealed class HarnessForm : Form
             return;
         }
 
-        var psi = NewPnpmUpdateStartInfo(profile);
+        // 挑一套与已装 Node 一致的 pnpm/corepack：解析不出 Node 不阻断插件更新
+        //（这是后台的"锦上添花"功能，不该因为 node 探测失败就整个放弃）。
+        string? nodePath = null;
+        try { nodePath = await ResolveNodeAsync(ct); }
+        catch { }
+
+        var psi = NewPnpmUpdateStartInfo(profile, nodePath);
         if (psi is null)
         {
             SetInfo("pnpm 未找到，跳过插件更新");
@@ -2947,17 +3156,29 @@ internal sealed class HarnessForm : Form
             };
             proc = new Process { StartInfo = psi };
             if (!proc.Start()) return null;
-            var outTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
-            var errTask = proc.StandardError.ReadToEndAsync(cts.Token);
-            await proc.WaitForExitAsync(cts.Token);
+
+            // 与 RunCmdAsync 同一套纪律：① stderr 必须读掉（管道写满会让子进程卡死）；
+            // ② 不给 ReadToEndAsync 传 token——被取消后剩余数据就没人读，任务会带着
+            // 未观察异常退场；③ 超时/取消必须 Kill 整棵树。三个合起来才是不留孤儿进程的做法。
+            var outTask = proc.StandardOutput.ReadToEndAsync();
+            var errTask = proc.StandardError.ReadToEndAsync();
+            try { await proc.WaitForExitAsync(cts.Token); }
+            catch (OperationCanceledException)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                try { await outTask; } catch { }
+                try { await errTask; } catch { }
+                return null;
+            }
+
             var text = (await outTask) + (await errTask);
+            try { await errTask; } catch { }
             var first = text.Split('\n').FirstOrDefault();
             return string.IsNullOrWhiteSpace(first) ? null : first.Trim();
         }
         catch
         {
-            // 超时/取消时进程可能还活着（比如 pnpm 经由 corepack shim 卡住）。
-            // 此前只 Dispose 不 Kill，会留下背地里跑着的孤儿进程。
+            // 其余异常（启动失败、句柄已被释放等）：同样可能留下活着孤儿进程。
             try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
             return null;
         }
@@ -3173,6 +3394,11 @@ internal sealed class HarnessForm : Form
         // 「环境」在忙碌期间也禁用：它会改写状态文案并弹模态报告，
         // 与进行中的启动/升级互相踩（此前只有方法开头一道守卫，按钮还亮着）。
         envButton.Enabled = false;
+        // 复选框同样要禁：RunStartAsync 在建插件更新任务时读一次、启动完成后再读一次，
+        // 两次读之间隔着整个引擎启动（实测十几秒）。不锁住就可能两次读到不同的值，
+        // 第二次读到 false 时会把一个还在跑 pnpm 的任务丢在身后（无人 await 的
+        // 未观察异常 + 一个提前释放的 CTS）。复选框在 panel 里，禁按钮并不会连带禁它。
+        autoUpdateCheckbox.Enabled = false;
         active.Text = text;
         // 忙碌时按钮文字变成"启动中/重启中"，读屏就再也读不出它是哪个按钮了；
         // busyText 本身自描述，直接作为 AccessibleName。
@@ -3201,6 +3427,7 @@ internal sealed class HarnessForm : Form
         upgradeButton.Enabled = true;
         versionsButton.Enabled = true;
         envButton.Enabled = true;
+        autoUpdateCheckbox.Enabled = true;   // 配 EnterBusy 里的同一条注释
         // 主按钮的文字/颜色随运行状态变，这里是唯一会在状态变化后被调用的地方。
         ApplyPrimaryActionLabel();
     }

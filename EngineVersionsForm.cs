@@ -38,6 +38,8 @@ internal sealed class EngineVersionsForm : Form
     private readonly Func<string, Task<string?>> deleteVersion;
     /// <summary>正在跑一个异步操作（读取/切换/删除）。防重入，同时统一管按钮可用性。</summary>
     private bool busy;
+    /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"——这两件事完全不同。</summary>
+    private bool closing;
 
     internal EngineVersionsForm(
         Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions,
@@ -113,11 +115,57 @@ internal sealed class EngineVersionsForm : Form
         Resize += (_, _) =>
         {
             ApplyResponsiveLayout();
-            LayoutDump.Capture($"版本管理 {ClientSize.Width}x{ClientSize.Height}", this,
-                title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
+            // LayoutDump.Enabled 要在**调用点**先判一次：参数里的插值字符串与 Control[]
+            // 在进入 Capture 之前就已经构造好了，而 Resize 是拖边框时每像素都触发的热路径。
+            // 不判的话，没开自检的普通用户也要为每次 Resize 白付一次字符串 + 数组分配。
+            if (LayoutDump.Enabled)
+                LayoutDump.Capture($"版本管理 {ClientSize.Width}x{ClientSize.Height}", this,
+                    title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
         };
         ApplyResponsiveLayout();
-        _ = ReloadAsync();
+
+        // 首屏加载挂在 Load，**不是构造函数**。
+        // 构造函数阶段窗体句柄必然还没创建，而此前 ReloadAsync 里拿 IsHandleCreated
+        // 当"窗体已消失"的判据，于是只要 listVersions 的 Task 恰好已完成（await 不产生
+        // 让出），代码会原地走到那个 return：列表永远是空的、提示永远停在"正在读取…"，
+        // 而且**不报任何错**。生产目前靠 GetInstalledEngineVersionsAsync 内部是 Task.Run
+        // （要扫 2.5 万个文件、必然让出）侥幸躲过，那是时序上的运气。Program 的布局自检
+        // 给的正是已完成的 Task.FromResult，所以自检每次跑的都是这条"空列表"分支——
+        // 也就是说它量到的布局状态在生产里根本不会出现。Load 时句柄已建，没这个问题。
+        Load += async (_, _) => await ReloadAsync();
+        FormClosing += (_, e) => ConfirmClose(e);
+    }
+
+    /// <summary>
+    /// 窗体已经不可用了（已释放或正在关闭）。
+    /// **刻意不用 <c>IsHandleCreated</c>**：它表达的是"还没显示"，不是"已经没了"。
+    /// </summary>
+    private bool Gone => IsDisposed || Disposing || closing;
+
+    /// <summary>
+    /// 关闭时收口。<paramref name="e.Cancel"/> 被置位时**不能**把 closing 置起来——
+    /// FormClosing 在取消关闭时照样触发，而 closing 是粘性的。一旦被一次"取消"
+    /// 误置，<see cref="Gone"/> 就永远为真：列表永远空、提示永远停在"正在读取…"，
+    /// 而且不报任何错——正是这次改动想消灭的那种静默失败。
+    ///
+    /// 破坏性操作进行到一半时给出确认，而不是把「关闭」按钮禁掉：
+    /// 禁按钮只挡得住鼠标，标题栏 X 与 Alt+F4 照样能关（ControlBox 不受控件
+    /// Enabled 影响），可它同时把 CancelButton 也废了——Button 在 Enabled==false
+    /// 时 CanSelect 为 false，Form.ProcessDialogKey 的 Escape 分支会直接跳过，
+    /// 键盘用户按 Esc 就变成**完全无反应**。与"无声吞掉 Esc"相比，
+    /// "问一句要不要关"把三条关闭路径统一成了同一个有意识的决定。
+    /// </summary>
+    private void ConfirmClose(FormClosingEventArgs e)
+    {
+        if (busy)
+        {
+            var go = MessageBox.Show(this,
+                "操作仍在进行中。\n\n现在关闭窗口，操作会继续在后台执行完，但结果不会再显示。\n\n确定要关闭吗？",
+                "操作进行中", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (go != DialogResult.Yes) { e.Cancel = true; return; }
+        }
+        closing = true;
     }
 
     /// <summary>
@@ -150,6 +198,8 @@ internal sealed class EngineVersionsForm : Form
     private const int BottomPad = 14;
     private const int Gap = 8;
     private const int ListTop = 34;
+    /// <summary>四个按钮的实测文字宽度，构造后第一次布局时算一次即可（见 LayoutButtons）。</summary>
+    private int[]? buttonWidths;
 
     /// <summary>
     /// 让内容跟着窗口尺寸走。
@@ -188,9 +238,14 @@ internal sealed class EngineVersionsForm : Form
     /// </summary>
     private void LayoutButtons(int rowY)
     {
-        var buttons = new Button[] { activateButton, deleteButton, closeButton, refreshButton };
+        // 按钮文字与字体在构造期就定死了，宽度**永远不变**，而 Resize 是拖边框时
+        // 每像素触发一次的热路径。TextRenderer.MeasureText 走 GDI，明显比普通标量计算贵，
+        // 外加每次两个数组分配——这些全都不该在 Resize 里重复付。
+        buttonWidths ??= new[] { activateButton, deleteButton, closeButton, refreshButton }
+            .Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
 
-        var widths = buttons.Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        var buttons = new[] { activateButton, deleteButton, closeButton, refreshButton };
+        var widths = buttonWidths;
         var total = widths.Sum() + Gap * (buttons.Length - 1);
         var available = ClientSize.Width - SidePad * 2;
         if (total > available && buttons.Length > 1)
@@ -214,13 +269,13 @@ internal sealed class EngineVersionsForm : Form
         new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
 
     private EngineVersionEntry? Selected =>
-        !IsDisposed && list.SelectedItems.Count > 0
+        !Gone && list.SelectedItems.Count > 0
             ? list.SelectedItems[0].Tag as EngineVersionEntry
             : null;
 
     private void UpdateButtons()
     {
-        if (busy || IsDisposed) return;
+        if (busy || Gone) return;
         var sel = Selected;
         activateButton.Enabled = sel is not null && !sel.IsActive;
         deleteButton.Enabled = sel is not null && !sel.IsActive;
@@ -233,13 +288,19 @@ internal sealed class EngineVersionsForm : Form
     /// </summary>
     private void SetBusy(bool value)
     {
-        if (IsDisposed) return;
+        // 守卫用 Gone 而不是只判 IsDisposed：父窗体那边是 using var dialog + ShowDialog，
+        // ShowDialog 返回后进入 Dispose(bool) 时 Disposing 已为真而 IsDisposed 仍为假，
+        // 只判后者会放行一串控件写入。ReloadAsync 走的是 async void 事件处理器，
+        // 真抛了就是无人接管的进程崩溃。
+        if (Gone) return;
         busy = value;
         // 列表也要禁用：按钮禁用挡不住双击，而并发两次目录交换会抢同一个 engine 目录。
         list.Enabled = !value;
         refreshButton.Enabled = !value;
         activateButton.Enabled = !value;
         deleteButton.Enabled = !value;
+        // 「关闭」**不**禁用：它是 CancelButton，禁用会连带吞掉 Esc（见 ConfirmClose）。
+        // 需要拦的时候由 ConfirmClose 弹一句确认，三条关闭路径统一收口。
         if (!value) UpdateButtons();
     }
 
@@ -250,7 +311,7 @@ internal sealed class EngineVersionsForm : Form
     /// </summary>
     private async Task ReloadAsync()
     {
-        if (busy || IsDisposed) return;
+        if (busy || Gone) return;
 
         SetBusy(true);
         hint.Text = "正在读取已安装的引擎版本…";
@@ -262,7 +323,8 @@ internal sealed class EngineVersionsForm : Form
 
             // await 期间用户可能关了窗：主窗体那边是 using var dialog + ShowDialog，
             // 窗口一返回就 Dispose，此后任何控件访问都是 ObjectDisposedException。
-            if (IsDisposed || !IsHandleCreated) return;
+            // 判据必须是 Gone 而不是"句柄还在不在"——见 Gone 的注释。
+            if (Gone) return;
 
             list.BeginUpdate();
             try
@@ -297,15 +359,42 @@ internal sealed class EngineVersionsForm : Form
         }
         catch (Exception ex)
         {
-            if (!IsDisposed) hint.Text = "读取版本列表失败：" + ex.Message;
+            if (!Gone) hint.Text = "读取版本列表失败：" + ex.Message;
         }
         finally
         {
-            SetBusy(false);
+            // 与 FoldersForm 同一套纪律：busy 是状态（无条件复位），
+            // 控件写入是副作用（Gone 之后不再做）。
+            busy = false;
+            if (!Gone) SetBusy(false);
         }
     }
 
-    private async void ActivateSelected()
+    /// <summary>
+    /// 所有 async void 事件处理器的统一入口。
+    ///
+    /// async void 里抛出的异常**绕过所有 try/catch**直达默认处理器，也就是整个启动器
+    /// 当场崩掉。而这两个处理器在 await 之后要摸控件、弹 MessageBox，关窗竞态随时
+    /// 可能插进来（ObjectDisposedException / InvalidOperationException）。
+    /// 顶部注释反复强调"绝不能崩"，那就必须有一层兜底，而不是指望每处判据都写对。
+    /// </summary>
+    private static async Task GuardedAsync(Func<Task> body)
+    {
+        try { await body(); }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+            // 关窗竞态：操作多半已经执行完，只是反馈没地方显示。正常路径，不打扰用户。
+        }
+        catch (Exception ex)
+        {
+            try { MessageBox.Show(ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            catch { }
+        }
+    }
+
+    private void ActivateSelected() => _ = GuardedAsync(ActivateSelectedCore);
+
+    private async Task ActivateSelectedCore()
     {
         var sel = Selected;
         if (sel is null || sel.IsActive || busy) return;
@@ -316,7 +405,7 @@ internal sealed class EngineVersionsForm : Form
             "完成后请回主界面点「启动」以新版本启动。当前版本不会被删除，随时可以切回来。",
             "切换引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
-        if (IsDisposed) return;
+        if (Gone) return;
 
         // 切换是本对话框最重的操作：停引擎（最多等端口关闭 8 秒）+ 两次目录改名。
         // 之前用 .GetAwaiter().GetResult() 在 UI 线程上同步等，期间两个窗口全部冻结，
@@ -328,26 +417,29 @@ internal sealed class EngineVersionsForm : Form
         try { error = await activateVersion(sel.Version); }
         catch (Exception ex) { error = ex.Message; }
 
-        // 等待期间用户可以点「关闭」或标题栏 X。主窗体那边是 using var dialog + ShowDialog，
-        // 窗口一返回就 Dispose；此后再碰控件就是 ObjectDisposedException，从 async void
-        // 抛出无人接管会直接崩掉进程——而切换其实早就成功了。
-        if (IsDisposed || !IsHandleCreated) return;
+        if (Gone) return;
 
         SetBusy(false);
         if (error is not null)
         {
             hint.Text = "切换失败：" + error;
             MessageBox.Show(error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // 失败也必须回到磁盘真相：目录交换走到一半才失败的情况（新的顶上失败、
+            // 旧的搬回也失败）会让列表里显示的"使用中"版本与磁盘实际状态不一致，
+            // 而界面上没有任何提示。SetBusy 恢复了「刷新」，但数据没人去重读。
+            await ReloadAsync();
             return;
         }
         await ReloadAsync();
-        if (IsDisposed || !IsHandleCreated) return;
+        if (Gone) return;
         MessageBox.Show(
             $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
             "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private async void DeleteSelected()
+    private void DeleteSelected() => _ = GuardedAsync(DeleteSelectedCore);
+
+    private async Task DeleteSelectedCore()
     {
         var sel = Selected;
         if (sel is null || sel.IsActive || busy) return;
@@ -359,7 +451,7 @@ internal sealed class EngineVersionsForm : Form
             "\n此操作不可恢复（该版本需要时可重新安装）。",
             "删除引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
-        if (IsDisposed) return;
+        if (Gone) return;
 
         // 删除整棵 node_modules（2.5 万个文件）是秒级操作，所以委托是异步的。
         SetBusy(true);
@@ -369,13 +461,14 @@ internal sealed class EngineVersionsForm : Form
         try { error = await deleteVersion(sel.Version); }
         catch (Exception ex) { error = ex.Message; }
 
-        if (IsDisposed || !IsHandleCreated) return;
+        if (Gone) return;
 
         SetBusy(false);
         if (error is not null)
         {
             hint.Text = "删除失败：" + error;
             MessageBox.Show(error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            await ReloadAsync();
             return;
         }
         await ReloadAsync();

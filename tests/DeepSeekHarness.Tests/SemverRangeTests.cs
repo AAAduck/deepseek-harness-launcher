@@ -71,6 +71,21 @@ public class SemverRangeTests
         Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
     }
 
+    [Theory]
+    // "-0" 是 npm 里"小于下一个正式版"的惯用写法（0.3.0-0 排在正式版之前，
+    // 于是 <0.3.0-0 表示"任何 0.3.0 的正式版都不在内"）。它此前只作为组合区间的
+    // 右半边出现过，没有被单独钉住。
+    [InlineData("0.2.9", "<0.3.0-0", true)]
+    [InlineData("0.3.0", "<0.3.0-0", false)]          // 正式版 > rc.0
+    [InlineData("0.3.0-0", "<0.3.0-0", false)]         // 精确相等，不是"小于"
+    // rc.1 vs 0：同为预发布但标识不同 → 本工具明确选择"判不出来"而不是猜。
+    // 这条钉的是**保守方向**：宁可报"未能判定"，也不能凭空说插件不兼容。
+    [InlineData("0.3.0-rc.1", "<0.3.0-0", null)]
+    public void 小于下一个正式版写法(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
     [Fact]
     public void 认不出的写法一律返回无法判定_而不是误判满足()
     {

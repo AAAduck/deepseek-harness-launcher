@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace DeepSeekHarness;
 
@@ -31,6 +32,12 @@ internal sealed class FoldersForm : Form
     private readonly Button refreshButton;
     /// <summary>正在跑一次刷新。防重入 + 统一管按钮可用性。</summary>
     private bool busy;
+    /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"（见 Gone）。</summary>
+    private bool closing;
+    /// <summary>四个按钮的实测文字宽度，构造后第一次布局时算一次即可。</summary>
+    private int[]? buttonWidths;
+    /// <summary>正在跑剪贴板重试（最长约 600ms），用来挡住连点。</summary>
+    private bool copying;
 
     /// <summary>一个相关位置。File 类条目在资源管理器里用"选中"而不是"打开"。</summary>
     private sealed record Entry(string Name, string Path, string Note, bool IsFile);
@@ -75,7 +82,12 @@ internal sealed class FoldersForm : Form
         Controls.Add(list);
 
         hint.Location = new Point(16, 210);
-        hint.Size = new Size(628, 18);
+        // 两行高度，且文本里用硬换行拆开。此前是一行 18px 的 Label 装一句约 35 个全角
+        // 字符的提示：Label 既不换行也无 AutoEllipsis，而本窗 MinimumSize.Width 只有 460
+        // （可用宽约 412px），120% DPI 下这段文字要 525px——**必然被截断**，
+        // 且被截掉的正是后半句「「凭据」含密钥，分享截图前请留意」这条唯一的安全提醒。
+        // 布局自检只看控件 Bounds，看不见文字截断，所以它永远不会报这里。
+        hint.Size = new Size(628, 36);
         hint.ForeColor = Color.FromArgb(108, 114, 126);
         Controls.Add(hint);
 
@@ -102,11 +114,47 @@ internal sealed class FoldersForm : Form
         Resize += (_, _) =>
         {
             ApplyResponsiveLayout();
-            LayoutDump.Capture($"目录 {ClientSize.Width}x{ClientSize.Height}", this,
-                title, list, hint, openButton, copyButton, closeButton, refreshButton);
+            // 与「版本管理」同一个理由：LayoutDump.Enabled 必须在调用点先判，
+            // 否则每次 Resize 都要白付一次插值字符串 + Control[] 的分配。
+            if (LayoutDump.Enabled)
+                LayoutDump.Capture($"目录 {ClientSize.Width}x{ClientSize.Height}", this,
+                    title, list, hint, openButton, copyButton, closeButton, refreshButton);
         };
         ApplyResponsiveLayout();
-        _ = ReloadAsync();
+
+        // 首屏加载挂在 Load 而不是构造函数：构造阶段句柄必然还没创建，
+        // 而下面 ReloadAsync 的存活判据不能用 IsHandleCreated（它表达"还没显示"）。
+        // 详见 Gone 的注释。
+        Load += async (_, _) => await ReloadAsync();
+        FormClosing += (_, e) => ConfirmClose(e);
+    }
+
+    /// <summary>
+    /// 窗体已经不可用了（已释放或正在关闭）。
+    /// **刻意不用 <c>IsHandleCreated</c>**：它表达的是"还没显示"，不是"已经没了"。
+    /// </summary>
+    private bool Gone => IsDisposed || Disposing || closing;
+
+    /// <summary>
+    /// 关闭时收口。被取消的关闭**不能**把 closing 置起来——FormClosing 在
+    /// <c>e.Cancel</c> 时照样触发，而 closing 粘性，误置一次 <see cref="Gone"/>
+    /// 就永远为真（列表永远空、提示永远停在"正在读取…"，且不报错）。
+    ///
+    /// 「关闭」按钮不禁用：它是 CancelButton，禁用会连带吞掉 Esc
+    /// （Button 在 Enabled==false 时 CanSelect 为 false，ProcessDialogKey 的
+    /// Escape 分支直接跳过），键盘用户就变成完全无反应。禁它也拦不住标题栏 X。
+    /// </summary>
+    private void ConfirmClose(FormClosingEventArgs e)
+    {
+        if (busy)
+        {
+            var go = MessageBox.Show(this,
+                "正在读取目录列表。\n\n现在关闭窗口，本次读取仍会在后台跑完，但结果不会再显示。\n\n确定要关闭吗？",
+                "读取进行中", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (go != DialogResult.Yes) { e.Cancel = true; return; }
+        }
+        closing = true;
     }
 
     /// <summary>
@@ -142,7 +190,7 @@ internal sealed class FoldersForm : Form
         // 列表高度上下都夹住。原来 hint 的 y 取自 list.Bottom，而 list 有下限保护，
         // 窗口压到最矮时提示会与按钮行零间隙相接（两个窗体的公式就此对齐）。
         const int listTop = 36;
-        const int hintHeight = 18;
+        const int hintHeight = 36;   // 两行：计数 + 凭据提醒（见构造里 hint 的注释）
         const int buttonHeight = 28;
         const int bottomPad = 14;
         const int margin = 16;
@@ -169,9 +217,13 @@ internal sealed class FoldersForm : Form
     /// </summary>
     private void LayoutButtons(int rowY, int margin, int gap, int buttonHeight)
     {
-        var buttons = new Button[] { openButton, copyButton, closeButton, refreshButton };
+        // 文字与字体构造期就定死，宽度永远不变；而 Resize 是拖边框时每像素触发一次的热路径。
+        // TextRenderer.MeasureText 走 GDI，比普通标量计算贵得多，不该在这里重复付。
+        buttonWidths ??= new[] { openButton, copyButton, closeButton, refreshButton }
+            .Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
 
-        var widths = buttons.Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        var buttons = new[] { openButton, copyButton, closeButton, refreshButton };
+        var widths = buttonWidths;
         var total = widths.Sum() + gap * (buttons.Length - 1);
         var available = ClientSize.Width - margin * 2;
         if (total > available && buttons.Length > 1)
@@ -198,7 +250,13 @@ internal sealed class FoldersForm : Form
     /// 收集所有相关位置。只返回真实存在的，按"常用的排前面"排序。
     /// 路径全部从环境变量推导，不写死任何机器专属位置。
     /// </summary>
-    private static List<Entry> Collect()
+    /// <summary>「相关目录」里最多列出的会话项目目录数，超出部分只报个数。</summary>
+    private const int MaxSessionProjects = 200;
+
+    /// <summary>收集结果：条目 + 因超过上限而未列出的会话项目数。</summary>
+    private readonly record struct CollectResult(List<Entry> Entries, int SessionOverflow);
+
+    private static CollectResult Collect()
     {
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -206,7 +264,7 @@ internal sealed class FoldersForm : Form
         // 是个**相对路径**——后面的 Exists 会按当前工作目录解析，可能误命中，
         // 并把一个相对路径显示甚至打开给用户。宁可少列几项。
         if (string.IsNullOrWhiteSpace(appData) || string.IsNullOrWhiteSpace(userProfile))
-            return new List<Entry>();
+            return new CollectResult(new List<Entry>(), 0);
 
         var appDir = Path.Combine(appData, "DeepSeekHarness");
         var dshHome = Path.Combine(userProfile, ".dsh");
@@ -231,14 +289,24 @@ internal sealed class FoldersForm : Form
             new("设置", Path.Combine(dshHome, "settings.yaml"), "迁移后一般不再存在", true),
         };
 
-        // 会话目录按项目分子目录，逐个也列出来，方便直接跳过去
+        // 会话目录按项目分子目录，逐个也列出来，方便直接跳过去。
+        // 上限 200：会话目录随使用线性增长，而这里对每个项目还要再发一次
+        // GetDirectories 统计会话数（N+1 次系统调用）。不设上限的话，一个用了
+        // 很久的账号能把这个"相关目录"窗口撑成上千行——而它的用途是挑几个位置跳过去，
+        // 没人需要翻到第 800 个项目。超限时在提示行里说明总数。
+        var overflow = 0;
         try
         {
             var sessions = Path.Combine(dshHome, "sessions");
             if (Directory.Exists(sessions))
             {
-                foreach (var dir in Directory.GetDirectories(sessions))
+                var projects = Directory.GetDirectories(sessions)
+                    .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var shown = Math.Min(projects.Count, MaxSessionProjects);
+                for (var i = 0; i < shown; i++)
                 {
+                    var dir = projects[i];
                     var count = Directory.GetDirectories(dir).Length;
                     candidates.Add(new Entry(
                         "  └ " + Path.GetFileName(dir),
@@ -246,6 +314,7 @@ internal sealed class FoldersForm : Form
                         $"{count} 个会话",
                         false));
                 }
+                overflow = projects.Count - shown;
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -254,15 +323,15 @@ internal sealed class FoldersForm : Form
             // 收窄异常类型：不该把 OutOfMemory 之类一并吞掉。
         }
 
-        return candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList();
+        var visible = candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList();
+        return new CollectResult(visible, overflow);
     }
 
     private async Task ReloadAsync()
     {
-        if (busy || IsDisposed) return;
+        if (busy || Gone) return;
 
-        busy = true;
-        refreshButton.Enabled = false;
+        SetBusy(true);
         hint.Text = "正在读取…";
         // 记住当前选中的路径：刷新后一律跳回第一行会让"复制路径"的上下文跑掉。
         var previous = Selected?.Path;
@@ -271,11 +340,13 @@ internal sealed class FoldersForm : Form
             // Collect 是纯只读的元数据查询（Exists + GetDirectories，不读文件内容），
             // 放后台线程就够；但 profile 落在漫游配置/网络盘时这些查询并不便宜，
             // 同步做在 UI 线程上会明显卡一下。
-            var entries = await Task.Run(Collect);
+            var collected = await Task.Run(Collect);
+            var entries = collected.Entries;
+            var sessionOverflow = collected.SessionOverflow;
 
             // await 期间用户可能关了窗：主窗体那边是 using var dialog + ShowDialog，
             // 窗口一返回就 Dispose，此后任何控件访问都是 ObjectDisposedException。
-            if (IsDisposed || !IsHandleCreated) return;
+            if (Gone) return;
 
             list.BeginUpdate();
             try
@@ -301,25 +372,48 @@ internal sealed class FoldersForm : Form
             }
 
             hint.Text = $"共 {entries.Count} 项（只显示真实存在的位置）" +
-                        "　·　「凭据」含密钥，分享截图前请留意";
+                        (sessionOverflow > 0 ? $"，另有 {sessionOverflow} 个会话项目未列出" : string.Empty) +
+                        "\r\n「凭据」含密钥，分享截图前请留意";
         }
         catch (Exception ex)
         {
-            if (!IsDisposed) hint.Text = "读取目录失败：" + ex.Message;
+            if (!Gone) hint.Text = "读取目录失败：" + ex.Message;
         }
         finally
         {
-            if (!IsDisposed) { busy = false; refreshButton.Enabled = true; }
-            UpdateButtons();
+            // busy 是状态、控件写入是副作用：两者必须分开无条件复位。
+            // 原先写在 `if (!IsDisposed)` 里，窗体一旦在 await 期间被关掉，
+            // busy 就被永远留在 true——目前无害，但只要有人放宽这个判断
+            // （比如改成"句柄没了但对象还在，以便把结果交回父窗体弹提示"），
+            // 就会留下一条再也不会被清掉的 busy。
+            busy = false;
+            if (!Gone) SetBusy(false);
         }
     }
 
+    /// <summary>
+    /// 统一管理忙碌态。与「版本管理」的 SetBusy 同一套纪律：列表也要禁用——
+    /// 只禁按钮挡不住双击，而 Collect() 在网络盘/漫游配置上可能几百毫秒，
+    /// 这段时间里双击命中的是**上一轮**的 Tag（可能已被删掉）。
+    /// </summary>
+    private void SetBusy(bool value)
+    {
+        if (Gone) return;
+        busy = value;
+        list.Enabled = !value;
+        refreshButton.Enabled = !value;
+        openButton.Enabled = !value;
+        copyButton.Enabled = !value;
+        // 「关闭」不用：它是 CancelButton，禁用会连带吞掉 Esc；由 ConfirmClose 收口。
+        if (!value) UpdateButtons();
+    }
+
     private Entry? Selected =>
-        !IsDisposed && list.SelectedItems.Count > 0 ? list.SelectedItems[0].Tag as Entry : null;
+        !Gone && list.SelectedItems.Count > 0 ? list.SelectedItems[0].Tag as Entry : null;
 
     private void UpdateButtons()
     {
-        if (busy || IsDisposed) return;
+        if (busy || Gone) return;
         var sel = Selected;
         openButton.Enabled = sel is not null;
         copyButton.Enabled = sel is not null;
@@ -359,19 +453,53 @@ internal sealed class FoldersForm : Form
         }
     }
 
-    private void CopySelectedPath()
+    private void CopySelectedPath() => _ = CopySelectedPathAsync();
+
+    /// <summary>
+    /// 复制选中的路径。
+    ///
+    /// 剪贴板被别的进程短暂占着时，<see cref="Clipboard.SetText"/> 抛的是
+    /// ExternalException（ERROR_CLIPBOARD_NOT_OPEN）——这在真实使用里非常常见
+    /// （剪贴板管理器、远程桌面、截图工具）。原先第一次失败就弹窗，于是用户
+    /// 点「复制路径」常常要试两三次。这里做有限次退避重试：等待必须离开 UI 线程，
+    /// 所以整体做成 async。
+    /// </summary>
+    private async Task CopySelectedPathAsync()
     {
         var sel = Selected;
-        if (sel is null) return;
+        if (sel is null || copying) return;   // 重试期间可能长达 600ms，得挡住连点
+        copying = true;
+        copyButton.Enabled = false;
         try
         {
-            Clipboard.SetText(sel.Path);
-            hint.Text = "已复制：" + sel.Path;
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    Clipboard.SetText(sel.Path);
+                    if (!Gone) hint.Text = "已复制：" + sel.Path;
+                    return;
+                }
+                catch (ExternalException) when (attempt < 4)
+                {
+                    await Task.Delay(60 * (attempt + 1));
+                    // 刻意不在这里判 Gone：最后一次尝试仍要照做，复制成功就是成功。
+                    // 中途 return 只会得到"既没复制成功、也没有任何提示"的静默失败——
+                    // 比旧实现"第一次失败必定弹窗"还要糟。
+                }
+                catch (Exception ex)
+                {
+                    if (!Gone)
+                        MessageBox.Show($"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。",
+                            "复制路径", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            MessageBox.Show($"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。",
-                "复制路径", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            copying = false;
+            if (!Gone) copyButton.Enabled = true;
         }
     }
 }

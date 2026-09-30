@@ -53,8 +53,22 @@
   </ItemGroup>
 
   <!-- tests\ 下的代码属于测试工程，绝不能被本项目默认的 **/*.cs 通配吃进来：
-       被编进 WinExe 的话，启动时会因找不到 xunit 程序集而直接起不来。 -->
+       被编进 WinExe 的话，启动时会因找不到 xunit 程序集而直接起不来。
+
+       这里用 DefaultItemExcludes 把整个 tests\ 目录（连同它下面的 bin\obj 产物，
+       实测三百多个文件）从**所有**默认通配里摘掉，而不只是 Compile 一项：
+       只挡 .cs 的话，那些产物仍会被逐个建成 None 项参与拷贝判定；更要命的是
+       将来谁在 tests\ 下放一个 .resx，本项目是 WinForms（**/*.resx 默认进
+       EmbeddedResource），它就会被直接编进启动器的资源里。 -->
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)/tests/**</DefaultItemExcludes>
+  </PropertyGroup>
   <ItemGroup>
+    <!-- 上一条是"把整个 tests\ 从所有默认通配里摘掉"，但它能不能生效取决于 SDK 在
+         props 还是 targets 里求值默认通配——这是跨 SDK 版本的隐式依赖，一旦哪天
+         提前了，这条排除会**静默变成空操作**，主 WinExe 就把 tests\**\*.cs 编进去，
+         启动时报"找不到 xunit 程序集"。所以这里保留 Compile Remove 作为不依赖
+         求值顺序的兜底：两条同时在，任一条失效都还有另一条。 -->
     <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
 
