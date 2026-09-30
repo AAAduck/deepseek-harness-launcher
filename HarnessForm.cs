@@ -96,6 +96,13 @@ internal sealed class HarnessForm : Form
     private static readonly string engineDir = Path.Combine(LocalAppDir, "engine");
     private static readonly string engineStageDir = Path.Combine(LocalAppDir, "engine.tmp");
     private static readonly string engineOldDir = Path.Combine(LocalAppDir, "engine.old");
+    /// <summary>
+    /// 归档认领的中转目录：engine.old 被某个进程原子改名到这里之后、归档成
+    /// engine.&lt;版本&gt; 之前，它一直待在这里。存在即表示"这份数据已被认领"。
+    /// 它不是新造的一种垃圾，而是 engine.old 本身——中途被杀留下的这一份，
+    /// 下一轮启动会先把它收尾（见 MigrateEngineOldToSlot）。
+    /// </summary>
+    private static readonly string engineMigratingDir = Path.Combine(LocalAppDir, "engine.migrating");
     /// <summary>web profile 目录。此前这个路径在多处各写了一遍，容易写歪，统一到这里。</summary>
     private static readonly string webProfileDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
@@ -1833,38 +1840,102 @@ internal sealed class HarnessForm : Form
     /// 把升级后留下的 engine.old 提升为一个正式的版本槽。
     /// 升级流程仍然用 engine.old 作中转（改名失败可以靠它恢复），
     /// 这里在下次启动时把它归档成 engine.&lt;版本号&gt;，于是旧版本不会被动丢掉了。
+    ///
+    /// 跨进程互斥不靠锁文件，靠的是**同卷上的目录改名是原子的**：
+    /// 先 engine.old → engine.migrating，抢到的人才继续做"删同名槽 + 归档"。
+    /// 同机两个登录会话各跑一个启动器时（互斥体是 Local\，管不到别的会话），
+    /// 只有一个能抢到，另一个直接跳过本轮。
+    ///
+    /// 这不只是省一次重复劳动。原先两个进程都会执行
+    /// 「ForceDeleteDirectory(slot) + Move」，交错起来是这一种：P1 刚把 engine.old
+    /// 归档成 engine.&lt;版本&gt;，P2 随后把**同一个槽**递归删掉、自己的 Move 再因
+    /// 源已不在而失败——上一版本就此丢失（engine.old 没了，槽也没了，要重下 214 MB）。
+    /// 认领把"删"这个破坏性动作关进了只有一个人能进的临界区。
     /// </summary>
     private static void MigrateEngineOldToSlot()
     {
         try
         {
-            if (!Directory.Exists(engineOldDir)) return;
-            // 活动版本缺失时这本该由 RecoverEngineSwap 处理，别在这里抢着归档。
-            if (!Directory.Exists(engineDir)) return;
+            // 三条规则的顺序本身就是要点（见 PlanEngineOldArchive），这里只照着执行。
+            var plan = PlanEngineOldArchive(
+                Directory.Exists(engineDir),
+                Directory.Exists(engineOldDir),
+                Directory.Exists(engineMigratingDir));
 
-            var oldVersion = ReadEngineVersion(engineOldDir);
+            if (plan.FinishClaimed) ArchiveClaimedDir();
+
+            // 收尾之后 engine.old 可能已经被上一轮处理掉了（也可能没动），再确认一次。
+            if (!plan.ClaimOld || !Directory.Exists(engineOldDir)) return;
+            try
+            {
+                Directory.Move(engineOldDir, engineMigratingDir);   // 认领
+            }
+            catch (IOException) { return; }                        // 已被别人认领 / 源刚好没了
+            catch (UnauthorizedAccessException) { return; }
+
+            ArchiveClaimedDir();
+        }
+        catch (Exception ex)
+        {
+            AppendStartupLog("认领 engine.old 失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>归档要依次做的两步。</summary>
+    internal readonly record struct ArchivePlan(bool FinishClaimed, bool ClaimOld);
+
+    /// <summary>
+    /// 这一轮归档该做什么（纯函数、可单测）。三条规则，顺序本身是防丢数据的关键：
+    ///
+    /// ① 活动引擎缺失时**一律不动**——那是 <see cref="RecoverEngineSwap"/> 的活，
+    ///    它优先把 engine.old 搬回活动目录；在这里抢着归档会让它无源可搬。
+    /// ② engine.migrating 存在就说明上一次没收尾，**先**把它归档掉：它占着双份磁盘
+    ///    （实测每份约 214 MB），又因为不参与版本列举而用户在界面上根本看不见——
+    ///    这是典型的"坏了也不报错"，所以必须先收尾。
+    /// ③ 之后才认领 engine.old。两者同时存在时也是先 ② 再 ③：收尾完认领才有落点，
+    ///    否则 Move 会因为目标目录已存在而失败（失败也是安全的：只是本轮不归档）。
+    /// </summary>
+    internal static ArchivePlan PlanEngineOldArchive(bool engineExists, bool oldExists, bool migratingExists)
+    {
+        if (!engineExists) return new ArchivePlan(false, false);
+        return new ArchivePlan(migratingExists, oldExists);
+    }
+
+    /// <summary>
+    /// 归档已被认领的那份数据（engine.migrating）。不在则什么都不做。
+    /// 调用方保证此刻没有别的进程持有它——要么本进程刚认领成功，
+    /// 要么它是上一轮中断留下的遗留（那种情况下别的进程也已经不在了）。
+    /// </summary>
+    private static void ArchiveClaimedDir()
+    {
+        try
+        {
+            if (!Directory.Exists(engineMigratingDir)) return;
+
+            var oldVersion = ReadEngineVersion(engineMigratingDir);
             if (oldVersion is null)
             {
                 // 读不出版本（装了一半）：不能确定它属于哪个槽，保守地留着让用户自己决定。
-                AppendStartupLog("engine.old 无法读出引擎版本，保留原样未归档");
+                // 注意它此时位于 engine.migrating 而非 engine.old，日志要把位置说清楚。
+                AppendStartupLog("engine.migrating 无法读出引擎版本，保留原样未归档");
                 return;
             }
 
             if (string.Equals(ReadEngineVersion(engineDir), oldVersion, StringComparison.OrdinalIgnoreCase))
             {
                 // 与活动版本同一个版本号，留两份纯属浪费磁盘。
-                ForceDeleteDirectory(engineOldDir);
+                ForceDeleteDirectory(engineMigratingDir);
                 return;
             }
 
             var slot = EngineSlotDirFor(oldVersion);
             ForceDeleteDirectory(slot);
-            Directory.Move(engineOldDir, slot);
+            Directory.Move(engineMigratingDir, slot);
             AppendStartupLog($"已把上一版本 {oldVersion} 归档为可切换版本");
         }
         catch (Exception ex)
         {
-            AppendStartupLog("归档 engine.old 失败：" + ex.Message);
+            AppendStartupLog("归档 engine.migrating 失败：" + ex.Message);
         }
     }
 
@@ -1901,8 +1972,8 @@ internal sealed class HarnessForm : Form
                 if (!name.StartsWith(EngineSlotPrefix, StringComparison.OrdinalIgnoreCase)) continue;
                 var version = name[EngineSlotPrefix.Length..];
                 if (version.Length == 0) continue;
-                // "engine.old" / "engine.tmp" 不是版本槽，跳过。
-                if (version is "old" or "tmp") continue;
+                // "engine.old" / "engine.tmp" / "engine.migrating" 不是版本槽，跳过。
+                if (version is "old" or "tmp" or "migrating") continue;
                 if (!File.Exists(Path.Combine(dir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))) continue;
                 result.Add(new EngineVersionEntry(
                     version, dir, false,
@@ -1920,13 +1991,23 @@ internal sealed class HarnessForm : Form
     /// 这里把 engine.old 改回来，避免出现"引擎凭空消失"。
     /// 注意顺序：必须先跑这个，再让 MigrateEngineOldToSlot 把 engine.old 归档成版本槽，
     /// 否则"活动目录缺失"的中间态会被归档动作掩盖掉。
+    ///
+    /// 兜底也要认领中转目录：进程若死在"认领之后、归档之前"，engine.old 已经不在，
+    /// 而 engine.migrating 里装着的正是上一版本。不认它的话，活动引擎缺失时就只剩
+    /// 重装一条路（214 MB），而那份能用的版本就静静躺在旁边。
     /// </summary>
     private void RecoverEngineSwap()
     {
         try
         {
-            if (!Directory.Exists(engineDir) && Directory.Exists(engineOldDir))
-                Directory.Move(engineOldDir, engineDir);
+            if (Directory.Exists(engineDir)) return;
+            foreach (var source in new[] { engineOldDir, engineMigratingDir })
+            {
+                if (!Directory.Exists(source)) continue;
+                Directory.Move(source, engineDir);
+                AppendStartupLog($"已从 {Path.GetFileName(source)} 恢复引擎目录");
+                return;
+            }
         }
         catch { }
     }
@@ -3053,6 +3134,16 @@ internal sealed class HarnessForm : Form
 
             if (Directory.Exists(engineStageDir))
                 notes.Add("存在未完成的安装残留 engine.tmp（下次安装会自动清理）");
+
+            if (Directory.Exists(engineMigratingDir))
+            {
+                // 它不参与版本列举，界面上看不见，却实实在在占着一份引擎的空间——
+                // 不说出来就等于"坏了没人知道"。下一次点「启动」会自动收尾归档。
+                var claimed = ReadEngineVersion(engineMigratingDir);
+                notes.Add(claimed is null
+                    ? "存在未完成的版本归档 engine.migrating（下次点「启动」会处理；版本读不出时将原样保留）"
+                    : $"存在待归档的上一版本 {claimed}（engine.migrating，下次点「启动」会自动归档）");
+            }
 
             var oldEngine = ReadEngineVersion(engineOldDir);
             if (oldEngine is not null)
