@@ -32,6 +32,6 @@ internal static class Swallow
         catch { }
     }
 
-    /// <summary>高频循环路径：彻底静默，零开销。</summary>
-    internal static void Silent() { }
+    // Silent()（高频路径零开销占位）已删除：从无调用点。高频路径保持普通 catch { }
+    // 即可——那本身就是零开销的写法，不需要再包一层函数调用。
 }

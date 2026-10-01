@@ -123,9 +123,15 @@ internal sealed class HarnessForm : Form
     // tail 读文件复现代替管道事件。效果：引擎不再随启动器陪葬——更新/崩溃后
     // 新实例探到 web-url.txt 仍可用就直接复用还在跑的引擎，Web 会话零打断。
     private static readonly string engineStdioLog = Path.Combine(LocalAppDir, "engine-stdio.log");
-    private long engineLogPos;                                  // tail 已读到的字节偏移
-    private Decoder engineLogDecoder = Encoding.UTF8.GetDecoder();
-    private string engineLogRemainder = string.Empty;           // 未完成的半行
+    /// <summary>
+    /// tail 游标（字节偏移 + UTF8 解码器 + 半行尾巴）。刻意是**引用类型并整体替换**：
+    /// 新引擎起跑时 UI 线程直接 new 一个新的换上（volatile 写），旧循环在入口捕获的
+    /// 旧游标继续自洽地读完退场——两边各持各的状态，不存在共享可变字段。
+    /// 此前 pos/decoder/remainder 是三个散装字段，旧循环在 FeedEngineLogChunk
+    /// 内部一边读一边写，与新启动的复位交错时，旧循环会拿被清零的 pos 续读、
+    /// 把新引擎的日志当旧文件重新分派一遍（窄竞态，代际令牌只在循环顶检查）。
+    /// </summary>
+    private volatile LogCursor engineLogCursor = new();
     private int engineTailToken;                                // 代际标记：新引擎起跑后旧循环自行退场
     private string? authenticatedUrl;
     private bool isOn;
@@ -567,11 +573,9 @@ internal sealed class HarnessForm : Form
         // 引擎 stdio 文件化：经 cmd 把 stdout/stderr 追加重定向进 engine-stdio.log。
         // 不再用管道的理由见字段区注释（启动器死亡 → 断管 → 引擎陪葬，实测 ~1 秒）。
         // 只在这次**真的**要拉新引擎时才重开日志文件；复用路径到不了这里。
-        // 先起代际令牌：旧引擎的 tail 循环随即退场，再复位读取状态。
+        // 先起代际令牌 + 换新游标：旧循环随即退场（退场前仍用旧游标自洽地读完）。
         var tailToken = ++engineTailToken;
-        engineLogPos = 0;
-        engineLogDecoder = Encoding.UTF8.GetDecoder();
-        engineLogRemainder = string.Empty;
+        engineLogCursor = new LogCursor();
         try
         {
             Directory.CreateDirectory(LocalAppDir);
@@ -741,16 +745,19 @@ internal sealed class HarnessForm : Form
     /// 退出时代际令牌一换，上一任循环自行收工；进程退出后再把尾巴读干净
     /// （崩溃前的最后几行日志就在那里，"启动失败"摘要全靠它）。
     /// 整段自吞异常：这是个后台循环，任何一轮读失败下一轮继续即可。
+    /// 游标在**入口捕获一次**：之后即使 UI 线程为新引擎换了新游标，本循环也
+    /// 只读写自己捕获的这份旧游标，不存在与复位交错写共享字段的窗口。
     /// </summary>
     private async Task EngineTailLoopAsync(Process process, int token)
     {
+        var cursor = engineLogCursor;
         var buffer = new byte[16 * 1024];
         while (true)
         {
             if (token != engineTailToken) return;
             try
             {
-                FeedEngineLogChunk(buffer);
+                FeedEngineLogChunk(cursor, buffer);
             }
             catch { }
 
@@ -760,7 +767,7 @@ internal sealed class HarnessForm : Form
                 // 退出检测与文件写入之间总有先后差：最后多读几轮，把没落完的日志收干净。
                 for (var drain = 0; drain < 4; drain++)
                 {
-                    try { if (FeedEngineLogChunk(buffer) == 0) break; } catch { break; }
+                    try { if (FeedEngineLogChunk(cursor, buffer) == 0) break; } catch { break; }
                     await Task.Delay(150);
                 }
                 return;
@@ -769,44 +776,57 @@ internal sealed class HarnessForm : Form
         }
     }
 
+    /// <summary>
+    /// tail 的全部可变状态。一个引擎一代：新引擎起跑时整体换新对象（见
+    /// <see cref="engineLogCursor"/> 的注释），旧循环持有旧对象自洽退场。
+    /// 字段刻意 public：只在 tail 循环单线程访问（每代一个循环、互不共享），
+    /// 无并发写面，包一层属性只增加噪音。
+    /// </summary>
+    private sealed class LogCursor
+    {
+        public long Pos;                                        // 已读到的字节偏移
+        public Decoder Decoder = Encoding.UTF8.GetDecoder();
+        public string Remainder = string.Empty;                 // 未完成的半行
+    }
+
     /// <summary>把新增字节解码成字符并按行分发；返回本次分发的行数（供退场判断）。</summary>
-    private int FeedEngineLogChunk(byte[] buffer)
+    private int FeedEngineLogChunk(LogCursor cursor, byte[] buffer)
     {
         if (!File.Exists(engineStdioLog)) return 0;
         using var fs = new FileStream(engineStdioLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        if (fs.Length < engineLogPos)
+        if (fs.Length < cursor.Pos)
         {
             // 文件被重开/清空（下次启动会删掉重建）：偏移与解码状态全部复位。
-            engineLogPos = 0;
-            engineLogDecoder = Encoding.UTF8.GetDecoder();
-            engineLogRemainder = string.Empty;
+            cursor.Pos = 0;
+            cursor.Decoder = Encoding.UTF8.GetDecoder();
+            cursor.Remainder = string.Empty;
         }
-        if (fs.Length == engineLogPos) return 0;
-        fs.Seek(engineLogPos, SeekOrigin.Begin);
+        if (fs.Length == cursor.Pos) return 0;
+        fs.Seek(cursor.Pos, SeekOrigin.Begin);
 
         var lines = 0;
         int len;
         while ((len = fs.Read(buffer, 0, buffer.Length)) > 0)
         {
-            engineLogPos += len;
-            var chars = new char[engineLogDecoder.GetCharCount(buffer, 0, len)];
-            var n = engineLogDecoder.GetChars(buffer, 0, len, chars, 0);
-            lines += DispatchEngineLogText(new string(chars, 0, n));
+            cursor.Pos += len;
+            var chars = new char[cursor.Decoder.GetCharCount(buffer, 0, len)];
+            var n = cursor.Decoder.GetChars(buffer, 0, len, chars, 0);
+            lines += DispatchEngineLogText(cursor, new string(chars, 0, n));
         }
         return lines;
     }
 
-    private int DispatchEngineLogText(string text)
+    private int DispatchEngineLogText(LogCursor cursor, string text)
     {
-        var data = engineLogRemainder + text;
+        var data = cursor.Remainder + text;
         var cut = data.LastIndexOf('\n');
         if (cut < 0)
         {
             // 一行迟迟不成形（引擎理论上不会这样，防超长行撑爆内存）：留尾巴，丢旧头。
-            engineLogRemainder = data.Length > 16 * 1024 ? data[^8192..] : data;
+            cursor.Remainder = data.Length > 16 * 1024 ? data[^8192..] : data;
             return 0;
         }
-        engineLogRemainder = data.Substring(cut + 1);
+        cursor.Remainder = data.Substring(cut + 1);
         var lines = 0;
         foreach (var raw in data.Substring(0, cut + 1).Split('\n'))
         {
@@ -848,11 +868,38 @@ internal sealed class HarnessForm : Form
         try
         {
             using var response = await LocalHttp.GetAsync($"http://127.0.0.1:{port}/", HttpCompletionOption.ResponseHeadersRead);
-            var body = await response.Content.ReadAsStringAsync();
-            return response.StatusCode == HttpStatusCode.OK ||
-                   (response.StatusCode == HttpStatusCode.Unauthorized && body.Contains("dsh web authentication required", StringComparison.OrdinalIgnoreCase));
+            if (response.StatusCode == HttpStatusCode.OK) return true;
+            if (response.StatusCode != HttpStatusCode.Unauthorized) return false;
+            // 401：只需确认 body 里那句 "dsh web authentication required"。此前是
+            // ReadAsStringAsync 整页读完——RefreshStatusAsync 每 1.5 秒调一次本方法，
+            // 每次都全量读 body。分块读、命中即返回，正常场景第一个缓冲就够
+            // （那句话在登录页靠前的位置）。
+            return await BodyContainsAsync(response, "dsh web authentication required");
         }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// 响应 body 是否含指定子串：分块读、命中即返回。保留"尾部 = 子串长 - 1"的
+    /// 滑动窗口，跨块边界的命中不会丢；body 异常长时内存也有界。
+    /// </summary>
+    private static async Task<bool> BodyContainsAsync(HttpResponseMessage response, string needle)
+    {
+        using var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var buffer = new char[4096];
+        var window = new StringBuilder(needle.Length * 2);
+        int read;
+        while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            window.Append(buffer, 0, read);
+            if (window.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            // 丢掉窗口头部，只留可能与下一块拼出目标子串的尾巴。
+            var keep = Math.Min(window.Length, needle.Length - 1);
+            window.Remove(0, window.Length - keep);
+        }
+        return false;
     }
 
     private async Task RefreshStatusAsync()
