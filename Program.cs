@@ -31,6 +31,36 @@ internal static class Program
         {
             ApplicationConfiguration.Initialize();
 
+            // 全局异常兜底。此前只有 Main 的 try/catch：UI 线程事件处理器抛异常走
+            // WinForms 默认对话框（不落 crash-log），后台线程/async void 逃逸的异常
+            // 直接杀进程（WinExe 无控制台，什么都留不下）。三个钩子统一落到
+            // WriteCrashLog；必须挂在任何窗口创建**之前**（SetUnhandledExceptionMode
+            // 的约束），所以紧跟 Initialize。
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            // UI 线程：写完日志后仍弹一次默认对话框——那是改动前用户就有的反馈
+            // （可继续/退出），只删不加会让 UI 异常从"看得见"变成"无声继续"。
+            Application.ThreadException += (_, e) =>
+            {
+                WriteCrashLog(e.Exception);
+                try { using var dialog = new ThreadExceptionDialog(e.Exception); dialog.ShowDialog(); }
+                catch { }
+            };
+            // 任意线程的未处理异常（多数场景进程随后即终）：只求留下死因。
+            // ExceptionObject 契约上是 object（极端情况不是 Exception），直接强转
+            // 会在处理器里再抛一次——用模式匹配兜住。
+            AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            {
+                if (e.ExceptionObject is Exception ex) WriteCrashLog(ex);
+                else WriteCrashLog(new Exception("非 Exception 的未处理对象：" + (e.ExceptionObject?.ToString() ?? "null")));
+            };
+            // 未观察的 Task 异常（.NET 默认不崩进程，但异常本身会无声消失）。
+            // SetObserved 显式认领，防未来有人开启"未观察异常即崩溃"策略时反复触发。
+            TaskScheduler.UnobservedTaskException += (_, e) =>
+            {
+                WriteCrashLog(e.Exception);
+                e.SetObserved();
+            };
+
             // 布局自检入口：只开两个对话框、在多个尺寸下记录几何、退出。不经过主窗体。
             // 加这个是因为主窗体在 DSH_LAYOUT_DUMP=1 下会先自己退出，对话框根本没机会被打开；
             // 而"拉伸对话框时内容不动"正是要验证的那件事，靠肉眼看窗口验证不了。
