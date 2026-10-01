@@ -40,6 +40,36 @@ public class SemverRangeTests
     }
 
     [Theory]
+    // —— npm 的比较器集合级预发布门槛（此前只有 caret/tilde 有守卫，裸比较器漏了）：
+    //    候选带预发布时，一个候选项（比较器集合）只有在"集合里至少有一个比较器的
+    //    基准带预发布且与候选同 [major, minor, patch] 三元组"时才放行。
+    //    此前裸比较器只做数字比较，0.3.0-rc.1 被判满足 >=0.2.0——npm 实际会拒绝
+    //    安装（peer 不满足），护栏恰在漏报警方向出错（本工具最不能犯的那个方向）。
+    //    注意门槛必须在**集合级**裁决：>=0.1.7-rc.1 <0.3.0-0 配 0.1.9 这种组合里，
+    //    逐 token 各自设门槛会把合法组合误判成不满足（凭空多警告）。——
+    [InlineData("0.3.0-rc.1", ">=0.2.0", false)]                 // 修复的主用例
+    [InlineData("0.2.5-rc.1", "<0.3.0", false)]                  // 数字满足但集合无预发布基准
+    [InlineData("0.2.0-rc.1", ">=0.1.7-rc.1 <0.3.0-0", false)]   // 现实 peer 形状：两个基准三元组都不匹配
+    [InlineData("0.2.5", ">=0.1.7-rc.1 <0.3.0-0", true)]         // 非预发布候选不受门槛影响（回归保护）
+    [InlineData("0.1.9", ">=0.1.7", true)]                       // 同上
+    [InlineData("0.1.5-rc.1", "0.1.5-rc.1", true)]               // 裸精确版本也参与集合：同三元组放行
+    public void 比较器集合的预发布门槛(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
+    // —— build 段里的 '-' 不是预发布标识："1.2.3+b-x" 是**带 build 的正式版**，
+    //    与 "1.2.3" 相等（build metadata 不参与比较）。此前预发布提取在整串里
+    //    找 '-'，把它误判成 1.2.3 的预发布版，^1.2.3 误报"不满足"。——
+    [InlineData("1.2.3+b-x", "^1.2.3", true)]
+    [InlineData("1.2.3+x-y", "1.2.3", true)]
+    public void build段里的连字符不是预发布标识(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
     [InlineData("0.1.5", "~0.1.5", true)]
     [InlineData("0.1.9", "~0.1.5", true)]      // 同 major+minor 的补丁升级
     [InlineData("0.2.0", "~0.1.5", false)]     // 越过 minor 即出界

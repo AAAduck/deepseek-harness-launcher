@@ -132,6 +132,10 @@ internal static class Program
                 LayoutDump.Capture($"版本管理 客户区={versions.ClientSize.Width}x{versions.ClientSize.Height}",
                     versions, versions.DumpControls());
             }
+            // 静默关闭：编程式 Close() 的 CloseReason 是 UserClosing，busy 没复位时
+            // 会弹"确定要关闭吗"确认框——自检进程没人应答，就挂死在那里（Collect
+            // 最多 200 个子目录的枚举，慢盘/杀软下完全可能拖过下面那几轮 DoEvents）。
+            versions.QuietClose = true;
             versions.Close();
         }
 
@@ -146,6 +150,7 @@ internal static class Program
                 LayoutDump.Capture($"目录 客户区={folders.ClientSize.Width}x{folders.ClientSize.Height}",
                     folders, folders.DumpControls());
             }
+            folders.QuietClose = true;
             folders.Close();
         }
     }

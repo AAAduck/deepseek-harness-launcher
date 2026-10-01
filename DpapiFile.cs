@@ -45,14 +45,35 @@ internal static class DpapiFile
         catch
         {
             // ① DPAPI 不可用：降级明文，别让加密功能连累链接持久化。
-            try { File.WriteAllText(path, plainText, Utf8NoBom); } catch { }
+            // 保持本方法"写不进也不抛"的旧契约（调用方各有自己的 catch，但契约别变）。
+            try { WriteAtomic(path, plainText); } catch { }
             return;
         }
-        try { File.WriteAllText(path, encoded, Utf8NoBom); }
+        try { WriteAtomic(path, encoded); }
         catch
         {
             // ② 加密格式写不进：降级明文再试一次。
-            try { File.WriteAllText(path, plainText, Utf8NoBom); } catch { }
+            try { WriteAtomic(path, plainText); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 原子写入：先写同目录临时文件，再同卷 Move 覆盖。File.WriteAllText 是原地
+    /// 覆写——进程被杀/断电落在写入中途，文件就停在半截 dpapi:base64，读侧解不开
+    /// → 复用静默失效、走完整重启。同卷 Move 在 NTFS 上是原子的：任何时刻目标要么
+    /// 是旧的完整内容，要么是新的完整内容（与 ConfigBackup.Restore 同一条纪律）。
+    /// </summary>
+    private static void WriteAtomic(string path, string contents)
+    {
+        var tmp = path + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, contents, Utf8NoBom);
+            File.Move(tmp, path, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
         }
     }
 

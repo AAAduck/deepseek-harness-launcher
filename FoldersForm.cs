@@ -38,6 +38,13 @@ internal sealed class FoldersForm : Form
     private int[]? buttonWidths;
     /// <summary>正在跑剪贴板重试（最长约 600ms），用来挡住连点。</summary>
     private bool copying;
+    /// <summary>
+    /// 布局自检（Program.RunLayoutSelfTest）的静默关闭开关。编程式 Close() 的
+    /// CloseReason 是 UserClosing（WinForms 文档原文："either programmatically
+    /// or through a user action"），Collect 还没跑完（busy）时会命中 ConfirmClose
+    /// 的确认框——自检进程没有人应答，就挂死在那里。自检关闭必须绕过询问。
+    /// </summary>
+    internal bool QuietClose;
 
     /// <summary>一个相关位置。File 类条目在资源管理器里用"选中"而不是"打开"。</summary>
     private sealed record Entry(string Name, string Path, string Note, bool IsFile);
@@ -151,6 +158,7 @@ internal sealed class FoldersForm : Form
         // e.Cancel = true 就是 Windows 意义上的"此应用阻止关机"，用户只能强杀，
         // 连日志都留不下。那种场景下"操作会不会跑完"根本不是用户需要做决定的事。
         if (e.CloseReason != CloseReason.UserClosing) { closing = true; return; }
+        if (QuietClose) { closing = true; return; }   // 布局自检：编程式关闭不询问（见字段注释）
         if (busy)
         {
             var go = MessageBox.Show(this,
@@ -457,7 +465,9 @@ internal sealed class FoldersForm : Form
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"无法打开：\n{sel.Path}\n\n{ex.Message}",
+            // 弹窗挂 owner：与「版本管理」同一纪律——无属主的框不参与 ShowDialog(this)
+            // 的模态 z 序，可能被压在主窗体后面，表现为"点了没反应"。
+            MessageBox.Show(this, $"无法打开：\n{sel.Path}\n\n{ex.Message}",
                 "打开目录", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -499,7 +509,7 @@ internal sealed class FoldersForm : Form
                 catch (Exception ex)
                 {
                     if (!Gone)
-                        MessageBox.Show($"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。",
+                        MessageBox.Show(this, $"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。",
                             "复制路径", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }

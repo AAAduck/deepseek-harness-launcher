@@ -660,6 +660,12 @@ internal sealed class HarnessForm : Form
         // 而截断发生在换代之际、旧循环可能正卡在一次 Feed 中间（`Length < Pos`
         // 会把它复位到 0 拿到整段保留尾部）——所以分发处另有逐行代际守卫，两条路各堵各的。
         var tailToken = ++engineTailToken;
+        // 摘要缓冲随引擎换代清空：它喂的是「启动失败」弹窗里的「最后输出」。
+        // 不清的话，新引擎零输出即崩时弹窗里躺着的是上一代引擎/上一次 npm install
+        // 的行——既误导排障，又让"未输出任何日志 → 给出日志路径与自检指引"
+        // 那个分支（summary.Contains("未输出任何日志")）永远轮不到触发。
+        // 与"新游标从截断后末尾起步"同一语义边界：一代引擎一份摘要。
+        lock (recentOutput) recentOutput.Clear();
         try
         {
             Directory.CreateDirectory(LocalAppDir);
@@ -739,7 +745,13 @@ internal sealed class HarnessForm : Form
                 // 直接取摘要会得到"未输出任何日志"——把真正有用的报错丢掉。
                 // 这里等一小会儿让管道排空，同时把"我们自己的进程被释放了"这种情况
                 // 与"引擎真的崩了"区分开。
-                try { await Task.Delay(300, ct); } catch (OperationCanceledException) { }
+                // 与等待循环尾部（769 行一带）同一条取消语义：取消就是取消，
+                // 静默 return。此前这里空 catch 吞掉 OCE 后继续往下走，一次取消
+                // 会被转写成"DeepSeek Harness 立即退出"的启动失败——今天只是被
+                // closing 守卫遮住看不见，将来谁加一条"非关窗取消"路径，这里
+                // 立刻变成假报错。
+                try { await Task.Delay(300, ct); }
+                catch (OperationCanceledException) { return; }
                 var code = SafeExitCode(process);
                 var codeText = code >= 0
                     ? $"代码 {code}"
@@ -794,11 +806,23 @@ internal sealed class HarnessForm : Form
         }
     }
 
-    private void HandleProcessLine(string? line)
+    private void HandleProcessLine(string? line, int token)
     {
         if (string.IsNullOrWhiteSpace(line)) return;
         var match = AuthUrlRegex.Match(line);
-        if (!match.Success)
+        string? url = match.Success
+            ? match.Value.TrimEnd('.', ',', ';', ')', ']', '\x1b')
+            : null;
+        if (url is not null)
+        {
+            // 端口归属校验：引擎固定以 --port 3080（DefaultPort，const）拉起，日志里
+            // 若出现指向**其他端口**的 token URL（第三方插件的输出、未来引擎打印的
+            // 回调地址等），采纳它只会写脏 web-url.txt、顶掉 authenticatedUrl、把浏览器
+            // 带去陌生地址。与探针同一失手方向：端口对不上就不当认证链接，按普通日志行走。
+            var urlPort = ExtractPort(url);
+            if (urlPort is null || urlPort != DefaultPort) url = null;
+        }
+        if (url is null)
         {
             // 非认证链接行：界面留一份进度、内部留一份尾部日志。
             // 之前这些行一律被丢弃，导致 npx 冷装或 DSH 报错期间界面完全看不出在干什么。
@@ -814,7 +838,13 @@ internal sealed class HarnessForm : Form
             return;
         }
 
-        var url = match.Value.TrimEnd('.', ',', ';', ')', ']', '\x1b');
+        // 写入前的二次代际核对。DispatchEngineLogText 的逐行守卫通过之后，本方法可能
+        // 被调度延迟到「杀引擎 → RetireEngineTail → 清 authenticatedUrl / 删
+        // web-url.txt」（StopHarnessProcessesAsync 1153-1158 一带）之后才执行——
+        // 那会把刚清掉的死 token 又写回去，重启等待循环随即在**新引擎起跑前**误判
+        // "启动成功"。这正是 1.4.1 修过两次的"authenticatedUrl 复活"失效形状剩下的
+        // 一条 check-then-act 缝：守卫在上游查过一次，不等于写进数据库的那一刻还成立。
+        if (!TailGenerationAlive(token, engineTailToken)) return;
         authenticatedUrl = url;
         lastPort = ExtractPort(url) ?? DefaultPort;
 
@@ -832,6 +862,8 @@ internal sealed class HarnessForm : Form
             BeginInvoke(() =>
             {
                 if (closing || IsDisposed) return;
+                // UI 回调排队期间令牌可能已退役（刚点完「停止」）：不能把死链当新会话打开。
+                if (!TailGenerationAlive(token, engineTailToken)) return;
                 link.Text = "打开 DeepSeek Harness 控制台";
                 UpdateButtons();
                 OpenBrowser(url);
@@ -948,7 +980,7 @@ internal sealed class HarnessForm : Form
             // 启动等待循环还会在新引擎就绪前提前返回"成功"。
             if (!TailGenerationAlive(token, engineTailToken)) return lines;
             lines++;
-            HandleProcessLine(raw.TrimEnd('\r'));
+            HandleProcessLine(raw.TrimEnd('\r'), token);
         }
         return lines;
     }
@@ -1505,7 +1537,19 @@ internal sealed class HarnessForm : Form
                 ".dsh", "profiles", "node_modules.lock");
             // 绝大多数启动这里根本没有锁文件：先判存在再决定要不要付出全量进程扫描的代价。
             if (!File.Exists(lockPath)) return;
-            if (GetProcessRecords().Values.Any(IsHarnessCommand)) return;
+            var records = GetProcessRecords();
+            // 快照为空（WMI 查询失败/被拦截）时**不能**把 Any()==false 当"没有残留进程"：
+            // 那会删掉一个可能仍被活着的引擎持有的锁——删锁正是本方法最不能犯的错
+            // （锁没了，并发写者就能同时进场）。宁可跳过：锁若真是孤儿，下次启动
+            // WMI 正常时仍会清掉；锁若被持有，跳过恰好避免一次真实的踩踏。
+            // 杀进程两条路径对空快照早已按异常处理并留痕（StopHarnessProcessesCore），
+            // 这里此前是唯一把空快照当"一切正常"的调用方。
+            if (records.Count == 0)
+            {
+                AppendStartupLog("进程快照为空（WMI 查询失败或被拦截），跳过孤儿锁清理，避免误删仍被持有的锁。");
+                return;
+            }
+            if (records.Values.Any(IsHarnessCommand)) return;
             File.Delete(lockPath);
         }
         catch (Exception ex) { Swallow.Quiet(ex, "clear-orphan-lock"); }
@@ -1601,6 +1645,8 @@ internal sealed class HarnessForm : Form
                                                      CancellationToken ct = default)
     {
         Process? proc = null;
+        Task<string>? outTask = null;
+        Task<string>? errTask = null;
         try
         {
             var psi = new ProcessStartInfo
@@ -1632,25 +1678,41 @@ internal sealed class HarnessForm : Form
 
             // 不给 ReadToEndAsync 传 token：一旦被取消它就不会再读完剩余数据，
             // 而杀掉子进程后管道自然会关闭、读取会干净地结束。
-            var outTask = proc.StandardOutput.ReadToEndAsync();
-            var errTask = proc.StandardError.ReadToEndAsync();
+            outTask = proc.StandardOutput.ReadToEndAsync();
+            errTask = proc.StandardError.ReadToEndAsync();
 
             try { await proc.WaitForExitAsync(timeoutCts.Token); }
             catch (OperationCanceledException)
             {
                 try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-                // 把两个读取任务收尾，别留下带未观察异常的 Task。
-                try { await outTask; } catch { }
-                try { await errTask; } catch { }
+                // 读取任务必须有界收尾（见下），裸 await 在孙进程继承句柄时会永挂。
+                await DrainQuietlyAsync(outTask, errTask);
                 return null;
             }
 
-            var text = await outTask;
-            // stderr 也要读掉：管道写满会让子进程自己卡死（内容不用）。
-            try { await errTask; } catch { }
+            // 进程退出了，管道**不一定**读完：孙进程若继承了 stdout 句柄且自己不退出，
+            // ReadToEndAsync 会一直挂着——而启动/升级路径对本方法没有外层超时，
+            // 一旦挂住界面就永久 busy。输出读不到是可接受的降级（各调用方都有回落），
+            // 与 GetToolVersionAsync/DrainQuietlyAsync 同一条纪律。
+            var drained = await Task.WhenAny(Task.WhenAll(outTask, errTask), Task.Delay(DrainTimeoutMs));
+            if (drained is not Task<string[]> done)
+            {
+                await DrainQuietlyAsync(outTask, errTask);
+                return null;
+            }
+            string text;
+            try { text = done.Result[0]; }
+            catch { return null; }
+            // stderr 已由上面一并排干：管道写满会让子进程自己卡死（内容不用）。
             return text;
         }
-        catch { return null; }
+        catch
+        {
+            // 其余异常（启动失败等）：同样可能留下孤儿进程与挂着的读取任务。
+            try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            await DrainQuietlyAsync(outTask, errTask);
+            return null;
+        }
         finally { try { proc?.Dispose(); } catch { } }
     }
 
@@ -2076,6 +2138,18 @@ internal sealed class HarnessForm : Form
             {
                 await Task.Run(() =>
                 {
+                    // 持闸后复查活动版本：上面的 active 是停引擎+等端口（最长 8 秒+）
+                    // 之前读的，而互斥体是 Local\（每个登录会话各一个实例），另一会话的
+                    // 启动器可能正在这个窗口里切换/重装引擎。拿陈旧名字决定"被换下的
+                    // 引擎归档进哪个槽"会把上一版本归进错误的槽/broken- 槽——
+                    // 与 DeleteEngineVersionAsync 的同窗口修法同一纪律。
+                    // 早退判断（active == version）仍留在停引擎之前：它只是省一次
+                    // 无谓的重启，窗口内变化的代价仅是"发现变了就中止"，不产生写动作。
+                    var confirmed = ReadEngineVersion(engineDir);
+                    if (!string.Equals(confirmed, active, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException(
+                            "等待期间活动引擎已被其他启动器改动，请重新打开「版本管理」再试。");
+
                     ForceDeleteDirectory(engineStageDir);
                     if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineStageDir);
                     try
@@ -2085,9 +2159,10 @@ internal sealed class HarnessForm : Form
                     catch
                     {
                         // 新版本顶上失败：把旧引擎搬回去再上抛。
-                        // 必须这么写——RecoverEngineSwap 只认 engine.old、不看 engineStageDir，
-                        // 而这条路径用的正是 engineStageDir。不搬回去就会留下"没有引擎"的状态，
-                        // 下次启动只能重新下载整份引擎（实测 214 MB）。
+                        // 必须这么写——engineStageDir 虽已列入 RecoverEngineSwap 的
+                        // 最后恢复源，但那要等下次启动才生效；当场搬回才是最直接的
+                        // 恢复路径。不搬回去就会留下"没有引擎"的状态，下次启动只能
+                        // 重新下载整份引擎（实测 214 MB）。
                         try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
                         throw;
                     }
@@ -2281,13 +2356,31 @@ internal sealed class HarnessForm : Form
                 if (!plan.ClaimOld || !Directory.Exists(engineOldDir)) return;
                 try
                 {
-                    Directory.Move(engineOldDir, engineMigratingDir);   // 认领
+                    // 认领直接落**私有名**（engine.migrating.<guid>），不再借道共享的
+                    // engine.migrating。共享名会被另一会话的收尾路（ClaimMigratingDir）
+                    // 当"无主残留"无条件抢走——抢的人不知道本进程正拿着它删槽/搬移，
+                    // 最坏交错（本进程刚 ForceDelete 掉同版本槽、还没 Move 顶上）会把
+                    // 对方刚填好的槽再整棵删掉：engine.old、engine.migrating、槽三者皆空，
+                    // 上一版本丢失。私有名只有本进程知道落点，而认领副本（ClaimDirs）
+                    // 的三个读取方——版本槽列举排除、RecoverEngineSwap 恢复源、
+                    // RestoreStaleClaims 陈旧回收——全都已按认领副本语义处理它，
+                    // 无需任何新分支。
+                    var claimed = Path.Combine(LocalAppDir, EngineClaimPrefix + Guid.NewGuid().ToString("N")[..8]);
+                    Directory.Move(engineOldDir, claimed);
+                    // NTFS 同卷改名**保留**目录的创建时间（=当初安装引擎的时刻），
+                    // 而 RestoreStaleClaims 用创建时间判"认领是否陈旧"——不改写的话
+                    // 每个刚创建的活认领都会立刻被判成陈旧、可能被另一会话挪走，
+                    // 30 分钟守卫从未真正生效过。改名成功立刻刷新，判定从此有意义。
+                    try { Directory.SetCreationTimeUtc(claimed, DateTime.UtcNow); } catch { }
+                    if (ArchiveClaimedDir(claimed)) return;
+                    // 归档没成：挪回共享名 engine.migrating，让下一轮收尾路立即重试——
+                    // 与 ArchiveMigratingLeftover 的失败分支同一语义，绝不能就地删
+                    // （里面装的是上一版本）。
+                    try { if (Directory.Exists(claimed)) Directory.Move(claimed, engineMigratingDir); }
+                    catch { }
                 }
                 catch (IOException) { return; }                        // 已被别人认领 / 源刚好没了
                 catch (UnauthorizedAccessException) { return; }
-
-                // 抢到 engine.old → engine.migrating 的那一步就是认领，此刻独占这份数据。
-                ArchiveClaimedDir(engineMigratingDir);
             }
             catch (Exception ex) { Swallow.Quiet(ex, "migrate-engine-old"); }
         }
@@ -2331,7 +2424,12 @@ internal sealed class HarnessForm : Form
         catch { }
     }
 
-    /// <summary>把 engine.migrating 原子改名成一份"私有的"，成功者独占本轮收尾。</summary>
+    /// <summary>
+    /// 把 engine.migrating 原子改名成一份"私有的"，成功者独占本轮收尾。
+    /// 私有名是这套协议的关键：收尾路只会对**自己抢到的**目录动手，
+    /// 别人正拿着归档的数据它永远碰不到（engine.old 的认领现在也直接落私有名，
+    /// 共享名 engine.migrating 只作为失败回退与陈旧回收的落点）。
+    /// </summary>
     private static string? ClaimMigratingDir()
     {
         if (!Directory.Exists(engineMigratingDir)) return null;
@@ -2339,6 +2437,10 @@ internal sealed class HarnessForm : Form
         try
         {
             Directory.Move(engineMigratingDir, claimed);
+            // 同 MigrateEngineOldToSlot 的认领：刷新创建时间。同卷改名保留创建时间，
+            // 不刷的话 RestoreStaleClaims 的 30 分钟陈旧判定会把刚抢到的活认领
+            // 当成陈旧残留挪走。
+            try { Directory.SetCreationTimeUtc(claimed, DateTime.UtcNow); } catch { }
             return claimed;
         }
         catch (IOException) { return null; }            // 已被别人认领走了
@@ -2533,15 +2635,26 @@ internal sealed class HarnessForm : Form
     /// 重装一条路（214 MB），而那份能用的版本就静静躺在旁边。收尾路的私有认领副本
     /// （engine.migrating.&lt;guid&gt;）同样要认——它就在认领之后那一步，进程死在那儿
     /// 的话留下的是同一份数据。
+    ///
+    /// engine.tmp 作**最后**恢复源：进程死在「切换版本」的两次改名之间时，
+    /// engine.tmp 里装的是完整的上一活动版本（目标槽原样健在），不认它就等于
+    /// 下次启动重装 214 MB 并把它当残骸删掉。必须验过是完整引擎（版本可读 +
+    /// bin.js 在）才认——安装中断留下的半截 staging 保持原状，交还重装路径清理。
     /// </summary>
     private void RecoverEngineSwap()
     {
         try
         {
             if (Directory.Exists(engineDir)) return;
-            foreach (var source in new[] { engineOldDir, engineMigratingDir }.Concat(ClaimDirs()))
+            foreach (var source in new[] { engineOldDir, engineMigratingDir }
+                         .Concat(ClaimDirs())
+                         .Append(engineStageDir))
             {
                 if (!Directory.Exists(source)) continue;
+                if (source == engineStageDir &&
+                    (ReadEngineVersion(source) is null ||
+                     !File.Exists(Path.Combine(source, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))))
+                    continue;   // 半截安装残骸：不是可回退副本，交给重装路径清理
                 Directory.Move(source, engineDir);
                 AppendStartupLog($"已从 {Path.GetFileName(source)} 恢复引擎目录");
                 return;
@@ -2849,6 +2962,23 @@ internal sealed class HarnessForm : Form
         return new Version(nums[0], nums[1], nums[2], parts.Length > 3 ? nums[3] : 0);
     }
 
+    /// <summary>
+    /// 取 semver 预发布标识（'-' 之后、'+' 之前）；没有返回 null。
+    /// 必须先按 '+' 截掉 build 段再找 '-'："1.2.3+b-x" 是**带 build 的正式版**，
+    /// 在整串里找 '-' 会把 build 段里的连字符当成预发布标识，与 <see cref="ParseVersion"/>
+    /// 在第一个 '-' 或 '+' 处截断 core 的口径不一致——同一个版本字符串，
+    /// core 判成正式版、预发布却判出 "x"，比较结果就会差一位（1.2.3+b-x 曾被
+    /// 当成 1.2.3 的预发布版，^1.2.3 误报"不满足"）。
+    /// </summary>
+    private static string? VersionPrerelease(string s)
+    {
+        s = s.Trim();
+        var plus = s.IndexOf('+');
+        var stem = plus >= 0 ? s[..plus] : s;
+        var i = stem.IndexOf('-');
+        return i < 0 ? null : stem[(i + 1)..];
+    }
+
     /// <summary>S1 &gt; S2 → 1；相等 → 0；S1 &lt; S2 → -1；无法比较 → null。</summary>
     internal static int? CompareVersionStrings(string a, string b)
     {
@@ -2866,17 +2996,8 @@ internal sealed class HarnessForm : Form
         // 数字段相同：正式版 > 预发布版；两边都是预发布且标识不同时，返回 null。
         // 预发布标识符的逐段比较（rc.1 vs rc.2 vs beta）规则繁琐且本工具用不上，
         // 拿不准就说拿不准，返回 null 让调用方按"未知"处理，绝不猜。
-        static string? Pre(string s)
-        {
-            var i = s.IndexOf('-');
-            if (i < 0) return null;
-            var rest = s[(i + 1)..];
-            var plus = rest.IndexOf('+');
-            return plus < 0 ? rest : rest[..plus];
-        }
-
-        var pa = Pre(a.Trim());
-        var pb = Pre(b.Trim());
+        var pa = VersionPrerelease(a);
+        var pb = VersionPrerelease(b);
         if (pa is null && pb is null) return 0;
         if (pa is null) return 1;
         if (pb is null) return -1;
@@ -2910,19 +3031,32 @@ internal sealed class HarnessForm : Form
         var anyAlternativeUnknown = false;
         foreach (var alternative in range.Split("||", StringSplitOptions.RemoveEmptyEntries))
         {
+            // 这个候选项里全部"比较器形态 token"的基准（供下面的集合级预发布门槛用）。
+            var comparators = new List<(int Major, int Minor, int Build, bool HasPrerelease)>();
             var allSatisfied = true;   // 目前为止每个 token 都满足
             var anyUnknown = false;    // 出现过无法判定的 token
             foreach (var token in alternative.Split(' ', StringSplitOptions.RemoveEmptyEntries))
             {
+                NoteComparatorBasis(token, comparators);
                 var verdict = SatisfiesSingle(candidate, token);
                 if (verdict is null) { anyUnknown = true; break; }
                 if (verdict.Value) continue;
                 allSatisfied = false;
                 break;
             }
-            if (allSatisfied && !anyUnknown) return true;   // 该候选项确定满足
+            if (allSatisfied && !anyUnknown)
+            {
+                // npm 的预发布门槛是**比较器集合级**的（node-semver Range.test 的收尾
+                // 规则），必须等全部 token 都数字满足之后在这一层统一裁决——不能塞进
+                // SatisfiesSingle 逐 token 做：那会把 ">=0.1.7-rc.1 <0.3.0-0" 配
+                // 0.1.7-rc.2 这种"集合里有同三元组预发布基准"的合法组合误判成不满足
+                // （凭空多警告）。
+                if (PrereleaseAdmittedByComparatorSet(candidate, comparators)) return true;
+                allSatisfied = false;
+                anyAlternativeFailed = true;
+                continue;
+            }
             if (anyUnknown) { anyAlternativeUnknown = true; continue; }
-            allSatisfied = false;
             anyAlternativeFailed = true;
         }
         // "无法判定"优先于"明确不满足"：只要还有一个候选项判不出来，
@@ -2930,12 +3064,26 @@ internal sealed class HarnessForm : Form
         return anyAlternativeFailed && !anyAlternativeUnknown ? false : null;
     }
 
+    /// <summary>
+    /// 比较器前缀 → 比较种类。<see cref="SatisfiesSingle"/> 与
+    /// <see cref="NoteComparatorBasis"/> 共用这一份——两边各写一份迟早漂移。
+    /// </summary>
+    private static readonly (string Prefix, int Op)[] ComparatorOps =
+        { (">=", 1), ("<=", 2), (">", 3), ("<", 4), ("=", 0) };
+
+    /// <summary>
+    /// 单个范围 token 的**数字**判定。npm 对预发布候选还有一道**比较器集合级**的门槛，
+    /// 那必须由 <see cref="SatisfiesRange"/> 在整个候选项（比较器集合）上统一裁决
+    /// （规则是"集合里至少有一个比较器的基准带预发布且与候选同三元组"，单看一个
+    /// token 无从谈起）——所以本方法对预发布候选只回答数字比较的结果，不要在
+    /// 这里单独加预发布守卫。
+    /// </summary>
     internal static bool? SatisfiesSingle(string candidate, string token)
     {
         token = token.Trim();
         if (token.Length == 0) return null;
 
-        foreach (var (prefix, op) in new[] { (">=", 1), ("<=", 2), (">", 3), ("<", 4), ("=", 0) })
+        foreach (var (prefix, op) in ComparatorOps)
         {
             if (!token.StartsWith(prefix, StringComparison.Ordinal)) continue;
             var cmp = CompareVersionStrings(candidate, token[prefix.Length..].Trim());
@@ -3004,10 +3152,64 @@ internal sealed class HarnessForm : Form
     internal static bool PrereleaseAllowedInRange(string candidate, int major, int minor, int patch)
     {
         // 非预发布候选不受这条门槛限制。
-        if (!candidate.Contains('-')) return true;
+        if (VersionPrerelease(candidate) is null) return true;
         var c = ParseVersion(candidate);
         if (c is null) return true;   // 解析不了的候选维持原判定路径（不额外收紧）
         return c.Major == major && c.Minor == minor && c.Build == patch;
+    }
+
+    /// <summary>
+    /// npm 的**比较器集合级**预发布门槛（node-semver Range.test 的收尾规则）：
+    /// 候选带预发布时，一个候选项（比较器集合）只有在「集合内至少有一个比较器的基准
+    /// **带预发布**、且与候选同 [major, minor, patch] 三元组」时才放行；
+    /// 否则整项明确不满足（false，不是猜）。此前裸比较器（<c>&gt;=0.2.0</c>）对预发布
+    /// 候选只做数字比较，<c>0.3.0-rc.1</c> 被判满足 <c>&gt;=0.2.0</c>——而 npm 语义下
+    /// 这个集合不接受任何预发布（peer 不满足、装不上），护栏恰在漏报警方向出错。
+    /// <paramref name="comparators"/> 是该候选项里全部"比较器形态 token"（含裸精确
+    /// 版本）的基准三元组与预发布标记；caret/tilde 不参与：它们对预发布候选的门槛
+    /// 已在自己分支内实施（<see cref="PrereleaseAllowedInRange"/>），基准带预发布时的
+    /// 既定取舍是"返回 null"，轮不到这道门槛说话。
+    /// 纯函数、可单测——这条规则和 <see cref="PrereleaseAllowedInRange"/> 一样，
+    /// 曾在漏报警方向出过错。
+    /// </summary>
+    internal static bool PrereleaseAdmittedByComparatorSet(
+        string candidate,
+        IReadOnlyList<(int Major, int Minor, int Build, bool HasPrerelease)> comparators)
+    {
+        if (VersionPrerelease(candidate) is null) return true;   // 非预发布候选不受此门槛限制
+        var c = ParseVersion(candidate);
+        if (c is null) return true;                              // 解析不了的候选维持原判定路径
+        foreach (var (major, minor, build, hasPrerelease) in comparators)
+            if (hasPrerelease && major == c.Major && minor == c.Minor && build == c.Build) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 收集一个 token 若为"比较器形态"（运算符比较器或裸精确版本）时其基准的三元组
+    /// 与预发布标记，供 <see cref="PrereleaseAdmittedByComparatorSet"/> 在候选项层面
+    /// 统一裁决。运算符前缀与 <see cref="SatisfiesSingle"/> 共用 <see cref="ComparatorOps"/>；
+    /// 裸 token（无运算符、非 caret/tilde）在 SatisfiesSingle 里按精确比较器处理，
+    /// 同样参与集合——否则 "0.1.5-rc.1" 精确匹配会因集合里没有可对认的比较器被误拒。
+    /// caret/tilde 与解析不了的 token 不收集（理由见 PrereleaseAdmittedByComparatorSet）。
+    /// </summary>
+    private static void NoteComparatorBasis(
+        string token, List<(int Major, int Minor, int Build, bool HasPrerelease)> comparators)
+    {
+        token = token.Trim();
+        var basis = token;
+        var isComparator = false;
+        foreach (var (prefix, _) in ComparatorOps)
+        {
+            if (!token.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            basis = token[prefix.Length..].Trim();
+            isComparator = true;
+            break;
+        }
+        if (!isComparator && !token.StartsWith('^') && !token.StartsWith('~')) isComparator = true;
+        if (!isComparator) return;
+        if (ParseVersion(basis) is not { } basisVersion) return;   // 解析不了的基准不参与门槛
+        comparators.Add((basisVersion.Major, basisVersion.Minor, basisVersion.Build,
+            VersionPrerelease(basis) is not null));
     }
 
     /// <summary>
@@ -3125,6 +3327,8 @@ internal sealed class HarnessForm : Form
     private static async Task<string?> GetLatestEngineVersionAsync(string node, CancellationToken ct)
     {
         Process? proc = null;
+        Task<string>? outTask = null;
+        Task<string>? errTask = null;
         try
         {
             var npm = ResolveNpmPath(node);
@@ -3165,23 +3369,39 @@ internal sealed class HarnessForm : Form
             // ① stderr 必须读掉——npm 往里写多了管道写满，子进程自己会卡死；
             // ② 不给 ReadToEndAsync 传 token——取消后剩余数据没人读；
             // ③ 超时/取消必须 Kill 整棵树——只 Dispose 会留下后台挂着的孤儿 npm。
-            var outTask = proc.StandardOutput.ReadToEndAsync();
-            var errTask = proc.StandardError.ReadToEndAsync();
+            outTask = proc.StandardOutput.ReadToEndAsync();
+            errTask = proc.StandardError.ReadToEndAsync();
             try { await proc.WaitForExitAsync(queryCts.Token); }
             catch (OperationCanceledException)
             {
                 try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-                try { await outTask; } catch { }
-                try { await errTask; } catch { }
+                await DrainQuietlyAsync(outTask, errTask);
                 return null;
             }
 
-            var text = (await outTask).Trim();
-            try { await errTask; } catch { }
+            // 进程退出了，管道**不一定**读完：孙进程若继承了 stdout 句柄且自己不退出，
+            // ReadToEndAsync 会一直挂着——裸 await 会让「升级」永久 busy。版本查不出来
+            // 是可接受的降级（保持当前引擎），界面卡死不是。与 GetToolVersionAsync
+            // 已确立的排干纪律同一条（那里连更简单的 node --version 都防了）。
+            var drained = await Task.WhenAny(Task.WhenAll(outTask, errTask), Task.Delay(DrainTimeoutMs));
+            if (drained is not Task<string[]> done)
+            {
+                await DrainQuietlyAsync(outTask, errTask);
+                return null;
+            }
+            string text;
+            try { text = (done.Result[0] + done.Result[1]).Trim(); }
+            catch { return null; }
             if (text.Length == 0) return null;
             return text.Split('\n').Last().Trim();
         }
-        catch { return null; }
+        catch
+        {
+            // 其余异常（启动失败等）：同样可能留下孤儿进程与挂着的读取任务。
+            try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            await DrainQuietlyAsync(outTask, errTask);
+            return null;
+        }
         finally { try { proc?.Dispose(); } catch { } }
     }
 
@@ -3253,7 +3473,10 @@ internal sealed class HarnessForm : Form
                 lines.AppendLine();
                 lines.AppendLine("选择「否」保持当前引擎不变（插件的现有状态完全不受影响）。");
 
-                var go = MessageBox.Show(lines.ToString(), "升级可能影响插件",
+                // 弹窗挂到主窗体上（与"引擎已锁定"、ShowError 同一条纪律）：这个弹窗
+                // 出现在最长可达 60 秒的 npm 查询之后，恰是最容易"用户已切走窗口"的
+                // 时点——无属主的框可能被压到别的窗口后面，表现为"点了没反应"。
+                var go = MessageBox.Show(this, lines.ToString(), "升级可能影响插件",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
                 if (go != DialogResult.Yes)
                 {
@@ -4115,7 +4338,18 @@ internal sealed class HarnessForm : Form
             client = new TcpClient();
             var connect = client.ConnectAsync(host, port);
             // 用 WaitAny 而不是 task.Wait(timeout)：超时后能被取消，也不吞掉 AggregateException。
-            if (Task.WaitAny(new Task[] { connect }, timeoutMs) != 0) return false;
+            if (Task.WaitAny(new Task[] { connect }, timeoutMs) != 0)
+            {
+                // 超时分支：连接任务还在后台跑，finally 的 Dispose 之后它会带着
+                // ObjectDisposedException（或 refused 的 SocketException）完成——
+                // 不观察就是未观察异常退场，与本文件"永不带未观察异常退场"的
+                // 纪律（GetToolVersionAsync/DrainQuietlyAsync）不一致。
+                _ = connect.ContinueWith(static t => { _ = t.Exception; },
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                return false;
+            }
             return client.Connected;
         }
         catch { return false; }

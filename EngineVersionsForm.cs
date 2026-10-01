@@ -40,6 +40,13 @@ internal sealed class EngineVersionsForm : Form
     private bool busy;
     /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"——这两件事完全不同。</summary>
     private bool closing;
+    /// <summary>
+    /// 布局自检（Program.RunLayoutSelfTest）的静默关闭开关。编程式 Close() 的
+    /// CloseReason 是 UserClosing（WinForms 文档原文："either programmatically
+    /// or through a user action"），busy 没复位时会命中 ConfirmClose 的确认框——
+    /// 自检进程没有人应答，就挂死在那里。自检关闭必须绕过询问。
+    /// </summary>
+    internal bool QuietClose;
 
     internal EngineVersionsForm(
         Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions,
@@ -162,6 +169,7 @@ internal sealed class EngineVersionsForm : Form
         // e.Cancel = true 就是 Windows 意义上的"此应用阻止关机"，用户只能强杀，
         // 连日志都留不下。那种场景下"操作会不会跑完"根本不是用户需要做决定的事。
         if (e.CloseReason != CloseReason.UserClosing) { closing = true; return; }
+        if (QuietClose) { closing = true; return; }   // 布局自检：编程式关闭不询问（见字段注释）
         if (busy)
         {
             var go = MessageBox.Show(this,
@@ -386,8 +394,10 @@ internal sealed class EngineVersionsForm : Form
     /// 当场崩掉。而这两个处理器在 await 之后要摸控件、弹 MessageBox，关窗竞态随时
     /// 可能插进来（ObjectDisposedException / InvalidOperationException）。
     /// 顶部注释反复强调"绝不能崩"，那就必须有一层兜底，而不是指望每处判据都写对。
+    /// 刻意是**实例**方法：兜底弹窗要挂 owner（this），否则可能被主窗体的模态对话框
+    /// 压在后面，表现为"点了没反应"。
     /// </summary>
-    private static async Task GuardedAsync(Func<Task> body)
+    private async Task GuardedAsync(Func<Task> body)
     {
         try { await body(); }
         catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
@@ -396,7 +406,7 @@ internal sealed class EngineVersionsForm : Form
         }
         catch (Exception ex)
         {
-            try { MessageBox.Show(ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            try { MessageBox.Show(this, ex.Message, "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             catch { }
         }
     }
@@ -408,7 +418,11 @@ internal sealed class EngineVersionsForm : Form
         var sel = Selected;
         if (sel is null || sel.IsActive || busy) return;
 
-        var confirm = MessageBox.Show(
+        // 确认框一律挂 owner（this）：owned 框会禁用属主窗体，确认期间没法再
+        // 双击列表叠出第二个操作（两个 activateVersion 先后进 migrateGate 会让
+        // 引擎被连停两次、活动版本随确认顺序来回翻转）；无属主的框也不参与
+        // ShowDialog(this) 的模态 z 序，可能被压在对话框后面。
+        var confirm = MessageBox.Show(this,
             $"把活动引擎切换到 {sel.Version}？\n\n" +
             "若引擎正在运行会先停止它（含整个进程树），然后交换目录。\n" +
             "完成后请回主界面点「启动」以新版本启动。当前版本不会被删除，随时可以切回来。",
@@ -432,7 +446,7 @@ internal sealed class EngineVersionsForm : Form
         if (error is not null)
         {
             hint.Text = "切换失败：" + error;
-            MessageBox.Show(error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
             // 失败也必须回到磁盘真相：目录交换走到一半才失败的情况（新的顶上失败、
             // 旧的搬回也失败）会让列表里显示的"使用中"版本与磁盘实际状态不一致，
             // 而界面上没有任何提示。SetBusy 恢复了「刷新」，但数据没人去重读。
@@ -441,7 +455,7 @@ internal sealed class EngineVersionsForm : Form
         }
         await ReloadAsync();
         if (Gone) return;
-        MessageBox.Show(
+        MessageBox.Show(this,
             $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
             "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
@@ -453,7 +467,7 @@ internal sealed class EngineVersionsForm : Form
         var sel = Selected;
         if (sel is null || sel.IsActive || busy) return;
 
-        var confirm = MessageBox.Show(
+        var confirm = MessageBox.Show(this,
             $"删除引擎版本 {sel.Version}？\n\n" +
             $"目录：{sel.Path}\n" +
             (sel.SizeBytes > 0 ? $"大小：约 {sel.SizeBytes / 1024.0 / 1024.0:N0} MB\n" : string.Empty) +
@@ -476,7 +490,7 @@ internal sealed class EngineVersionsForm : Form
         if (error is not null)
         {
             hint.Text = "删除失败：" + error;
-            MessageBox.Show(error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
             await ReloadAsync();
             return;
         }

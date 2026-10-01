@@ -85,6 +85,22 @@ internal static class ConfigBackup
     {
         try
         {
+            // GetFolderPath 失败时文档化返回**空串**，Path.Combine 出来的是相对路径
+            // （".dsh"、"DeepSeekHarness\config-backups"）——后续所有读写会按**当前
+            // 工作目录**解析：快照写进不明位置，Restore 把文件恢复进不明位置还报
+            // "成功"。这类机器上宁可不做、留痕（FoldersForm.Collect 对同一形状有
+            // 同款护栏："宁可少列几项"）。
+            if (!Path.IsPathFullyQualified(DshHome))
+            {
+                HarnessForm.AppendStartupLog("USERPROFILE 解析为空，跳过配置快照（避免按相对路径读写 .dsh）");
+                return null;
+            }
+            if (!Path.IsPathFullyQualified(BackupRoot))
+            {
+                HarnessForm.AppendStartupLog("LOCALAPPDATA 解析为空，跳过配置快照（避免按相对路径写 config-backups）");
+                return null;
+            }
+
             var files = ConfigFiles().Where(f => File.Exists(Path.Combine(DshHome, f))).ToList();
             if (files.Count == 0) return null;
 
@@ -250,7 +266,14 @@ internal static class ConfigBackup
                 .ToList();
             foreach (var old in dirs.Skip(KeepSnapshots))
             {
-                try { old.Delete(recursive: true); } catch { }
+                try { old.Delete(recursive: true); }
+                catch (Exception ex)
+                {
+                    // 内层也要留痕：删除失败（被资源管理器/备份工具占着、权限被撤）意味着
+                    // 含明文凭据的快照会无信号地累积——README「低频路径异常统一日志」的
+                    // 纪律不能只落到外层。Swallow 的每小时节流天然防刷屏。
+                    Swallow.Quiet(ex, "prune-snapshot");
+                }
             }
         }
         catch (Exception ex) { Swallow.Quiet(ex, "prune-snapshots"); }
@@ -297,6 +320,9 @@ internal static class ConfigBackup
         // 注意：这里必须比 Path.DirectorySeparatorChar，不能用 char.IsSeparator——
         // 后者判的是 Unicode「分隔符」类别（空格类），对 '\' 返回 false，
         // 会让这道守卫把**所有**路径都判成越界（恢复动作全量跳过，且不报错）。
+        // 已知边界：候选恰为 "root + 一个尾分隔符"（"…\.dsh\"）时会在这一步被判成
+        // 界内——它语义上就是 root 本身，Restore 只传 GetFiles 的**文件**路径
+        // （相对段恒非空），该形状实际不可达，不值得为它收紧判定。
         var next = candidate[root.Length];
         return next == Path.DirectorySeparatorChar || next == Path.AltDirectorySeparatorChar;
     }
@@ -340,6 +366,14 @@ internal static class ConfigBackup
             if (!Directory.Exists(snapshotDir))
             {
                 failed.Add("快照目录不存在：" + snapshotDir);
+                return new RestoreResult(0, failed);
+            }
+            // USERPROFILE 解析为空时 DshHome 是相对路径 ".dsh"——GetFullPath 会把它
+            // 落到当前工作目录，恢复"成功"却写错了位置、界面还报成功数。必须在这里
+            // 挡住，并把原因如实报给用户（与 CreateSnapshot 的同形状护栏成对）。
+            if (!Path.IsPathFullyQualified(DshHome))
+            {
+                failed.Add("USERPROFILE 解析为空，无法定位 .dsh；未做任何改动。");
                 return new RestoreResult(0, failed);
             }
             var root = Path.GetFullPath(DshHome);
