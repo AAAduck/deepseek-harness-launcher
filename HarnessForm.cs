@@ -925,6 +925,11 @@ internal sealed class HarnessForm : Form
         // 查杀整体放后台线程：WMI 全量查询实测约 140 ms，加上逐个 Kill，
         // 同步跑会把 UI 线程冻住半秒——方法名带 Async 就不该在调用线程上干这些。
         await Task.Run(StopHarnessProcessesCore);
+        // dshProcess 的 Dispose/置 null 收回到 UI 续延上做（Core 里曾经顺手做了，
+        // 但那是后台线程写 UI 所属字段）。杀干净后句柄上的进程必然已退出，
+        // Dispose 只是释放内核句柄、无副作用，放这里与原先语义一致。
+        try { dshProcess?.Dispose(); } catch { }
+        dshProcess = null;
         // 引擎进程没了，上一份认证链接就是过期 token。不在这里清空的话，
         // 「重启」/「升级后重启」的等待循环会在下一个引擎还没输出任何日志时
         // 因 authenticatedUrl != null 立刻"成功返回"，浏览器先弹出过期 token 的失败页。
@@ -940,9 +945,12 @@ internal sealed class HarnessForm : Form
     {
         var records = GetProcessRecords();
         var seeds = records.Values.Where(IsHarnessCommand).Select(x => x.Id).ToHashSet();
-        if (dshProcess is not null && !ProcessHasExited(dshProcess))
+        // 只读 dshProcess（取 Id 做 seed），不在此线程 Dispose/置 null——那是 UI 字段，
+        // 清理在 StopHarnessProcessesAsync 的 await 之后回 UI 续延做。
+        var current = dshProcess;
+        if (current is not null && !ProcessHasExited(current))
         {
-            try { seeds.Add(dshProcess.Id); } catch { }
+            try { seeds.Add(current.Id); } catch { }
         }
         var all = new HashSet<int>(seeds);
         var queue = new Queue<int>(seeds);
@@ -956,19 +964,22 @@ internal sealed class HarnessForm : Form
         foreach (var id in all.OrderByDescending(x => x))
         {
             // Process 对象持有内核句柄，用完即收、不等 GC（与 Program.ActivateExistingWindow 同一纪律）。
-            // PID 复用防护：GetProcessById 之后比对 StartTime，PID 被系统复用时 StartTime 必然不同。
-            // 此时跳过不杀——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
+            // PID 复用防护：GetProcessById 之后带容差比对 StartTime（见 IsSameProcessStart——
+            // 严格相等在 WMI 的微秒精度下连"同一个进程"都判不等，实测单进程命中率仅约 1/5，
+            // 曾经让「停止」大概率空转且不报错）。PID 被复用时创建时间必然相差秒级以上，
+            // 容差比对照样跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
             if (!records.TryGetValue(id, out var expected)) continue;
             try
             {
                 using var victim = Process.GetProcessById(id);
-                if (victim.StartTime != expected.StartTime) continue;
+                if (!IsSameProcessStart(victim.StartTime, expected.StartTime)) continue;
                 victim.Kill(entireProcessTree: true);
             }
             catch { }
         }
-        try { dshProcess?.Dispose(); } catch { }
-        dshProcess = null;
+        // dshProcess 是 UI 线程字段（其余读写全在 UI 续延上）：本方法跑在 Task.Run 的
+        // 后台线程里，Dispose 与置 null 都收回 StopHarnessProcessesAsync 的 await 之后，
+        // 避免后台线程写 UI 所属状态的跨线程写。
     }
 
     /// <summary>
@@ -993,11 +1004,11 @@ internal sealed class HarnessForm : Form
         {
             foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
             {
-                // PID 复用防护：同 StopHarnessProcessesCore，StartTime 不同即跳过。
+                // PID 复用防护：同 StopHarnessProcessesCore，带容差比对（见 IsSameProcessStart）。
                 try
                 {
                     using var victim = Process.GetProcessById(record.Id);
-                    if (victim.StartTime != record.StartTime) continue;
+                    if (!IsSameProcessStart(victim.StartTime, record.StartTime)) continue;
                     victim.Kill(entireProcessTree: true);
                 }
                 catch { }
@@ -1006,6 +1017,25 @@ internal sealed class HarnessForm : Form
         catch { }
         InvalidateProcessRecordCache();
     }
+
+    /// <summary>
+    /// 两个"进程创建时间"读数是否指向同一个进程的启动。纯函数、可单测——
+    /// 它守着两条杀进程路径（「停止」与关窗清扫），判错了不会报错。
+    ///
+    /// 为什么必须带容差而不是严格相等：两个读数的精度不同——
+    /// WMI 的 Win32_Process.CreationDate 是 DMTF 微秒精度（6 位小数），
+    /// 而 Process.StartTime 是 100ns 精度（FILETIME 原值）。同一个进程的
+    /// 两个读数因此恒差 0–0.9 µs（实测本机 21 个进程样本里仅 3 个严格相等，
+    /// 新起 5 个 cmd.exe 仅 1 个命中；差值全落在 0.1–0.9 µs、方向恒为
+    /// StartTime ≥ WMI）。严格相等会把"同一个进程"判成"PID 被复用了"，
+    /// 于是杀进程循环对真正的目标也跳过——「停止」大概率空转且不报错。
+    ///
+    /// 容差选 1ms：比最大读数差（0.9 µs）大三个数量级，足以吸收任何精度损失；
+    /// 而 PID 复用后新进程的创建时间必然与旧读数相差秒级以上（复用前提是旧句柄
+    /// 全部关闭、旧进程已完全退出），1ms 与之相比可忽略——防护语义不变。
+    /// </summary>
+    internal static bool IsSameProcessStart(DateTime a, DateTime b) =>
+        Math.Abs((a - b).Ticks) <= TimeSpan.TicksPerMillisecond;
 
     /// <summary>
     /// 只认「命令行里带本启动器引擎目录」的进程，用于退出清扫。
@@ -1236,17 +1266,14 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>
-    /// 端口是否已被监听。此前用 GetActiveTcpListeners()：它在启动等待循环里每 250 ms
-    /// 被调用一次，每次都分配并枚举整张 TCP 表（本机实测 22 ms / 29 个端点，
+    /// 端口是否已被监听（异步版）。此前用 GetActiveTcpListeners()：它在启动等待循环里
+    /// 每 250 ms 被调用一次，每次都分配并枚举整张 TCP 表（本机实测 22 ms / 29 个端点，
     /// 进程一多就更贵）。改成对回环地址做一次定向连接探测，成本低一个数量级。
     /// 副作用与旧实现一致：只关心确有进程在该端口 accept。
-    /// </summary>
-    private static bool IsPortListening(int port) => IsTcpOpen("127.0.0.1", port, 200);
-
-    /// <summary>
-    /// <see cref="IsPortListening"/> 的异步版。**轮询路径必须用这个**：
-    /// 同步版内部 Task.WaitAny 最多阻塞 200 ms，而启动等待循环每 250 ms 调一次
-    /// （回环端口被防火墙 DROP 的机器上每次都等满），等于把 UI 线程卡掉近一半时间。
+    ///
+    /// 只保留异步版：同步版（Task.WaitAny 阻塞 200ms）没有调用点后删掉了——
+    /// 轮询路径每 250 ms 调一次，同步版会把 UI 线程卡掉近一半时间
+    /// （回环端口被防火墙 DROP 的机器上每次都等满）。
     /// </summary>
     private static Task<bool> IsPortListeningAsync(int port, CancellationToken ct = default)
         => IsTcpOpenAsync("127.0.0.1", port, 200, ct);
@@ -1694,6 +1721,10 @@ internal sealed class HarnessForm : Form
         startButton.AccessibleName = isOn
             ? "停止引擎并释放端口"
             : "启动 Harness 引擎并打开控制台。回车键等效";
+        // 悬停提示同随状态刷新：按钮文字在"启动/停止"间切换，鼠标用户没有提示
+        // 就只能靠颜色与文字猜。tooltip 之类是低频写入，每 1.5 秒刷新一次可忽略。
+        try { tooltip.SetToolTip(startButton, isOn ? "停止引擎并释放端口（Esc 等效）" : "启动 Harness 引擎并打开控制台（回车等效）"); }
+        catch { }
     }
 
     /// <summary>
@@ -1857,13 +1888,17 @@ internal sealed class HarnessForm : Form
         !version.Contains("..", StringComparison.Ordinal) &&
         version.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
 
-    /// <summary>目录占用，MB 粒度。用 EnumerateFiles 避免一次性把所有 FileInfo 建出来。</summary>
+    /// <summary>目录占用，MB 粒度。用 EnumerateFiles 避免一次性把所有 FileInfo 建出来。
+    /// 与 ForceDeleteDirectory 同一个理由走 \\?\ 扩展前缀：LongPathsEnabled 默认关闭的
+    /// 机器上，引擎 node_modules 的深路径同样会超过 MAX_PATH，不加前缀时枚举抛异常
+    /// 被吞掉，版本列表的大小列就静默显示"—"。这里的路径来自我们自己的目录规划
+    /// （绝对路径），前缀化是安全的。</summary>
     private static long DirectorySizeBytes(string dir)
     {
         try
         {
             long total = 0;
-            foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            foreach (var file in Directory.EnumerateFiles(ToExtendedPath(dir), "*", SearchOption.AllDirectories))
             {
                 try { total += new FileInfo(file).Length; } catch { }
             }
@@ -2427,6 +2462,12 @@ internal sealed class HarnessForm : Form
             var v = ParseVersion(basis);
             var c = ParseVersion(candidate);
             if (v is null || c is null) return null;
+            // npm 语义：caret/tilde 这类**范围**只接受与基准同 major.minor.patch 的预发布
+            // 候选（如 ^4.0.1 只放行 4.0.1-xxx）。此前不实施这条，0.1.5-rc.9 会被判满足
+            // ^0.1.0——护栏在漏报警的方向上出错（本工具最不能犯的那个方向）。
+            // 语义修正后这里是**明确的 false**（npm 对"预发布不进范围"的定义），
+            // 与"拿不准返回 null"的取舍并不冲突：这条不是拿不准，是规则本身。
+            if (!PrereleaseAllowedInRange(candidate, v.Major, v.Minor, v.Build)) return false;
             var majorMatters = v.Major > 0;
             var minorMatters = !majorMatters && v.Minor > 0;
             if (majorMatters) return c.Major == v.Major;
@@ -2446,6 +2487,8 @@ internal sealed class HarnessForm : Form
             var v = ParseVersion(basis);
             var c = ParseVersion(candidate);
             if (v is null || c is null) return null;
+            // 同 caret：预发布候选必须与基准同 major.minor.patch 才进得了范围（npm 规则）。
+            if (!PrereleaseAllowedInRange(candidate, v.Major, v.Minor, v.Build)) return false;
             return c.Major == v.Major && c.Minor == v.Minor;
         }
 
@@ -2454,6 +2497,22 @@ internal sealed class HarnessForm : Form
         // 引擎 0.9.0 会被误判成"满足"——护栏恰好在危险方向上漏报。
         var bare = CompareVersionStrings(candidate, token);
         return bare is null ? null : bare == 0;
+    }
+
+    /// <summary>
+    /// 预发布候选是否进得了以 (major, minor, patch) 为基准的范围 token。
+    /// npm 规则：预发布候选只在"与某个比较对象共享同一 [major, minor, patch] 三元组"
+    /// 时才被 caret/tilde 这类范围接受。返回 false = npm 语义下明确不满足（不是猜）。
+    /// 非预发布候选与解析不了的候选不受此门槛限制，维持原有判定路径。
+    /// internal（而非 private）：边界要被单测钉住——这条规则曾在漏报警方向出过错。
+    /// </summary>
+    internal static bool PrereleaseAllowedInRange(string candidate, int major, int minor, int patch)
+    {
+        // 非预发布候选不受这条门槛限制。
+        if (!candidate.Contains('-')) return true;
+        var c = ParseVersion(candidate);
+        if (c is null) return true;   // 解析不了的候选维持原判定路径（不额外收紧）
+        return c.Major == major && c.Minor == minor && c.Build == patch;
     }
 
     /// <summary>
@@ -3053,6 +3112,10 @@ internal sealed class HarnessForm : Form
         var result = string.Join("\n", kept);
         if (result.Length > 0) return result;
 
+        // 兜底分支：单行就超过保留预算（KeepBytes 按字节、这里按字符索引切）。
+        // 换算到字符数避免把多字节汉字劈成乱码是不可能的——字符串已解码；
+        // 这里只能按"字符预算 ≈ 字节预算 / UTF-8 最大 3 字节"取尾部，再从完整
+        // 换行符之后切起（切点在已解码的字符串上，绝不会写出半个 UTF-8 序列）。
         var tail = text[^Math.Min(text.Length, KeepBytes / 3)..];
         return tail[(tail.IndexOf('\n') + 1)..];
     }
@@ -3469,6 +3532,7 @@ internal sealed class HarnessForm : Form
 
         // 悬停提示（读屏走 AccessibleName，普通用户走 tooltip）。之前 ToolTip
         // 实例化后从没 SetToolTip 过任何控件，纯占资源——现在真的用起来。
+        // 主按钮的提示在 ApplyPrimaryActionLabel 里随状态刷新（那里才读 isOn）。
         tooltip.SetToolTip(restartButton, "结束当前引擎并重新启动（会先清理残留进程与端口）");
         tooltip.SetToolTip(refreshButton, "重新检测引擎状态");
         tooltip.SetToolTip(envButton, "检测 Node、npm、pnpm、引擎、插件兼容性与端口");

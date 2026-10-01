@@ -14,7 +14,7 @@ rem   ② 新实例起来后探到 web-url.txt 的链接仍可用，直接复用
 rem      全程无感（实测：模拟启动器强杀后引擎持续存活写日志）；
 rem   ③ 例外：从管道耦合的旧版跨进 1.3.0 的【首次】更新，旧引擎仍会随断管退出，
 rem      新实例自动走完整重启（十几秒，会话历史在盘上不丢）。这一次之后皆无感。
-echo 即将把启动器更新到 1.3.0（无感更新：引擎 stdio 文件化，不再随启动器陪葬）。
+echo 即将把启动器更新到 1.4.0（PID 复用校验容差修复 + SHA256 校验真正生效）。
 echo Web 会话不会中断（首次从旧版迁移除外，那会重启一次引擎、历史不丢）。
 echo.
 
@@ -30,23 +30,48 @@ if not exist "%STAGED%" (
 rem ── SHA256 完整性校验（防 staging 目录被写坏或替换）──────────────────────
 rem 发布时把 exe 和它的 .sha256 文件一起放进 update-staging\。
 rem 没有 .sha256 文件时跳过校验（兼容旧流程），有则必须比对通过才继续。
+rem
+rem ⚠ 1.4.0 修复（务必别退回旧写法）：旧版把比较写在 if (...) 括号块里且用
+rem %VAR% 引用——cmd 对整个括号块做**一次性解析**，块内 %VAR% 在任何一行
+rem 执行前就展开成空串，于是实际比较的是 ""==""，校验**永远通过**
+rem （实测：期望哈希故意写错仍打印"✓ 校验通过"）。必须用 setlocal
+rem enabledelayedexpansion + !VAR! 延迟展开。
+rem 摘要提取也一并修了：不再 findstr /v "hash"（中文系统的 certutil 表头是
+rem "SHA256 的 C:\… 哈希:"，不含小写 "hash"，过滤靠不住），改为只认
+rem 纯十六进制行——天然免疫中英文表头差异。
+setlocal enabledelayedexpansion
 set "SHA256FILE=%STAGED%.sha256"
 if exist "%SHA256FILE%" (
-  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 ^| findstr /v "hash"') do set "COMPUTED=%%a"
-  rem 去掉空格（certutil 输出有空格分隔符）
-  set "COMPUTED=%COMPUTED: =%"
+  set "COMPUTED="
+  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 2^>nul ^| findstr /r /i "^[0-9a-f][0-9a-f]*$"') do set "COMPUTED=%%a"
+  set "COMPUTED=!COMPUTED: =!"
   set /p EXPECTED=<"%SHA256FILE%"
-  if /i not "%COMPUTED%"=="%EXPECTED%" (
+  if not defined COMPUTED (
+    echo.
+    echo ✗ 无法计算 staging 文件的 SHA256（certutil 失败）。
+    echo   请确认文件完整后重试，或删掉 .sha256 文件跳过校验。
+    pause
+    exit /b 1
+  )
+  if not defined EXPECTED (
+    echo.
+    echo ✗ .sha256 文件是空的，无法校验。
+    echo   请重新生成或删掉 .sha256 文件跳过校验。
+    pause
+    exit /b 1
+  )
+  if /i not "!COMPUTED!"=="!EXPECTED!" (
     echo.
     echo ✗ SHA256 校验失败，staging 文件可能已损坏或被替换。
-    echo   期望：%EXPECTED%
-    echo   实际：%COMPUTED%
+    echo   期望：!EXPECTED!
+    echo   实际：!COMPUTED!
     echo   请重新放入正确的 DeepSeekHarness.exe 和 .sha256 文件。
     pause
     exit /b 1
   )
   echo ✓ SHA256 校验通过
 )
+endlocal & rem 延迟展开只用于校验块；后续按普通展开继续（保持脚本其余部分原样）
 
 echo 按任意键开始更新（浏览器里的会话不用关）...
 pause >nul

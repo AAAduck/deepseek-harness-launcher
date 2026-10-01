@@ -21,15 +21,34 @@ internal static class DpapiFile
 
     /// <summary>
     /// 写入：先 DPAPI 加密，再 Base64 编码落盘。
+    /// 两级降级，均与注释承诺的"明文也比不写强"对齐：
+    ///   ① DPAPI 不可用（企业策略禁用等）→ 写明文。暴露面回到旧版，好过
+    ///      "链接无法持久化"——那会让引擎复用功能静默失效（读取方拿 null）。
+    ///   ② 加密成功但加密格式写不进（路径暂时不可写）→ 再试一次明文。
+    ///   ③ 明文也写不进（磁盘满/权限被撤）→ 才什么都不留；此时读取方本来
+    ///      也会拿到 null，行为与旧版"写不进"一致，不算新增损失。
     /// </summary>
     internal static void WriteAllText(string path, string plainText)
     {
         var plainBytes = Utf8NoBom.GetBytes(plainText);
-        var encrypted = ProtectedData.Protect(plainBytes, null, DataProtectionScope.CurrentUser);
-        var encoded = Magic + Convert.ToBase64String(encrypted);
-        // 写文件失败时静默降级：明文也比不写强（认证链接对用户可见，只是暴露面回到旧版）
+        string encoded;
+        try
+        {
+            var encrypted = ProtectedData.Protect(plainBytes, null, DataProtectionScope.CurrentUser);
+            encoded = Magic + Convert.ToBase64String(encrypted);
+        }
+        catch
+        {
+            // ① DPAPI 不可用：降级明文，别让加密功能连累链接持久化。
+            try { File.WriteAllText(path, plainText, Utf8NoBom); } catch { }
+            return;
+        }
         try { File.WriteAllText(path, encoded, Utf8NoBom); }
-        catch { }
+        catch
+        {
+            // ② 加密格式写不进：降级明文再试一次。
+            try { File.WriteAllText(path, plainText, Utf8NoBom); } catch { }
+        }
     }
 
     /// <summary>

@@ -35,7 +35,7 @@
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
 
     <!-- exe 属性（右键→属性 里能看到），分发给同学时便于确认版本 -->
-    <Version>1.3.0</Version>
+    <Version>1.4.0</Version>
     <AssemblyTitle>DeepSeek Harness 控制台</AssemblyTitle>
     <Product>DeepSeek Harness Launcher</Product>
     <Company>DeepSeek Harness Launcher</Company>

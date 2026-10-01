@@ -63,6 +63,25 @@ public class SemverRangeTests
     }
 
     [Theory]
+    // —— npm 的预发布门槛：caret/tilde 范围只放行与基准同 major.minor.patch 的
+    //    预发布候选。此前不实施这条，0.1.5-rc.9 被判满足 ^0.1.0——护栏在
+    //    漏报警的方向出错（本工具最不能犯的那个方向）。——
+    [InlineData("0.1.5-rc.9", "^0.1.0", false)]     // 修复的主用例：npm 判 false（数字段更高但三元组不同）
+    [InlineData("0.1.0-rc.1", "^0.1.0", false)]     // 同上：三元组不同（patch 位不同）
+    [InlineData("0.2.0-rc.1", "^0.1.0", false)]      // minor 也不同
+    [InlineData("1.5.0-beta", "^1.0.0", false)]
+    [InlineData("4.2.0-rc.1", "^4.0.1", false)]      // 审查报告点名的例子
+    // 数字段低于基准的预发布候选走不进门槛——被 >= 基准先挡下（独立路径，顺带钉住）：
+    [InlineData("0.1.5-rc.1", "~0.1.5", false)]     // rc.1 < 0.1.5 基准
+    [InlineData("0.1.5-rc.9", "~0.1.5", false)]     // 同上：预发布恒小于同数字段正式版
+    [InlineData("0.1.5-rc.9", "~0.1.9", false)]     // 数字段更低
+    [InlineData("0.1.4", "^0.1.5", false)]           // 非预发布候选不受门槛影响（回归保护）
+    public void 预发布候选必须与范围基准同三元组(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
     [InlineData("0.1.5", ">=0.2.0 || 0.1.5", true)]   // 第二个候选项满足 → 整条满足
     [InlineData("0.1.5", ">=0.2.0 || 0.3.0", false)]  // 全部候选项明确不满足
     [InlineData("0.1.5", ">=0.2.0 || *", null)]        // 有一个候选项判不出来 → 整体不猜
