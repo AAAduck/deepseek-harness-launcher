@@ -14,7 +14,7 @@ rem   ② 新实例起来后探到 web-url.txt 的链接仍可用，直接复用
 rem      全程无感（实测：模拟启动器强杀后引擎持续存活写日志）；
 rem   ③ 例外：从管道耦合的旧版跨进 1.3.0 的【首次】更新，旧引擎仍会随断管退出，
 rem      新实例自动走完整重启（十几秒，会话历史在盘上不丢）。这一次之后皆无感。
-echo 即将把启动器更新到 1.4.0（PID 复用校验容差修复 + SHA256 校验真正生效）。
+echo 即将把启动器更新到 1.4.1（重启不再回放旧会话日志里的死链接；SHA256 校验兼容空格分隔的老式 certutil）。
 echo Web 会话不会中断（首次从旧版迁移除外，那会重启一次引擎、历史不丢）。
 echo.
 
@@ -38,12 +38,16 @@ rem （实测：期望哈希故意写错仍打印"✓ 校验通过"）。必须�
 rem enabledelayedexpansion + !VAR! 延迟展开。
 rem 摘要提取也一并修了：不再 findstr /v "hash"（中文系统的 certutil 表头是
 rem "SHA256 的 C:\… 哈希:"，不含小写 "hash"，过滤靠不住），改为只认
-rem 纯十六进制行——天然免疫中英文表头差异。
+rem 十六进制行。⚠ 1.4.1 两处缺一不可：① 字符类补空格——老式 certutil 按空格
+rem 分隔字节对输出（"ab cd ef"），不含空格的正则会把哈希行整行滤掉、校验在
+rem 老系统上永远中止；空格由下一行 !COMPUTED: =! 去掉。② 必须加 /c:——
+rem findstr /r 会把带空格的引号串**拆成多个模式**（实测表头/提示行反而被误命中），
+rem /c: 才让整串是"一个"正则。
 setlocal enabledelayedexpansion
 set "SHA256FILE=%STAGED%.sha256"
 if exist "%SHA256FILE%" (
   set "COMPUTED="
-  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 2^>nul ^| findstr /r /i "^[0-9a-f][0-9a-f]*$"') do set "COMPUTED=%%a"
+  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
   set "COMPUTED=!COMPUTED: =!"
   set /p EXPECTED=<"%SHA256FILE%"
   if not defined COMPUTED (

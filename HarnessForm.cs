@@ -3,7 +3,6 @@ using System.Globalization;
 using System.Management;
 using System.Net;
 using System.Net.Http;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -129,10 +128,16 @@ internal sealed class HarnessForm : Form
     /// 旧游标继续自洽地读完退场——两边各持各的状态，不存在共享可变字段。
     /// 此前 pos/decoder/remainder 是三个散装字段，旧循环在 FeedEngineLogChunk
     /// 内部一边读一边写，与新启动的复位交错时，旧循环会拿被清零的 pos 续读、
-    /// 把新引擎的日志当旧文件重新分派一遍（窄竞态，代际令牌只在循环顶检查）。
+    /// 把新引擎的日志当旧文件重新分派一遍（窄竞态。整替游标封掉跨代交错；
+    /// 1.4.1 再把代际核对下沉到**逐行分发**——换代瞬间旧循环可能正卡在
+    /// 一次 Feed 中途，刚读进的整段里混着上一会话的 token 行，只在循环顶
+    /// 核对的话整段照发不误）。
     /// </summary>
-    private volatile LogCursor engineLogCursor = new();
-    private int engineTailToken;                                // 代际标记：新引擎起跑后旧循环自行退场
+    private volatile LogCursor engineLogCursor = new(0);
+    /// <summary>代际标记：新引擎起跑后旧循环自行退场。volatile——UI 线程 `++`、
+    /// tail 后台循环每行读它做分发守卫；要的是语言规范的可见性保证，
+    /// 不是"x86 上恰好没出事"（与上面的 engineLogCursor 同一纪律）。</summary>
+    private volatile int engineTailToken;
     private string? authenticatedUrl;
     private bool isOn;
     private bool busy;
@@ -555,7 +560,9 @@ internal sealed class HarnessForm : Form
 
         // 上一次启动若在持有 profiles\node_modules.lock 期间被杀，锁会残留成孤儿，
         // 之后每次启动都会在 2 秒后抛 "timed out waiting for the writer lock" 并退出。
-        ClearOrphanProfileLock();
+        // 走后台线程：锁文件存在时这里要做一次 ~140 ms 的 WMI 全量进程查询，
+        // 留在 UI 线程上就是白屏半秒——与 StopHarnessProcessesAsync 开头同一条理由。
+        await Task.Run(ClearOrphanProfileLock);
 
         // 端口被别的程序占用时，node 只会报 EADDRINUSE 然后立刻退出，
         // 界面最终显示的是"立即退出（代码 1）"——同学完全无从判断。
@@ -572,16 +579,30 @@ internal sealed class HarnessForm : Form
 
         // 引擎 stdio 文件化：经 cmd 把 stdout/stderr 追加重定向进 engine-stdio.log。
         // 不再用管道的理由见字段区注释（启动器死亡 → 断管 → 引擎陪葬，实测 ~1 秒）。
-        // 只在这次**真的**要拉新引擎时才重开日志文件；复用路径到不了这里。
-        // 先起代际令牌 + 换新游标：旧循环随即退场（退场前仍用旧游标自洽地读完）。
+        // 复用路径到不了这里；只有真拉新引擎才截断日志并换代游标。
+        //
+        // 顺序刻意是：换令牌 → 截断 → 以**截断后的文件末尾**为起点建新游标 → 起跑。
+        // 游标不能再从 0 读：日志是 cmd `>>` 追加、历史仍在盘上（只有超过 8 MB 才截尾），
+        // 从头读等于把上一个会话整体回放一遍——旧 `?token=` 行会回填 authenticatedUrl、
+        // 弹出死链接标签页、写脏 web-url.txt，等待循环还会在**新引擎就绪之前**
+        // 因 authenticatedUrl != null 提前判成"启动成功"。此前注释与 README 说的
+        // "每次重新拉起时重开"从未被实现过（没有任何删除/清空动作），这条就是那笔债。
+        // 而截断发生在换代之际、旧循环可能正卡在一次 Feed 中间（`Length < Pos`
+        // 会把它复位到 0 拿到整段保留尾部）——所以分发处另有逐行代际守卫，两条路各堵各的。
         var tailToken = ++engineTailToken;
-        engineLogCursor = new LogCursor();
         try
         {
             Directory.CreateDirectory(LocalAppDir);
             TruncateEngineLog();   // 截断保留尾部 8 MB，避免日志无限膨胀
         }
         catch { }
+        // 取长度单独守卫：截断可能因共享冲突抛（Defender 正扫描），但那不该把起点
+        // 拖回 0——起点=0 就是这次修掉的"回放历史"本身。只读探测不会撞写锁，
+        // 它自己失败时文件多半已不存在，引擎也无从追加，0 才是正确答案。
+        long cursorStart;
+        try { cursorStart = File.Exists(engineStdioLog) ? new FileInfo(engineStdioLog).Length : 0; }
+        catch { cursorStart = 0; }
+        engineLogCursor = new LogCursor(cursorStart);
 
         var psi = new ProcessStartInfo
         {
@@ -747,6 +768,9 @@ internal sealed class HarnessForm : Form
     /// 整段自吞异常：这是个后台循环，任何一轮读失败下一轮继续即可。
     /// 游标在**入口捕获一次**：之后即使 UI 线程为新引擎换了新游标，本循环也
     /// 只读写自己捕获的这份旧游标，不存在与复位交错写共享字段的窗口。
+    /// 分发是逐行核对代际令牌的（见 <see cref="DispatchEngineLogText"/>），
+    /// 所以"正在读的那一段"也不会越代外流——被取代后哪怕手里攥着刚读到的
+    /// 上一会话 token 行，也一行都不会喂出去。
     /// </summary>
     private async Task EngineTailLoopAsync(Process process, int token)
     {
@@ -757,7 +781,7 @@ internal sealed class HarnessForm : Form
             if (token != engineTailToken) return;
             try
             {
-                FeedEngineLogChunk(cursor, buffer);
+                FeedEngineLogChunk(cursor, buffer, token);
             }
             catch { }
 
@@ -765,9 +789,10 @@ internal sealed class HarnessForm : Form
             if (ProcessHasExited(process))
             {
                 // 退出检测与文件写入之间总有先后差：最后多读几轮，把没落完的日志收干净。
+                // 收尾排空不受代际守卫影响：那时没有新引擎起跑、令牌没换过，照常喂完。
                 for (var drain = 0; drain < 4; drain++)
                 {
-                    try { if (FeedEngineLogChunk(cursor, buffer) == 0) break; } catch { break; }
+                    try { if (FeedEngineLogChunk(cursor, buffer, token) == 0) break; } catch { break; }
                     await Task.Delay(150);
                 }
                 return;
@@ -781,22 +806,29 @@ internal sealed class HarnessForm : Form
     /// <see cref="engineLogCursor"/> 的注释），旧循环持有旧对象自洽退场。
     /// 字段刻意 public：只在 tail 循环单线程访问（每代一个循环、互不共享），
     /// 无并发写面，包一层属性只增加噪音。
+    /// **没有无参构造**：起点必须显式给出。"从 0 起步"在追加式日志上等于
+    /// 回放整个历史（旧会话的 token 行照发不误）——1.4.1 起这是编译期禁止
+    /// 的形状，而不是只靠注释提醒的约定。internal（而非 private）是为了被单测钉住。
     /// </summary>
-    private sealed class LogCursor
+    internal sealed class LogCursor
     {
+        internal LogCursor(long startPos) => Pos = Math.Max(0, startPos);
+
         public long Pos;                                        // 已读到的字节偏移
         public Decoder Decoder = Encoding.UTF8.GetDecoder();
         public string Remainder = string.Empty;                 // 未完成的半行
     }
 
     /// <summary>把新增字节解码成字符并按行分发；返回本次分发的行数（供退场判断）。</summary>
-    private int FeedEngineLogChunk(LogCursor cursor, byte[] buffer)
+    private int FeedEngineLogChunk(LogCursor cursor, byte[] buffer, int token)
     {
         if (!File.Exists(engineStdioLog)) return 0;
         using var fs = new FileStream(engineStdioLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         if (fs.Length < cursor.Pos)
         {
-            // 文件被重开/清空（下次启动会删掉重建）：偏移与解码状态全部复位。
+            // 文件被截断重写（或异常缩小）：偏移与解码状态全部复位。
+            // 注意此刻代际多半已经换过——分发处有逐行守卫兜底，复位后读到的
+            // 历史内容不会被喂出去，只会被丢弃（下一次换代由新游标从末尾续读）。
             cursor.Pos = 0;
             cursor.Decoder = Encoding.UTF8.GetDecoder();
             cursor.Remainder = string.Empty;
@@ -811,12 +843,12 @@ internal sealed class HarnessForm : Form
             cursor.Pos += len;
             var chars = new char[cursor.Decoder.GetCharCount(buffer, 0, len)];
             var n = cursor.Decoder.GetChars(buffer, 0, len, chars, 0);
-            lines += DispatchEngineLogText(cursor, new string(chars, 0, n));
+            lines += DispatchEngineLogText(cursor, new string(chars, 0, n), token);
         }
         return lines;
     }
 
-    private int DispatchEngineLogText(LogCursor cursor, string text)
+    private int DispatchEngineLogText(LogCursor cursor, string text, int token)
     {
         var data = cursor.Remainder + text;
         var cut = data.LastIndexOf('\n');
@@ -830,6 +862,11 @@ internal sealed class HarnessForm : Form
         var lines = 0;
         foreach (var raw in data.Substring(0, cut + 1).Split('\n'))
         {
+            // 逐行代际守卫：本循环一旦被新引擎取代，哪怕手里正攥着一整段刚读进来的
+            // 内容也立刻停止分发。失手代价全在"不报错"那一侧：上一会话的 token 行
+            // 回填 authenticatedUrl、OpenBrowser 弹死链接、写脏 web-url.txt，
+            // 启动等待循环还会在新引擎就绪前提前返回"成功"。
+            if (token != engineTailToken) return lines;
             lines++;
             HandleProcessLine(raw.TrimEnd('\r'));
         }
@@ -949,7 +986,10 @@ internal sealed class HarnessForm : Form
             UpdateButtons();
 
             // engine.migrating 定时归档：长期只复用不重启的用户，残留会永久占着 214 MB。
-            // 每小时后台检查一次（有才动，没有零成本）。busy 时跳过，与启动路径互斥。
+            // 每小时后台检查一次（有才动，没有零成本）。busy 时跳过；但先起跑的后台轮
+            // 没跑完时用户点了「启动」，同进程两条归档仍会短暂并跑——认领靠同卷目录改名
+            // 的原子性互斥（见 MigrateEngineOldToSlot），后到的那次只会 IOException 空转
+            // 一轮，不损数据。
             if (!busy && DateTime.UtcNow - lastMigrateAttemptAt > MigrateThrottle)
             {
                 lastMigrateAttemptAt = DateTime.UtcNow;
@@ -1121,6 +1161,9 @@ internal sealed class HarnessForm : Form
     /// 全进程快照（含命令行）。WMI 带 CommandLine 的全量查询在本机实测约 140 ms，
     /// 而一次启动里 StopHarnessProcessesAsync 与 ClearOrphanProfileLock 会各要一份；
     /// 缓存 1 秒即可让两者共用同一次查询，又不至于让快照过期到影响"找出残留进程"的准确性。
+    /// 缓存字段**刻意不加锁**：并发下最坏是多跑一次 140 ms 查询、或短暂读到旧快照——
+    /// 两者都不改变决策正确性（Kill 前还有 StartTime 容差兜底），而加锁反倒会把
+    /// WMI 查询挂进另一条线程的等待路径。
     /// </summary>
     private static Dictionary<int, ProcessRecord>? processRecordCache;
     private static DateTime processRecordCacheAt = DateTime.MinValue;
@@ -1541,7 +1584,10 @@ internal sealed class HarnessForm : Form
         string? tooOldVersion = null;
         foreach (var candidate in candidates)
         {
-            if (ct.IsCancellationRequested) return candidates[0];
+            // 取消就抛 OCE，别再返回 candidates[0]——那可能是一个明知不达标的旧版，
+            // 调用点本来就各自紧跟 cancel 判定/捕获 OCE，"取消"与"解析出了一个 node"
+            // 必须是两件事。此前谎返回值只因为两个调用方恰好都不会用它。
+            if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
             var version = await GetToolVersionAsync(candidate, "--version");
             var major = ParseMajorVersion(version);
             if (major < 0) return candidate;          // 读不到版本：当作可用
@@ -3633,6 +3679,8 @@ internal sealed class HarnessForm : Form
     /// 引擎 stdio 文件化后，日志由 cmd 以追加句柄持有、引擎运行期间持续增长。
     /// 不做轮转的话，长期复用（数周不重启）会让它膨胀到 GB 级。
     /// 这里在**每次真启动**（到得了 StartHarnessAsync 的路径）时截断，保留尾部供排查。
+    /// 调用方保证截断之后才为新游标取起点（见 StartHarnessAsync 的换代顺序），
+    /// 截掉的头部连同其余历史内容都不会被回放。
     /// </summary>
     private static void TruncateEngineLog()
     {
