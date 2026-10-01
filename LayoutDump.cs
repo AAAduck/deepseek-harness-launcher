@@ -15,13 +15,9 @@ namespace DeepSeekHarness;
 internal static class LayoutDump
 {
     private static readonly object Gate = new();
-    private static int captureCount;
 
     internal static bool Enabled =>
         string.Equals(Environment.GetEnvironmentVariable("DSH_LAYOUT_DUMP"), "1", StringComparison.Ordinal);
-
-    /// <summary>已记录的次数。自检时用来判断"跑了几个尺寸、可以收工了"。</summary>
-    internal static int CaptureCount => captureCount;
 
     private static string DumpPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -61,7 +57,6 @@ internal static class LayoutDump
 
             lock (Gate)
             {
-                captureCount++;
                 Directory.CreateDirectory(Path.GetDirectoryName(DumpPath)!);
                 File.AppendAllText(DumpPath, sb.ToString(), new UTF8Encoding(false));
             }
