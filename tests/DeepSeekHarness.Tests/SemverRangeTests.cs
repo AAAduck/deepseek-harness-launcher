@@ -105,6 +105,42 @@ public class SemverRangeTests
         Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
     }
 
+    [Theory]
+    // —— 基准本身带预发布标识（^0.1.5-rc.1 / ~0.1.5-rc.1）：判不出来 ——
+    // npm 对这种范围没有可套用的明确规则，本工具的既定取舍是"判不出来"，
+    // README 在 caret 与 tilde **两边**都承诺了这条。此前只有 caret 有这道守卫、
+    // tilde 没有，而 tilde 分支恰恰是最容易被"顺手整理"掉的那一处：
+    // 删掉守卫后下面 "0.1.6" + "~0.1.5-rc.1" 会从"未能判定"翻成 **满足**——
+    // 护栏在漏报警的方向上出错（本工具最不能犯的那个方向）。
+    [InlineData("0.1.5", "^0.1.5-rc.1")]        // 正式版 > 同数字段的预发布基准
+    [InlineData("0.1.6", "^0.1.5-rc.1")]        // 数字段更高
+    [InlineData("0.1.5-rc.1", "^0.1.5-rc.1")]   // 同为预发布、标识相同
+    [InlineData("0.1.5-rc.9", "^0.1.5-rc.1")]   // 同为预发布、标识不同
+    [InlineData("1.4.1", "^1.4.1-rc.2")]         // 引擎自己的常用形状
+    [InlineData("0.1.5", "~0.1.5-rc.1")]
+    [InlineData("0.1.6", "~0.1.5-rc.1")]        // ← 没有守卫时这一条会判成 true
+    [InlineData("0.1.5-rc.1", "~0.1.5-rc.1")]
+    [InlineData("0.1.5-rc.9", "~0.1.5-rc.1")]
+    [InlineData("1.4.1", "~1.4.1-rc.2")]
+    public void 范围基准带预发布标识时判不出来(string candidate, string token)
+    {
+        Assert.Null(HarnessForm.SatisfiesSingle(candidate, token));
+        // 走完整范围路径必须是同一个"未能判定"：用户在「升级引擎」确认框里看到的
+        // 是这一层的结果，token 级判对了但组合层猜了，一样是错的结论。
+        Assert.Null(HarnessForm.SatisfiesRange(candidate, token));
+    }
+
+    [Fact]
+    public void 基准带预发布标识时_低于基准的候选仍是明确不满足()
+    {
+        // 钉的是上面那条的**边界**：null 只能从"已经进入范围判定"之后出来。
+        // 候选低于基准时（0.1.4 < 0.1.5）比较器给出的是确定答案，此时报"未能判定"
+        // 会把一条本来明确的"不满足"降级成"未知"——护栏因此在漏报警方向上出错。
+        // 把这两行的期望改成 null 它们就会红：那说明有人把 cmp<0 的收窄挪到了守卫之后。
+        Assert.False(HarnessForm.SatisfiesSingle("0.1.4", "^0.1.5-rc.1"));
+        Assert.False(HarnessForm.SatisfiesSingle("0.1.4", "~0.1.5-rc.1"));
+    }
+
     [Fact]
     public void 认不出的写法一律返回无法判定_而不是误判满足()
     {

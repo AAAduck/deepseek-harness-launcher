@@ -129,15 +129,18 @@ internal static class Program
     {
         try
         {
+            // 构造函数**不等待**：它只在对象已存在时把 createdNew 置 false 并打开
+            // 同一个互斥体，不会抛 AbandonedMutexException（那是 WaitOne 才会抛的）。
+            // 所以这里没有对应的 catch —— 此前那个 catch 是死代码，注释还把它说成
+            // "上一个实例被强杀"的处理路径，会误导下一个改这里的人。
+            //
+            // 上一任被强杀的情形本来就自动成立：命名互斥体在最后一个句柄关闭、
+            // 且无线程持有它时由内核销毁，于是本进程构造时必然 createdNew = true，
+            // 不需要任何补偿。真正需要防的是"另一个实例还活着"（createdNew = false），
+            // 那条路走的是 ActivateExistingWindow。
             singleInstanceMutex = new Mutex(initiallyOwned: true, @"Local\DeepSeekHarness.Launcher", out var createdNew);
             ownsSingleInstanceMutex = createdNew;
             return createdNew;
-        }
-        catch (AbandonedMutexException)
-        {
-            // 上一个实例是被强杀的：互斥体归我们，继续启动。
-            ownsSingleInstanceMutex = true;
-            return true;
         }
         catch
         {

@@ -35,8 +35,9 @@
 - **目录**：DeepSeek Harness 相关目录一览（双击在资源管理器里打开）。
 - **启动后更新插件**（复选框）：引擎启动后跑 `pnpm update`，改动在**下次启动**生效。上限是**距上次成功 20 小时**内不再自动跑（只在真正成功时才记戳记，所以失败会照常重试）；要强制重跑就删掉 `lastPluginUpdate.txt`。
 - **环境**：检测 Node / npm / pnpm / 引擎 / 插件兼容性 / 端口占用。报告只列结论与需要处理的问题；若已有配置快照，弹窗会问要不要从最近一份恢复——**默认按钮是「否」**（「是」会用快照覆盖当前配置，只在确实要回滚时点）。
+  检测期间也占 busy：「启动/升级」变灰、Esc 不响应。理由见「已实现的增强」里「环境检测期间也占 busy」那条。
 
-键盘：**回车** = 启动/停止（随主按钮），**Esc** = 停止引擎（启动/升级等忙碌期间不响应，等本次操作收尾），**Tab** 可遍历所有控件。
+键盘：**回车** = 启动/停止（随主按钮），**Esc** = 停止引擎（忙碌期间——启动/升级/环境检测——不响应，等本次操作收尾），**Tab** 可遍历所有控件。
 
 ### 生命周期与单实例
 
@@ -81,7 +82,7 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
 | DSH 引擎 | `%LOCALAPPDATA%\DeepSeekHarness\engine` |
 | DSH profile | `%USERPROFILE%\.dsh\profiles\web` |
 | 认证 URL | `%LOCALAPPDATA%\DeepSeekHarness\web-url.txt` |
-| 引擎输出日志 | `%LOCALAPPDATA%\DeepSeekHarness\engine-stdio.log`（引擎 stdout/stderr 全量；每次重新拉起引擎时重开。复用期间持续增长，量级为引擎自身日志量） |
+| 引擎输出日志 | `%LOCALAPPDATA%\DeepSeekHarness\engine-stdio.log`（引擎 stdout/stderr 全量；每次真正重新拉起引擎时截断到**末尾 8 MB**——不是清零，见「已知限制」。复用期间持续增长，量级为引擎自身日志量） |
 | 更新日志 | `%LOCALAPPDATA%\DeepSeekHarness\update-log.txt`（超 256 KB 自动截断） |
 | 插件更新节流戳记 | `%LOCALAPPDATA%\DeepSeekHarness\lastPluginUpdate.txt`（只在更新成功后写；删掉 = 下次启动强制更新） |
 | 启动异常日志 | `%LOCALAPPDATA%\DeepSeekHarness\startup-log.txt`、`crash-log.txt` |
@@ -119,6 +120,11 @@ dotnet publish --configuration Release
 
 产物在 `bin/Release/net8.0-windows/win-x64/publish/DeepSeekHarness.exe`。
 
+> 工程里开着 `TreatWarningsAsErrors`（警告即错误）：nullable 在本项目里的约束力来自
+> "编译器把每一个可能为 null 的地方都点出来"，而本项目出过的 bug 形状恰恰全是
+> **不报编译错、只静默失效**的（探针认错身份、归档认领抢不到、恢复漏报失败……）。
+> 默认只警告等于把"绝不能崩"降级成提示，所以把它钉回构建期。
+
 > 旧启动器**正在运行时**这个默认路径会被锁住（报 MSB3027，锁文件的正是运行中的
 > `DeepSeekHarness.exe`），此时改用独立输出目录，见下面「更新启动器本体」。
 
@@ -129,10 +135,13 @@ dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
 ```
 
 只测"判错了不报错"的那几处决策：杀哪些进程、要不要拍配置快照、恢复路径是否越界、
-semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局自检。
+semver 范围怎么判、端口探针凭什么断定"这台 3080 上跑的确实是 DSH"、
+tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些靠肉眼和上面的布局自检。
 改动这几个函数前先跑一遍，绿了再改。
 
 覆盖的分支与用例是**一一对应**的，改匹配规则前先看注释里写的事故与误伤面。
+本轮新增的这批判定（探针握手、tail 代际退役、版本槽名对认领副本的排除）同样按这条标准钉住，
+不是"等有空再补"——它们的失效形态全是**静默**的，界面上看不出任何异常。
 
 ## 更新启动器本体（标准流程：随时跑 `更新启动器.bat`，Web 会话不中断）
 
@@ -146,7 +155,12 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 流程五步：
 
 1. **升版本号**：`DeepSeekHarness.csproj` 的 `<Version>`，同步 `app.manifest` 的
-   `assemblyIdentity version` 和 `更新启动器.bat` 开头 echo 的版本说明。
+   `assemblyIdentity version`（写成 `x.y.z.0`）和 `更新启动器.bat` 开头 echo 的版本说明。
+   前两处漏改现在会**直接构建失败**：csproj 的 `VerifyManifestAssemblyVersion` 目标在
+   `PrepareForBuild` 之前拿 `<Version>` 去清单里找 `assemblyIdentity version="<版本>.0"`，
+   找不到就 `Error`。版本号是手工写在三处的，不同步的后果是"exe 属性显示 1.4.3、
+   Windows 看到的文件版本还是 1.4.2"，**没有任何地方会报错**——所以干脆让它变成构建失败。
+   `.bat` 那处管不到（不在构建输入里），仍要手工同步，别因为前两处被拦住了就忘了它。
 2. **发布单文件包**（旧启动器在跑，用独立输出目录绕开 `bin\` 锁）：
    ```powershell
    dotnet publish DeepSeekHarness.csproj -c Release -p:OutDir=D:\tmp\dsh-pub\bin\ -o D:\tmp\dsh-pub\out
@@ -177,7 +191,8 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - **首次跨入 1.3.0 的更新仍会重启一次引擎**：当时在跑的旧引擎 stdio 还是管道、随旧启动器陪葬；
   迁完这次，之后才进入无感复用的常态。
 - 引擎输出日志 `engine-stdio.log` 由 cmd 以追加句柄持有，**引擎运行期间删不掉**；
-  它只在下次重新拉起引擎时重开，长期复用期间会缓慢增长（在意的话重启一次引擎即可归零）。
+  它只在下次真正重新拉起引擎时才被截断到末尾 8 MB（不足 8 MB 时原样保留，**永远不会归零**），
+  长期复用期间会缓慢增长。
 - **端口 3080 被占**时启动失败，报错会附 `netstat -ano | findstr :3080`；
   若该端口落在 Windows 动态端口范围内（Hyper-V / WSL / Docker Desktop 预留段），报错会额外给出释放方法。
 - 首次装引擎中途被强行结束，会留下 `engine.tmp` 残留；下次安装会自动清理（「环境」检测也会提示）。
@@ -185,6 +200,8 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - **token 有效性无法在启动器侧校验**：DSH 的 `/` 无论 token 对错都返回同样的页面，
   `/api/*` 对任何 HTTP 头形式（Bearer / Cookie / query）一律 401——认证是浏览器端握手。
   所以启动器只能确认"这台 3080 上跑的确实是 DSH"，无法确认链接里的 token 还有效。
+  而"确实是 DSH"这句本身也不是看状态码就算的：HTTP 200 也必须带 SPA 首页的
+  `<title>DeepSeek Harness</title>` 标记（见「已实现的增强」里「端口探针验身份」那条）。
 
 以下几条是已实现的增强（1.4.0 起），记录设计意图，供后续维护参考：
 
@@ -210,9 +227,53 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
 - **低频路径异常统一日志**：配置快照、恢复、引擎归档、孤儿锁清理等低频关键路径的
   静默 `catch { }` 改为经 `Swallow.Quiet(ex, context)` 记录到 startup-log，
   同一异常源每小时只记一条。磁盘满、权限被撤这类系统性问题不再完全无信号。
+- **端口探针验身份，不只看状态码**：`ProbeServerAsync`（状态栏与启动前预检）与
+  `ProbeUrlAsync`（复用路径）共用 `IsDshHandshake` 这一个纯函数判定。两个标记都取自
+  **引擎自身产物**，不是本启动器的约定：未认证时引擎回 401 + `dsh web authentication required`，
+  带对 token 时回 200 + SPA 首页，其 `<title>DeepSeek Harness</title>` 恒落在第一个
+  4 KB 缓冲内（分块读、命中即返回，跨块边界用滑动窗口补住）。
+  此前是 200 一律放行，于是 3080 上坐着任意本机 dev server 时（本项目自己的 web profile
+  就跑在 Vite 上，对 `/` 回 200 是再正常不过的事）：状态栏误报"运行中"、启动前那道
+  "端口被别的程序占用"的预检被一并绕过（用户最后看到的是引擎 EADDRINUSE 的原始报错，
+  正是那道预检要避免的结局）；而复用路径那一条更重——它是唯一会把 token 作为 query
+  发出去的调用点，等于把浏览器**和 token 一起**送到不相干的服务上、token 进了它的访问日志。
+  ⚠ 失手方向刻意选"宁可说不是 DSH"：认错身份要把 token 递出去，认不成只是多一次重新拉起。
+  探针那个 HttpClient 还开着 gzip/deflate 自动解压——DSH 的 web server 带 gzip 中间件，
+  不解压就只拿到压缩流、标记永远读不到，于是 200 分支会恒为假。
 - **`engine.migrating` 定时归档**：`RefreshStatusAsync`（每 1.5 秒）挂一个每小时一次的
   节流器，长期只复用不重启的用户也能在 1 小时内自动归档 `engine.migrating`，
-  不再需要点「重启」才能释放那 214 MB。
+  不再需要点「重启」才能释放那 214 MB。⚠ 这条与点「启动」那次归档是**两个执行者**，
+  收尾路因此也得自己认领（见「文件说明」里 `ConfigBackup.cs` 那条）。
+- **环境检测期间也占 busy**：`RunEnvCheckAsync` 同样走 `EnterBusy(envButton, "检测中")`。
+  此前它只判 `busy` 不设 busy，而探测段是 4 个候选 × 10 秒级的等待——这期间「启动/升级」
+  全亮，用户可以点「启动」把引擎拉起来，再在随后弹出的报告里点「是」恢复配置：
+  启动器自己把"启动前/恢复前拍快照"这件事要防的后果给诱发了。
+  占 busy 同时也解决报告弹窗与进行中的启动互相覆盖状态文案。
+- **配置恢复如实报告部分失败**：`ConfigBackup.Restore` 现在返回 `RestoreResult`
+  （成功数 + 失败清单）。此前逐文件 `catch { }` 吞掉异常、只把成功数带回去，于是
+  "引擎正在运行、正占着这些文件"这个**最常见**的失败场景走的恰恰是成功分支：
+  用户看到"已恢复 N 个文件"，而 `$DSH_HOME` 实际停在新旧混合态——比整体失败更难排查。
+  现在清单在弹窗里逐条列出（最多 12 条，其余只报数量），一个都没写回时另有专门的报错弹窗
+  并提示先点「停止」。另外恢复前那份"留底快照"的返回值**必须看**：`CreateSnapshot`
+  的 null 是二义的（配置无变化无需拍 / 真拍失败了），而"这一步本身可逆"是刚刚对用户
+  做出的承诺，不能靠猜——现在返回 null 就记一条 startup-log，而不是默认它成立。
+- **子窗体只在用户自己点关闭时询问**：`EngineVersionsForm` 与 `FoldersForm` 的关闭确认
+  都以 `e.CloseReason == CloseReason.UserClosing` 为前提，其余关闭理由直接放行。
+  系统关机 / 注销 / 任务管理器结束同样会走 `FormClosing`，而此刻 `busy` 的概率最高
+  （正在扫 2.5 万个文件）：弹模态框 + `e.Cancel = true` 在 Windows 看来就是
+  "此应用阻止关机"，用户只能强杀，连日志都留不下。那种场景下"操作会不会跑完"
+  根本不是用户需要做决定的事，放行的代价至多是关窗早于列举完成——而列举本来就在后台线程。
+- **递归删除与日志截断一律后台线程**：`InstallEngineAsync` 的替换三步（清 `engine.old`、
+  现行目录改名、staging 顶上）与失败回退时的 staging 清理，以及 `TruncateEngineLog`，
+  都经 `Task.Run` 挪出 UI 线程。此前它们跑在 UI 线程上：2.5 万个文件 + 只读属性全树枚举
+  + 超过 8 MB 时的同步读写，确定性冻结界面数秒到数十秒——与本项目自订的
+  "2.5 万文件的递归删除不能挂 UI 线程"（见「文件说明」里两个子窗体那条）自相矛盾。
+- **启动流程在 `process.Start()` 之前补了取消检查点**：此前最后一个取消检查点在端口预检处。
+  关窗时 `FormClosing` 先跑完 `CancelPendingStart + StopEngineForExit`，而消息泵仍可能分发
+  已排队的续延（点 ✕ 落在 `await Task.Run(ClearOrphanProfileLock)` 或端口预检的那几百毫秒里
+  就会这样）：引擎被拉起、`dshProcess` 被赋值，然后才 return——那时 `StopEngineForExit`
+  早已执行完，没人再管它，窗口关了、3080 上留着一个没人接管的孤儿。
+  检查点必须**紧贴** `process.Start()`，往后再挪一步就白挪。
 - **PID 复用 StartTime 校验**：`StopHarnessProcessesCore` 与 `StopEngineForExit` 杀进程前，
   先比对 `Process.StartTime` 与 WMI 快照里的 `CreationDate`。PID 被系统复用时
   StartTime 必然不同，直接跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
@@ -220,25 +281,47 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
   `CreationDate` 是 DMTF 微秒精度、`Process.StartTime` 是 100ns 精度，同一进程的
   两个读数恒差 0–0.9 µs——严格相等在实测样本里只命中约 1/7，旧写法让「停止」
   大概率空转且不报错。改回严格相等前先看 `ProcessStartToleranceTests`。
+  ⚠ 1.4.1 再修：**WMI 快照为空不再静默空转**。`GetProcessRecords` 失败时返回的是
+  **空字典**而不是抛异常，于是整个杀进程循环一个都杀不掉、界面回到"未运行"、
+  日志里一个字都没有——这正是"界面说停了、引擎其实还占着 3080"那种故障。
+  现在手里握着活句柄的 `dshProcess` **直接 `Kill`**：这个 `Process` 对象是我们自己
+  `Start` 出来的，内核句柄一直指着那个进程，既不会被 PID 复用骗到、也不需要 WMI 快照
+  来证明同一性，所以它不必等快照里有对应条目。快照为空时另记一条启动日志——
+  这条路径必须有痕迹。
 - **semver 预发布门槛**（1.4.0）：caret/tilde 范围只放行与基准同
   `major.minor.patch` 三元组的预发布候选（npm 规则，`PrereleaseAllowedInRange`）。
   此前 `0.1.5-rc.9` 会被判满足 `^0.1.0`——升级护栏在**漏报警**的方向出错。
-  范围 token 里基准本身带预发布标识时维持旧语义（返回 null"未能判定"）。
+  范围 token 里基准本身带预发布标识时（`^0.1.5-rc.1`），对**不低于基准**的候选维持旧语义、
+  返回 null"未能判定"；低于基准的候选仍返回明确的 false——那是一条确定的"不满足"，
+  把它降级成"未知"恰恰是护栏漏报的方向。caret 与 tilde 两条分支对称（此前只有 caret 有这道守卫）。
 - **引擎日志截断保留尾部**：每次真启动时把 `engine-stdio.log` 截断到末尾 8 MB
   （在第一个完整换行符处切开，避免截断多字节 UTF-8 字符），日志体量从此有界。
+  截断本身走后台线程——超过 8 MB 时那是整整 8 MB 的同步读写，留在 UI 线程上是一次
+  可感知的停顿（同「递归删除与日志截断一律后台线程」那条）。
 - **引擎日志重启不回放（1.4.1）**：tail 游标改为从截断后的文件末尾起步（此前从 0 读，
   而 cmd 是 `>>` 追加——第二次起的「重启」会把历史日志整体回放：浏览器弹出旧会话的
   死 token 链接、启动等待循环在引擎就绪前就提前判"成功"），且分发处**逐行**核对代际
   令牌、令牌 volatile——换代瞬间正卡在读取中途的旧循环，攥着上一会话的 token 行也
-  一行不发。旧的「每次重新拉起时重开」说法（README/注释）从未实现，现已按实际行为改写。
+  一行不发。三处守卫（循环顶 ×2、逐行分发 ×1）都走同一个 `TailGenerationAlive`，
+  不能各写各的——多写一次就多一处能被"顺手改坏"的地方。
+  ⚠ 1.4.1 再修：**杀引擎后令牌也要退役**（`RetireEngineTail`，两条杀进程路径——点「停止」
+  与关窗清扫——都调）。此前只有"新引擎起跑"才换令牌，于是"杀掉引擎"到"新引擎起跑"之间的
+  那段窗口里，旧 tail 循环的退场排空（最多 4×150 ms）仍拿着**当前**令牌通过逐行守卫：
+  刚被删掉的 `web-url.txt` 被重写成过期 token、`authenticatedUrl` 复活，紧接着的等待循环
+  （`authenticatedUrl is not null → return`）在新引擎还没输出任何日志时就提前判"启动成功"。
+  令牌只增不减、从不复用，所以"退役"就是加一：旧循环下一次读就发现自己过期。
+  旧的「每次重新拉起时重开」说法（README/注释）从未实现——实际发生的是
+  "截断到末尾 8 MB"，现已按实际行为改写。
 
 ## 文件说明
 
 - `HarnessForm.cs`：主界面、进程管理、端口检测、认证 URL 捕获（engine-stdio.log 增量 tail）、
   引擎安装与升级、插件兼容性检查、配置备份恢复。
 - `EngineVersionsForm.cs`：引擎版本管理窗口（列表 / 切换 / 删除）。列举与删除都放后台线程，
-  窗口因此能在遍历 2.5 万个 `node_modules` 文件时保持响应。
-- `FoldersForm.cs`：相关目录一览窗口。
+  窗口因此能在遍历 2.5 万个 `node_modules` 文件时保持响应——这条纪律同样要求启动器自己那几处
+  递归删除与日志截断不许挂 UI 线程。关闭确认只在 `CloseReason.UserClosing` 时弹，
+  免得关机时被模态框挡成"此应用阻止关机"。
+- `FoldersForm.cs`：相关目录一览窗口。关闭确认与上面同一条纪律。
 - `DpapiFile.cs`：DPAPI（CurrentUser 作用域）文件加密/解密。认证链接（`web-url.txt`）含完整
   token，明文落盘时任何能读 `%LOCALAPPDATA%` 的进程都能拿到；加密后只有同一 Windows 用户
   能解开。旧版明文文件读取时自动升级为加密格式，用户无感。DPAPI 不可用（企业策略禁用等）
@@ -255,22 +338,39 @@ semver 范围怎么判。UI 与 IO 不测——那些靠肉眼和上面的布局
   引擎随启动器存活时启动流程会走复用分支直接返回，挂在支路上等于形同虚设）。
   跨进程互斥靠"同卷目录改名是原子的"：先 `engine.old` → `engine.migrating` 认领，
   抢到的人才做删除+归档。原先两个会话的启动器会各自删一次同名槽，交错起来会把
-  对方刚归档好的那份一起删掉。认领中途被杀会留下 `engine.migrating`（它就是那份数据本身），
-  下次启动先收尾再认领；活动引擎缺失时 `RecoverEngineSwap` 也会认它当恢复源。
+  对方刚归档好的那份一起删掉。
+  ⚠ 1.4.1 再修：**收尾路（`ArchiveMigratingLeftover`）原先根本没有认领**，直接对
+  `engine.migrating` 做「删同名槽 + Move」——而收尾有两个执行者（点「启动」那次与每小时
+  那次定时归档）。T1 归档成功后 T2 的 `ForceDeleteDirectory(slot)` 正好把**刚归档好的那一槽**
+  整棵删掉，自己的 Move 再因源已不在而失败被吞，`engine.old` 与 `engine.migrating` 双双消失，
+  上一版本就此丢失：这等于把上面那条认领刚修死的事故在收尾路上重新开了一条缝。
+  现在收尾路先把 `engine.migrating` 原子改名成 `engine.migrating.<8 位十六进制>`
+  （`ClaimMigratingDir`）抢到独占权再归档，抢不到就空转一轮；同进程再加一把 `lock`，
+  因为点「启动」那轮（`Task.Run` 后不等待）与定时那轮（`_ =` 丢出去）本来就可能并跑。
+  认领副本的代价与 `engine.migrating` 完全一样，所以一并处理：版本槽列举**排除**它
+  （`IsEngineSlotName`，否则界面上会冒出一个叫 `engine.migrating.1a2b3c4d` 的怪条目）、
+  `RecoverEngineSwap` 也把它当恢复源（进程死在"认领之后、归档之前"时它就是上一版本，
+  不认就只剩重装 214 MB 一条路）。而陈旧的认领目录**不删**：`RestoreStaleClaims` 把创建
+  超过 30 分钟的那份挪回 `engine.migrating` 走正常归档（仍可能被别人持有的用创建时间挡开，
+  归档是秒级动作）——它里面装的就是可回退副本，删掉等于丢版本。
 - `LayoutDump.cs`：布局自检（`DSH_LAYOUT_DUMP=1` / `DSH_LAYOUT_TEST=1` 时把真实几何写入 `layout-dump.txt`）。
   自检只在 `Program.cs` 的 `DSH_LAYOUT_TEST=1` 入口里驱动，两个对话框不再各自挂 `Shown` 处理器。
 - `Program.cs`：程序入口、单实例互斥、启动异常兜底（写 `crash-log.txt`）。
 - `app.manifest`：应用清单（asInvoker 不提权、supportedOS 声明、长路径感知）。
   DPI 感知不在清单里声明——它由 csproj 的 `ApplicationHighDpiMode` 给出（取值 `SystemAware`），
   与 `UseWindowsForms` 生成的 `ApplicationConfiguration.Initialize()` 保持单一来源。
-- `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。含 `InternalsVisibleTo`：
+- `DeepSeekHarness.csproj`：.NET 8 构建配置（发布参数已内置）。开着
+  `TreatWarningsAsErrors`（理由见「构建」）并带 `VerifyManifestAssemblyVersion` 目标
+  （版本号一致性，见「更新启动器本体」第 1 步）。含 `InternalsVisibleTo`：
   只对配套测试工程开放几个 internal 纯函数；同时用 `DefaultItemExcludes` 把整个 `tests\`
   从默认通配里摘掉（只挡 `.cs` 的话，测试工程的 bin/obj 产物仍会被逐个求值，
   将来谁在 `tests\` 下放个 `.resx` 还会被编进启动器资源）。
-- `tests\DeepSeekHarness.Tests\`：xunit 单测（146 条）。刻意只覆盖"判错了不报错"的决策：
+- `tests\DeepSeekHarness.Tests\`：xunit 单测（211 条）。刻意只覆盖"判错了不报错"的决策：
   两条杀进程路径（点「停止」与关窗清扫）、PID 复用 StartTime 容差、端口收窄、快照判定、
   恢复路径守卫、版本号白名单、版本归档的规划顺序、semver 范围判定（含预发布门槛）、
-  引擎换代 tail 游标的起点钳制（1.4.1，防"重启回放旧 token 行"）。
+  引擎换代 tail 游标的起点钳制（1.4.1，防"重启回放旧 token 行"）、tail 代际令牌退役后的
+  守卫是否仍拦得住旧循环、版本槽名白名单对认领副本 `engine.migrating.<8 位十六进制>`
+  的排除。
   这几处的共同点是错了不会有任何报错，只在用户眼前发生——所以必须有测试钉住。
   几条用例是**专门为了让别的用例变红**而存在的，例如端口收窄那条：把它整行删掉，
   必须有用例失败，否则说明它压根没被测住。

@@ -35,7 +35,12 @@
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
 
     <!-- exe 属性（右键→属性 里能看到），分发给同学时便于确认版本 -->
-    <Version>1.4.1</Version>
+    <Version>1.4.2</Version>
+    <!-- 警告即错误。nullable 在本项目里靠的是"编译器把每一个可能为 null 的地方
+         都点出来"的约束力（无一处 .Result/.Wait、无一处被吞的异常靠 catch 兜底），
+         而这些恰恰全是**不报编译错、只报运行错或静默失效**的形状。
+         默认只警告等于把项目自设的"绝不能崩"标准降级成提示，这里把它钉回构建期。 -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyTitle>DeepSeek Harness 控制台</AssemblyTitle>
     <Product>DeepSeek Harness Launcher</Product>
     <Company>DeepSeek Harness Launcher</Company>
@@ -71,6 +76,33 @@
          求值顺序的兜底：两条同时在，任一条失效都还有另一条。 -->
     <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
+
+  <!-- 版本号一致性校验（构建期）。
+       版本号手工写在三处：这里的 <Version>、app.manifest 的 assemblyIdentity、
+       更新启动器.bat 里 echo 给用户看的那句。三处不同步的后果是"exe 属性显示 1.4.2、
+       Windows 看到的文件版本还是 1.4.1"，而这个 exe 正是别人从更新目录里覆盖安装的，
+       没有任何地方会报错。这里把能自动兜住的那两处变成构建失败：漏改就编不过，
+       而不是等到分发出去、用户覆盖安装失败之后才发现。
+
+       为什么用 XmlPeek 而不是搜字符串：原先写的 FindInFiles 只存在于 .NET Framework 的
+       MSBuild，dotnet SDK（.NET 版 MSBuild）没有这个任务，报 MSB4036 直接让项目编不过。
+       XmlPeek 同属 Microsoft.Build.Tasks.Core，SDK 自带，.NET 8 下实测可用。
+       两个实测出来的坑：① 它的输出参数叫 Result，不是 Output；
+       ② 它**没有** XmlNamespace 参数，app.manifest 根元素声明的
+       xmlns="urn:schemas-microsoft-com:asm.v1" 只能靠 XPath 的 local-name() 绕开——
+       不带前缀的 /assembly/assemblyIdentity/@version 实测匹配为空。
+       这么写比字符串匹配更抗改：属性顺序、单双引号、缩进怎么变都照样匹配得到。
+       更新启动器.bat 不在这条 Target 的检查范围内：那句 echo 和文件里其它注释出现过
+       同一个版本号，单纯搜版本号在"忘了改 echo 那行"时照样通过，是假的安全感；
+       那处只能靠人记得同步，见下面的错误提示。 -->
+  <Target Name="VerifyManifestAssemblyVersion" BeforeTargets="PrepareForBuild">
+    <XmlPeek XmlInputPath="$(MSBuildProjectDirectory)/$(ApplicationManifest)"
+            Query="/*[local-name()='assembly']/*[local-name()='assemblyIdentity']/@version">
+      <Output TaskParameter="Result" ItemName="ManifestAssemblyVersion" />
+    </XmlPeek>
+    <Error Condition="'@(ManifestAssemblyVersion)' != '$(Version).0'"
+           Text="app.manifest 的 assemblyIdentity version 是「@(ManifestAssemblyVersion)」，与本项目的 &lt;Version&gt;$(Version)&lt;/Version&gt; 不一致——清单里应写成 $(Version).0（Windows 只认四段数字）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改；前两处漏改会在这里编不过，.bat 里 echo 给用户看的那句仍需人工同步。" />
+  </Target>
 
   <!-- 单测要直接跑几个 internal 纯函数：进程匹配内核、快照判定、恢复路径守卫、
        semver 范围判定。它们默认对外部程序集不可见，这里只对配套测试开口子。 -->

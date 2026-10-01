@@ -275,16 +275,32 @@ internal static class ConfigBackup
     }
 
     /// <summary>
-    /// 把一份快照覆盖回 $DSH_HOME。返回恢复的文件数；-1 表示失败。
-    /// 只恢复快照里存在的文件，不动其他任何东西。
+    /// 一次恢复的结果：成功写了几个文件，以及**每一个没成的**。
+    /// 必须把失败清单带出来——只报成功数的话，"引擎占着配置"这种最常见的失败
+    /// 会被显示成"已恢复 N 个文件"，而 $DSH_HOME 实际停在新旧混合态，
+    /// 比整体失败更难排查。
     /// </summary>
-    internal static int Restore(string snapshotDir)
+    internal readonly record struct RestoreResult(int Restored, List<string> Failed)
     {
+        public bool AnyFailed => Failed.Count > 0;
+    }
+
+    /// <summary>
+    /// 把一份快照覆盖回 $DSH_HOME。只恢复快照里存在的文件，不动其他任何东西。
+    /// 逐文件失败照旧继续（一个文件写不进去不该让其余的都不恢复），但**必须记账**。
+    /// </summary>
+    internal static RestoreResult Restore(string snapshotDir)
+    {
+        var failed = new List<string>();
+        var restored = 0;
         try
         {
-            if (!Directory.Exists(snapshotDir)) return -1;
+            if (!Directory.Exists(snapshotDir))
+            {
+                failed.Add("快照目录不存在：" + snapshotDir);
+                return new RestoreResult(0, failed);
+            }
             var root = Path.GetFullPath(DshHome);
-            var restored = 0;
             foreach (var src in Directory.GetFiles(snapshotDir, "*", SearchOption.AllDirectories))
             {
                 var rel = Path.GetRelativePath(snapshotDir, src);
@@ -295,17 +311,31 @@ internal static class ConfigBackup
                 // 一个 "../" 就可能写到别处去。
                 var full = Path.GetFullPath(dst);
                 if (!IsWithinRoot(full, root))
+                {
+                    failed.Add($"{rel}（越出 $DSH_HOME，已跳过）");
                     continue;
+                }
                 try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(full)!);
                     File.Copy(src, full, overwrite: true);
                     restored++;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // 最常见的原因是引擎还开着、正占着这些文件。留一条日志，
+                    // 更重要的是把相对路径记进清单交给用户看。
+                    Swallow.Quiet(ex, "config-restore-file");
+                    failed.Add($"{rel}（{ex.GetType().Name}）");
+                }
             }
-            return restored;
+            return new RestoreResult(restored, failed);
         }
-        catch (Exception ex) { Swallow.Quiet(ex, "config-restore"); return -1; }
+        catch (Exception ex)
+        {
+            Swallow.Quiet(ex, "config-restore");
+            failed.Add("读取快照目录失败：" + ex.Message);
+            return new RestoreResult(0, failed);
+        }
     }
 }

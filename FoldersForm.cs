@@ -146,6 +146,11 @@ internal sealed class FoldersForm : Form
     /// </summary>
     private void ConfirmClose(FormClosingEventArgs e)
     {
+        // 只有**用户自己点的关闭**才询问。系统关机/注销/任务管理器结束同样会走
+        // FormClosing，而此刻 busy 的概率最高（正在扫 2.5 万文件）：弹模态框 +
+        // e.Cancel = true 就是 Windows 意义上的"此应用阻止关机"，用户只能强杀，
+        // 连日志都留不下。那种场景下"操作会不会跑完"根本不是用户需要做决定的事。
+        if (e.CloseReason != CloseReason.UserClosing) { closing = true; return; }
         if (busy)
         {
             var go = MessageBox.Show(this,
@@ -223,7 +228,11 @@ internal sealed class FoldersForm : Form
             .Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
 
         var buttons = new[] { openButton, copyButton, closeButton, refreshButton };
-        var widths = buttonWidths;
+        // **必须 Clone**：int[] 是引用类型，直接用 buttonWidths 等于把下面压缩出来的
+        // 宽度写回那份缓存。后果是窗口拉宽后按钮不恢复，反复横拖一路压到 72px 下限
+        // 就再也回不去了。缓存里存的是"文字实测宽度"这个不变量，压缩只是本次布局的
+        // 临时结果，两者不能是同一份数据。
+        var widths = (int[])buttonWidths!.Clone();
         var total = widths.Sum() + gap * (buttons.Length - 1);
         var available = ClientSize.Width - margin * 2;
         if (total > available && buttons.Length > 1)
