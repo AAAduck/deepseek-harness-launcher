@@ -70,6 +70,17 @@ internal sealed class HarnessForm : Form
         @"(?<![\w.])[0-9]{1,5}(?![\w.])",
         RegexOptions.Compiled | RegexOptions.ECMAScript);
     /// <summary>
+    /// 残留进程匹配的两条宽松正则。与 AuthUrlRegex/PortTokenRegex 同一纪律：
+    /// 提为 static readonly + Compiled（每个进程都要过一遍它们，内联字面量
+    /// 每次调用都要重新解析模式）。IgnoreCase 用选项表达，不再用内联 (?i)。
+    /// </summary>
+    private static readonly Regex DshCommandRegex = new(
+        @"(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex NpxDshCommandRegex = new(
+        @"\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    /// <summary>
     /// 探针专用 HttpClient。<b>AutomaticDecompression 不可省</b>：DSH 的 web server 带
     /// gzip 中间件（dsh-host-webserver 的 compression 配置，默认 none 但可开），
     /// 一旦对方开了压缩，不解压就只能看到二进制，body 里的身份标记永远匹配不上——
@@ -1454,8 +1465,7 @@ internal sealed class HarnessForm : Form
         // 结果就是点一次「停止」把用户自己的进程整树杀掉。这是真实的误杀面。
         if (!MentionsLauncherPort(c, port)) return false;
 
-        return Regex.IsMatch(c, @"(?i)(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b") ||
-               Regex.IsMatch(c, @"(?i)\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b");
+        return DshCommandRegex.IsMatch(c) || NpxDshCommandRegex.IsMatch(c);
     }
 
     /// <summary>
@@ -2201,7 +2211,11 @@ internal sealed class HarnessForm : Form
         !version.Any(char.IsWhiteSpace) &&
         version == Path.GetFileName(version) &&
         !version.Contains("..", StringComparison.Ordinal) &&
-        version.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+        version.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
+        // Windows 建目录会静默剥掉尾点（"engine.1.2.3." 实际建成 "engine.1.2.3"），
+        // 之后列举/删除按带尾点的名字找就永远找不到——槽目录名失配。
+        // 尾点也不在 GetInvalidFileNameChars 里，与空格同是"合法但会被系统改写"的形状。
+        !version.EndsWith('.');
 
     /// <summary>目录占用，MB 粒度。用 EnumerateFiles 避免一次性把所有 FileInfo 建出来。
     /// 与 ForceDeleteDirectory 同一个理由走 \\?\ 扩展前缀：LongPathsEnabled 默认关闭的
@@ -2479,9 +2493,16 @@ internal sealed class HarnessForm : Form
                 Directory.GetCreationTime(engineDir)));
         }
 
-        try
+        string[] slotDirs;
+        try { slotDirs = Directory.GetDirectories(LocalAppDir, EngineSlotPrefix + "*"); }
+        catch { return result; }   // 根目录都列不出来：返回已有的活动版本即可
+
+        // try 收窄到单个目录体内：某个槽损坏（权限被撤、Defender 占着、半截删除）
+        // 不该中止整个枚举——原实现整个 foreach 一个 try，一个坏目录就让版本列表
+        // 静默缺掉其后所有条目，用户在「版本管理」里看到的比实际少。
+        foreach (var dir in slotDirs)
         {
-            foreach (var dir in Directory.GetDirectories(LocalAppDir, EngineSlotPrefix + "*"))
+            try
             {
                 var name = Path.GetFileName(dir);
                 if (!name.StartsWith(EngineSlotPrefix, StringComparison.OrdinalIgnoreCase)) continue;
@@ -2495,8 +2516,8 @@ internal sealed class HarnessForm : Form
                     DirectorySizeBytes(dir),
                     Directory.GetCreationTime(dir)));
             }
+            catch { /* 单个坏目录跳过，别拖垮整份列表 */ }
         }
-        catch { }
 
         return result;
     }
@@ -3960,7 +3981,14 @@ internal sealed class HarnessForm : Form
             // ReadToEndAsync 会一直挂着——而这一段原本没有任何超时，整个方法就此永挂。
             // 工具版本读不出来是可接受的降级，界面卡住不是。
             var drained = await Task.WhenAny(Task.WhenAll(outTask, errTask), Task.Delay(DrainTimeoutMs));
-            if (drained is not Task<string[]> done) return null;
+            // 排干超时（孙进程继承句柄、读取永不完成）也要收尾——这条早退路原本
+            // 漏掉了 DrainQuietlyAsync，与 OCE/catch 两个分支自己声明的纪律不一致，
+            // 留下的挂起读取任务会带着未观察异常退场。
+            if (drained is not Task<string[]> done)
+            {
+                await DrainQuietlyAsync(outTask, errTask);
+                return null;
+            }
             try
             {
                 var text = done.Result[0] + done.Result[1];

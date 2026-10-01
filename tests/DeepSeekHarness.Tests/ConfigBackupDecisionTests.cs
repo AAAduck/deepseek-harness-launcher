@@ -99,6 +99,19 @@ public class ConfigBackupDecisionTests
             VolatileFiles));
     }
 
+    [Fact]
+    public void 某文件本轮缺席_必须拍_读取或复制失败的文件靠这条自动重试()
+    {
+        // CreateSnapshot 对"哈希没算出来 / 复制没成功"的文件的记账方式就是
+        // "本轮 manifest 里它缺席"。上一轮有、本轮没有 → 键集合变化 → 必须拍，
+        // 这样瞬时失败（文件被引擎短暂占用）才会在下一轮被自动重试，
+        // 而不是靠占位符哈希被判成"永久变化"每轮重拍。
+        Assert.True(ConfigBackup.NeedsSnapshot(
+            Map(("settings.yaml", "b1")),
+            Map(("settings.yaml", "b1"), (".credentials.yaml", "a1")),
+            VolatileFiles));
+    }
+
     [Theory]
     [InlineData(@"C:\Users\me\.dsh\settings.yaml", @"C:\Users\me\.dsh", true)]
     [InlineData(@"C:\Users\me\.dsh\profiles\web\cordis.patch.yml", @"C:\Users\me\.dsh", true)]

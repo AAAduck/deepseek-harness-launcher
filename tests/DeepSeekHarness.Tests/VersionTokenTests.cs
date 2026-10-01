@@ -61,4 +61,16 @@ public class VersionTokenTests
         Assert.False(HarnessForm.IsSafeVersionToken(new string('v', 65)));
         Assert.True(HarnessForm.IsSafeVersionToken(new string('v', 64)));
     }
+
+    [Fact]
+    public void 尾点一律拒绝_Windows建目录会剥尾点导致槽名失配()
+    {
+        // 尾点不在 Path.GetInvalidFileNameChars 里："engine.1.2.3." 会被 Windows
+        // 静默建成 "engine.1.2.3"，之后按带尾点的版本名列举/删除永远找不到。
+        // 与空格同属"合法但会被系统改写"的形状，删掉这条约束测试必须红。
+        Assert.False(HarnessForm.IsSafeVersionToken("1.2.3."));
+        Assert.False(HarnessForm.IsSafeVersionToken("latest."));
+        // 中间有点是正常的（语义化版本本来就靠点分段），不能误伤。
+        Assert.True(HarnessForm.IsSafeVersionToken("1.2.3"));
+    }
 }

@@ -102,8 +102,15 @@ internal static class ConfigBackup
                     hashes[rel] = Convert.ToHexString(
                         System.Security.Cryptography.SHA256.HashData(stream))[..16];
                 }
-                catch { hashes[rel] = "<读取失败>"; }
+                catch { /* 读取失败：hashes 不含该项，下面复制也会跳过它 */ }
             }
+
+            // 读取失败的文件**不能**往 hashes 里塞占位符再照常落 manifest：
+            // 占位符会被当成"该文件的哈希"写进 last-hashes.txt，此后每次启动真实哈希
+            // 都与它不等 → NeedsSnapshot 恒为 true → 每轮重拍一份，8 个名额被无意义
+            // 快照轮流挤掉。改成"读取失败即跳过复制"：该文件本轮不在 hashes 里，
+            // manifest 也只写确实复制成功的项（见下面 copied 的记账），于是下一轮
+            // NeedsSnapshot 按"键缺席"判为要拍，自动重试——与复制失败的语义完全一致。
 
             Directory.CreateDirectory(BackupRoot);
             var manifestPath = Path.Combine(BackupRoot, "last-hashes.txt");
@@ -144,13 +151,17 @@ internal static class ConfigBackup
             var failedCopies = new List<string>();
             foreach (var rel in files)
             {
+                // 哈希没算出来的文件（上面读取失败）直接跳过：既不复制也不进 manifest，
+                // 下一轮按"键缺席"自然重试。hashes[rel] 不能再用索引器硬取——取不到会
+                // 抛 KeyNotFoundException，被外层 catch 吞成"整份快照失败"。
+                if (!hashes.TryGetValue(rel, out var hash)) continue;
                 var src = Path.Combine(DshHome, rel);
                 var dst = Path.Combine(target, rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
                 try
                 {
                     File.Copy(src, dst, overwrite: true);
-                    copied[rel] = hashes[rel];
+                    copied[rel] = hash;
                 }
                 catch (Exception ex)
                 {
@@ -349,7 +360,21 @@ internal static class ConfigBackup
                 try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-                    File.Copy(src, full, overwrite: true);
+                    // 原子覆盖：先写临时文件再同卷 Move。File.Copy(overwrite) 是原地
+                    // 覆写——进程被杀/断电落在写一半时，.credentials.yaml / settings.yaml
+                    // 就停在部分写入状态，而这正是备份机制本来要防的损坏。
+                    // 同卷 Move 在 NTFS 上是原子的：任何时刻目标要么是旧的完整内容，
+                    // 要么是新的完整内容。临时文件失败时顺带清掉，不留在配置目录里。
+                    var tmp = full + ".tmp";
+                    try
+                    {
+                        File.Copy(src, tmp, overwrite: true);
+                        File.Move(tmp, full, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                    }
                     restored++;
                 }
                 catch (Exception ex)
