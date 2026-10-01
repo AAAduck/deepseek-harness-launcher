@@ -48,6 +48,14 @@ internal sealed class HarnessForm : Form
         "\u001b\\[[0-9;?]*[ -/]*[@-~]",
         RegexOptions.Compiled);
     /// <summary>
+    /// 引擎日志里的认证 token 脱敏（TruncateEngineLog 落盘前用）。
+    /// 字符集与 AuthUrlRegex 的 token 段一致：URL 查询参数形式 (?|&)token=...，
+    /// 吃到空白/引号/ANSI 转义为止——与"每行一个 URL"的日志形态对齐。
+    /// </summary>
+    private static readonly Regex AuthTokenRedactRegex = new(
+        "([?&])token=[^\\s\\\"'<>\\x1b]+",
+        RegexOptions.Compiled);
+    /// <summary>
     /// 命令行里"独立的数字 token"。端口收窄专用：必须**整体**等于本启动器的端口才算数。
     /// 前后都不允许紧邻数字、小数点或任何单词字符，于是 "30801" 被当成一个整体而不是
     /// "3080"，"3080x" 也不会被截成 "3080"。
@@ -181,11 +189,17 @@ internal sealed class HarnessForm : Form
     /// 令牌只增不减、不复用，所以"退役"就是加一：旧循环下一次读就发现自己过期。
     /// </summary>
     private void RetireEngineTail() => Interlocked.Increment(ref engineTailToken);
-    private string? authenticatedUrl;
+    // volatile：tail 后台线程写（HandleProcessLine）、UI 线程在 250ms 轮询里读它判
+    // "启动成功"。实际内存模型 + Task.Delay 的隐式栅栏让陈旧读几乎不可能被观察到，
+    // 但本文件对 engineTailToken 的可见性用的是 Interlocked（语言规范保证，不靠
+    // "x86 上恰好没出事"），这两个字段是同一并发形状，执行同一纪律。
+    private volatile string? authenticatedUrl;
     private bool isOn;
     private bool busy;
     private bool refreshing;
     private bool closing;
+    // 与 authenticatedUrl 同点写入（tail 线程）、跨线程读；只用于界面展示
+    // （状态文案与提示），不参与任何判定分支，int 原子读写即可。
     private int lastPort = DefaultPort;
     private DateTime lastInstallInfoAt = DateTime.MinValue;
     private readonly CheckBox autoUpdateCheckbox = new();
@@ -397,7 +411,9 @@ internal sealed class HarnessForm : Form
         // 不匹配 profile 条目 id 的配置段（jet-hub 账号、llm-pi-ai 供应商都中过招），
         // 备份必须发生在"可能被改写"之前，事后再备份就晚了。
         // 内容没变化时不会重复生成，所以正常启动几乎零成本。
-        ConfigBackup.CreateSnapshot(reuseExisting ? "启动前" : "重启前");
+        // 放后台线程：哈希 + 复制是真实磁盘 I/O，%USERPROFILE% 落在漫游配置/网络盘
+        // 时并不便宜（FoldersForm 对同类 I/O 同一条纪律），不能挂在 UI 线程上。
+        await Task.Run(() => ConfigBackup.CreateSnapshot(reuseExisting ? "启动前" : "重启前"));
 
         // engine.old 的归档放在这里，而不是"打开版本管理窗口"时。
         //
@@ -1195,12 +1211,17 @@ internal sealed class HarnessForm : Form
     /// <summary>
     /// 关窗退出时结束引擎。与「停止」按钮的区别：这里必须**快**，因为它在窗体的
     /// 关闭路径上，阻塞会让窗口卡住不消失。
-    /// 先直接杀掉已知的进程树（不查 WMI），再补一次定向清扫——只扫
-    /// **命令行里带本启动器引擎目录**的 node，用来兜住在开始菜单/别处启动、
-    /// 或本实例没记录到的残留。锁文件不存在（绝大多数情况）时连这次清扫都跳过。
+    /// 先直接杀掉已知的进程树（不查 WMI）；WMI 定向清扫**只在复用路径**上补一次——
+    /// 复用的引擎是上一个（可能已崩溃的）实例拉起的，dshProcess 为 null，
+    /// 这次扫描是关窗时结束它的唯一手段。本实例自己拉起的引擎树已被句柄整树
+    /// 击杀（句柄即同一性证明），再扫一遍只是重复回答已知的事：白白把 ~140 ms
+    /// 的 WMI 全量查询压进关窗的 UI 线程（WMI 受损的机器上可到数秒）。
+    /// 更陌生的残留（别处启动、连复用探针都没对上的）宁可漏掉——下次启动的
+    /// 端口预检会给出明确报错兜住（见 MatchesEngineProcess 的注释）。
     /// </summary>
     private void StopEngineForExit()
     {
+        var ownEngine = dshProcess is not null;
         try
         {
             if (dshProcess is not null && !ProcessHasExited(dshProcess))
@@ -1214,21 +1235,24 @@ internal sealed class HarnessForm : Form
         // token 行仍会被这条排空路径吃掉并落盘（下一双击时就是一条死链）。
         RetireEngineTail();
 
-        try
+        if (!ownEngine)
         {
-            foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
+            try
             {
-                // PID 复用防护：同 StopHarnessProcessesCore，带容差比对（见 IsSameProcessStart）。
-                try
+                foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
                 {
-                    using var victim = Process.GetProcessById(record.Id);
-                    if (!IsSameProcessStart(victim.StartTime, record.StartTime)) continue;
-                    victim.Kill(entireProcessTree: true);
+                    // PID 复用防护：同 StopHarnessProcessesCore，带容差比对（见 IsSameProcessStart）。
+                    try
+                    {
+                        using var victim = Process.GetProcessById(record.Id);
+                        if (!IsSameProcessStart(victim.StartTime, record.StartTime)) continue;
+                        victim.Kill(entireProcessTree: true);
+                    }
+                    catch { }
                 }
-                catch { }
             }
+            catch { }
         }
-        catch { }
         InvalidateProcessRecordCache();
     }
 
@@ -1312,17 +1336,23 @@ internal sealed class HarnessForm : Form
         try
         {
             using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name, CommandLine, CreationDate FROM Win32_Process");
-            foreach (ManagementObject item in searcher.Get())
-            {
-                var id = Convert.ToInt32(item["ProcessId"]);
-                var parent = Convert.ToInt32(item["ParentProcessId"]);
-                // PID 复用防护：StartTime 用于在 Kill 前比对——PID 被系统复用时 StartTime 必然不同。
-                // WMI 的 CreationDate 是 FILETIME（UTC），转成 DateTime 供后续比较。
-                var startTime = item["CreationDate"] is string creationStr
-                    ? ManagementDateTimeConverter.ToDateTime(creationStr)
-                    : DateTime.MinValue;
-                result[id] = new ProcessRecord(id, parent, item["Name"] as string ?? string.Empty, item["CommandLine"] as string ?? string.Empty, startTime);
-            }
+            // Collection 与每个 ManagementObject 都持有 COM 对象（IWbemClassObject），
+            // 只 Dispose searcher 的话它们全靠终结器排队——启动/停止/清扫/锁清理
+            // 叠加 1 秒缓存未命中时短时间可积压数百个。与"Process 句柄用完即收"
+            // 同一条纪律。
+            using var results = searcher.Get();
+            foreach (var item in results.Cast<ManagementObject>())
+                using (item)
+                {
+                    var id = Convert.ToInt32(item["ProcessId"]);
+                    var parent = Convert.ToInt32(item["ParentProcessId"]);
+                    // PID 复用防护：StartTime 用于在 Kill 前比对——PID 被系统复用时 StartTime 必然不同。
+                    // WMI 的 CreationDate 是 FILETIME（UTC），转成 DateTime 供后续比较。
+                    var startTime = item["CreationDate"] is string creationStr
+                        ? ManagementDateTimeConverter.ToDateTime(creationStr)
+                        : DateTime.MinValue;
+                    result[id] = new ProcessRecord(id, parent, item["Name"] as string ?? string.Empty, item["CommandLine"] as string ?? string.Empty, startTime);
+                }
         }
         catch { }
         processRecordCache = result;
@@ -1576,13 +1606,25 @@ internal sealed class HarnessForm : Form
             proc = new Process { StartInfo = psi };
             if (!proc.Start()) return null;
 
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(timeout);
+            // 取消击杀必须挂在**同步执行的取消回调**上（Register 的回调在 Cancel()/
+            // CancelAfter 的触发线程上直接跑），不能只依赖下面 OCE catch 里的那份：
+            // 关窗时 CancelPendingStart 在 WM_CLOSE 分发期间同步 Cancel()，而 catch
+            // 是一条 Post 给 WinForms 上下文的续延——泵在 WM_CLOSE 分发期间不切换，
+            // 关窗后这条续延"可能被分发也可能被丢"，被丢时 cmd 及其子进程就成了
+            // 无人看管的孤儿（孤儿 npm 继续写 engine.tmp，下次升级删不掉临时目录）。
+            // catch 里那份 Kill 保留：它兜注册之前的取消与超时路径，双保险不冲突。
+            using var killOnCancel = timeoutCts.Token.Register(() =>
+            {
+                try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
+
             // 不给 ReadToEndAsync 传 token：一旦被取消它就不会再读完剩余数据，
             // 而杀掉子进程后管道自然会关闭、读取会干净地结束。
             var outTask = proc.StandardOutput.ReadToEndAsync();
             var errTask = proc.StandardError.ReadToEndAsync();
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(timeout);
             try { await proc.WaitForExitAsync(timeoutCts.Token); }
             catch (OperationCanceledException)
             {
@@ -2013,51 +2055,69 @@ internal sealed class HarnessForm : Form
             await StopHarnessProcessesAsync();
             await WaitForPortToCloseAsync(DefaultPort, TimeSpan.FromSeconds(8), CancellationToken.None);
 
-            await Task.Run(() => ForceDeleteDirectory(engineStageDir));
-            if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineStageDir);
+            // 交换段全程持 migrateGate：每小时的 MigrateEngineOldToSlot 会对同一批
+            // engine.<版本> 槽做 ForceDelete + Move，而「版本管理」对话框打开期间
+            // 主窗体 busy == false、归档轮照常起跑——此前两路可以交错：轻则 Move
+            // 失败走回滚报"切换失败"，重则归档把刚切走的同版本号陈旧副本又建回槽里。
+            // 串行化之后谁先谁后都得到自洽状态（不影响"改名认领"那层跨进程互斥，
+            // 两者守的是不同粒度的竞态）。
+            await migrateGate.WaitAsync();
             try
             {
-                Directory.Move(slot, engineDir);
-            }
-            catch
-            {
-                // 新版本顶上失败：把旧引擎搬回去再上抛。
-                // 必须这么写——RecoverEngineSwap 只认 engine.old、不看 engineStageDir，
-                // 而这条路径用的正是 engineStageDir。不搬回去就会留下"没有引擎"的状态，
-                // 下次启动只能重新下载整份引擎（实测 214 MB）。
-                try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
-                throw;
-            }
-            // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
-            // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在 engine.tmp
-            // 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，至少位置可见、可管理。
-            try
-            {
-                if (active is not null)
-                    Directory.Move(engineStageDir, EngineSlotDirFor(active));
-                else if (Directory.Exists(engineStageDir))
-                    Directory.Move(engineStageDir,
-                        EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
-            }
-            catch (Exception ex)
-            {
-                AppendStartupLog($"切换后归档旧版本失败（{active}）：{ex.Message}");
-                // 归档失败**也不能把这份旧版本直接删掉**——engine.tmp 里装着的正是
-                // 切换前的活动引擎，删掉等于丢掉唯一的回退副本（新版本顶上后，
-                // 用户想退回就只能重下 214 MB）。至少挪到 broken- 槽，位置可见、可管理。
-                var saved = false;
-                try
+                await Task.Run(() =>
                 {
-                    if (Directory.Exists(engineStageDir))
+                    ForceDeleteDirectory(engineStageDir);
+                    if (Directory.Exists(engineDir)) Directory.Move(engineDir, engineStageDir);
+                    try
                     {
-                        Directory.Move(engineStageDir,
-                            EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
-                        saved = true;
+                        Directory.Move(slot, engineDir);
                     }
-                }
-                catch { }
-                if (!saved) try { await Task.Run(() => ForceDeleteDirectory(engineStageDir)); } catch { }
+                    catch
+                    {
+                        // 新版本顶上失败：把旧引擎搬回去再上抛。
+                        // 必须这么写——RecoverEngineSwap 只认 engine.old、不看 engineStageDir，
+                        // 而这条路径用的正是 engineStageDir。不搬回去就会留下"没有引擎"的状态，
+                        // 下次启动只能重新下载整份引擎（实测 214 MB）。
+                        try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
+                        throw;
+                    }
+                    // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
+                    // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在 engine.tmp
+                    // 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，至少位置可见、可管理。
+                    // active 同样来自 package.json（可能被篡改/损坏），拼进槽目录名前必须过
+                    // IsSafeVersionToken（与 ArchiveClaimedDir 同一道闸）；不合法时走 broken- 槽
+                    // ——槽名由本程序生成、不含外部输入，这份旧版本仍然可见、可管理。
+                    try
+                    {
+                        if (active is not null && IsSafeVersionToken(active))
+                            Directory.Move(engineStageDir, EngineSlotDirFor(active));
+                        else if (Directory.Exists(engineStageDir))
+                            Directory.Move(engineStageDir,
+                                EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendStartupLog($"切换后归档旧版本失败（{active}）：{ex.Message}");
+                        // 归档失败**也不能把这份旧版本直接删掉**——engine.tmp 里装着的正是
+                        // 切换前的活动引擎，删掉等于丢掉唯一的回退副本（新版本顶上后，
+                        // 用户想退回就只能重下 214 MB）。至少挪到 broken- 槽，位置可见、可管理。
+                        var saved = false;
+                        try
+                        {
+                            if (Directory.Exists(engineStageDir))
+                            {
+                                Directory.Move(engineStageDir,
+                                    EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
+                                saved = true;
+                            }
+                        }
+                        catch { }
+                        // 已在后台线程，不再需要 Task.Run（锁内也不允许 await）。
+                        if (!saved) ForceDeleteDirectory(engineStageDir);
+                    }
+                });
             }
+            finally { migrateGate.Release(); }
             AppendStartupLog($"引擎版本已切换到 {version}");
             return null;
         }
@@ -2082,12 +2142,33 @@ internal sealed class HarnessForm : Form
 
         try
         {
-            var active = await Task.Run(() => ReadEngineVersion(engineDir));
-            if (string.Equals(active, version, StringComparison.OrdinalIgnoreCase))
-                return "不能删除正在使用的版本。请先切换到其他版本。";
-
             SetInfo($"正在删除引擎 {version}…");
-            await Task.Run(() => ForceDeleteDirectory(slot));
+            // 读活动版本与删除收进**同一个后台闭包**，不留 UI 线程往返的窗口：
+            // 互斥体是 Local\（每个登录会话各一个实例、共享同一份 %LOCALAPPDATA%），
+            // 另一会话的启动器可能正在切换/启动引擎，两次 Task.Run 之间就是它的机会窗。
+            var error = await Task.Run(() =>
+            {
+                // 与版本切换、每小时归档共用 migrateGate：三者改的是同一批
+                // engine.<版本> 槽目录，删到一半撞上别人改名会两败俱伤。
+                // 已在后台线程，同步 Wait 即可，不占 UI 线程。
+                migrateGate.Wait();
+                try
+                {
+                    var active = ReadEngineVersion(engineDir);
+                    // fail-safe：活动目录**存在**却读不出版本（正被另一实例改名交换、
+                    // 或 package.json 已损坏——后者恰是用户最可能来动版本的时机）时
+                    // 不能放行。原实现拿 null 与版本号比较，null ≠ version，守卫空放行；
+                    // 引擎目录若真不存在（已卸载），删除任意槽才是安全的。
+                    if (Directory.Exists(engineDir) && active is null)
+                        return "活动引擎目录存在但读不出版本（可能正被另一启动器实例交换目录，或清单已损坏），已拒绝删除。请稍后重试，或先修复/重装活动引擎。";
+                    if (string.Equals(active, version, StringComparison.OrdinalIgnoreCase))
+                        return "不能删除正在使用的版本。请先切换到其他版本。";
+                    ForceDeleteDirectory(slot);
+                    return null;
+                }
+                finally { migrateGate.Release(); }
+            });
+            if (error is not null) return error;
             AppendStartupLog($"已删除引擎版本 {version}");
             SetInfo($"已删除引擎 {version}");
             return null;
@@ -2162,7 +2243,10 @@ internal sealed class HarnessForm : Form
         // 同进程内也要互斥。用户点「启动」的那次归档（RunStartAsync 里 Task.Run 后不等待）
         // 与每小时那轮定时归档（RefreshStatusAsync 里 `_ =` 丢出去）可以并跑，两者都只看
         // Directory.Exists 就往下走。锁只管本进程；跨进程仍然只能靠下面的改名认领。
-        lock (migrateGate)
+        // 临界区里还有版本切换/删除（见 migrateGate 声明处的说明），它们持锁时间
+        // 可能长到秒级（整目录删除），本方法在后台线程上同步等待即可，不占 UI 线程。
+        migrateGate.Wait();
+        try
         {
             try
             {
@@ -2193,9 +2277,16 @@ internal sealed class HarnessForm : Form
             }
             catch (Exception ex) { Swallow.Quiet(ex, "migrate-engine-old"); }
         }
+        finally { migrateGate.Release(); }
     }
 
-    private static readonly object migrateGate = new();
+    // 同进程内也要互斥。用户点「启动」的那次归档（RunStartAsync 里 Task.Run 后不等待）
+    // 与每小时那轮定时归档（RefreshStatusAsync 里 `_ =` 丢出去）可以并跑，两者都只看
+    // Directory.Exists 就往下走。用 SemaphoreSlim 而不是 lock：切换/删除版本
+    // （ActivateEngineVersionAsync / DeleteEngineVersionAsync）也要进同一个临界区，
+    // 而它们的进入点在 await 之后（异步等待锁，lock 做不到）；归档侧在后台线程上
+    // 同步 Wait，两侧串行化的是同一批 engine.<版本> 槽目录的删改。
+    private static readonly SemaphoreSlim migrateGate = new(1, 1);
 
     /// <summary>
     /// engine.migrating 的收尾入口：**先原子改名认领，抢到才动**。
@@ -2316,6 +2407,16 @@ internal sealed class HarnessForm : Form
                 // 注意它此时位于 engine.migrating（或收尾路的认领副本）而非 engine.old，
                 // 日志要把位置说清楚。
                 AppendStartupLog($"{Path.GetFileName(claimedDir)} 无法读出引擎版本，保留原样未归档");
+                return false;
+            }
+            // 纵深防御：version 来自目录里那份 package.json——被篡改/损坏成含 "../"
+            // 的字符串时，EngineSlotDirFor(oldVersion) 经规范化可能指到 DeepSeekHarness
+            // 之外，下面的 ForceDeleteDirectory 会**递归删除**目标。用户可编辑的
+            // engine-version.txt 与对话框入参都过 IsSafeVersionToken，这个来源不能例外；
+            // 不合法就走"保留原样"分支，让环境检测把它显示出来，由用户决定。
+            if (!IsSafeVersionToken(oldVersion))
+            {
+                AppendStartupLog($"{Path.GetFileName(claimedDir)} 的版本号「{oldVersion}」不是合法目录名，保留原样未归档");
                 return false;
             }
 
@@ -2497,6 +2598,14 @@ internal sealed class HarnessForm : Form
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
 
+            // 取消击杀挂同步回调（理由见 RunCmdAsync 同款注释）：关窗丢掉 OCE 续延时，
+            // npm 整棵树会带着 engine.tmp 继续跑，下次升级的 ForceDeleteDirectory
+            // 就撞上"目录被占"。回调 + 下面 catch 双保险。
+            using var killOnCancel = installCts.Token.Register(() =>
+            {
+                try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
+
             await proc.WaitForExitAsync(installCts.Token);
 
             if (proc.ExitCode != 0)
@@ -2617,8 +2726,13 @@ internal sealed class HarnessForm : Form
     /// <summary>
     /// 需要拼进 cmd 命令行的值必须校验：含引号/空白/换行都可能把命令行拆坏。
     /// registry 是用户可改的 npm 配置，不能无条件信任。
+    /// internal（而非 private）是为了被单测直接钉住：它的输出被原样拼进
+    /// <c>cmd /d /s /c "… --registry &lt;这里&gt;"</c>（InstallEngineAsync /
+    /// GetLatestEngineVersionAsync），是"用户可改的 npm 配置拆坏/注入命令行"的
+    /// 唯一闸门；README 明文承诺了"含引号或空白的值不采用"。下面每一条排除项
+    /// 被"顺手整理"掉一个，编译零反馈——由测试兜住。
     /// </summary>
-    private static bool IsSafeNpmValue(string value) =>
+    internal static bool IsSafeNpmValue(string value) =>
         value.Length is > 0 and < 512 &&
         !value.Any(ch => char.IsWhiteSpace(ch) || ch is '"' or '\'' or '&' or '|' or '<' or '>' or '^' or '%');
 
@@ -3019,6 +3133,13 @@ internal sealed class HarnessForm : Form
             proc = new Process { StartInfo = psi };
             if (!proc.Start()) return null;
 
+            // 取消击杀挂同步回调（理由见 RunCmdAsync 同款注释）：关窗丢续延时
+            // 不能把孤儿 npm 留在后台。
+            using var killOnCancel = queryCts.Token.Register(() =>
+            {
+                try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
+
             // 与 RunCmdAsync 同一套纪律（理由见那里的注释，此处此前是反面教材）：
             // ① stderr 必须读掉——npm 往里写多了管道写满，子进程自己会卡死；
             // ② 不给 ReadToEndAsync 传 token——取消后剩余数据没人读；
@@ -3129,7 +3250,8 @@ internal sealed class HarnessForm : Form
             SetInfo($"正在安装引擎 {latest}（先装临时目录，成功后替换）…");
             // 升级是配置迁移的实际触发点（引擎版本一变，下次启动就可能改写 settings.yaml），
             // 所以这里再拍一份——此时还是"升级前"的配置，是最有价值的还原点。
-            ConfigBackup.CreateSnapshot($"升级引擎前（{current ?? "未安装"} → {latest}）");
+            // 放后台线程：与 RunStartAsync 的快照同一条纪律。
+            await Task.Run(() => ConfigBackup.CreateSnapshot($"升级引擎前（{current ?? "未安装"} → {latest}）"));
             await InstallEngineAsync(node, latest, await ResolveNpmRegistryAsync(node, cts.Token), cts.Token);
             if (cts.IsCancellationRequested) return;
 
@@ -3357,6 +3479,14 @@ internal sealed class HarnessForm : Form
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
 
+            // 取消击杀挂同步回调（理由见 RunCmdAsync 同款注释）：关窗丢掉 OCE 续延时，
+            // 孤儿 pnpm 会继续写 profiles\node_modules，与下一次引擎启动的模块链接
+            // 重建踩踏同一棵树——正是 RunStartAsync 注释里要防的并发场景。
+            using var killOnCancel = updateCts.Token.Register(() =>
+            {
+                try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
+
             try { await proc.WaitForExitAsync(updateCts.Token); }
             catch (OperationCanceledException)
             {
@@ -3436,21 +3566,32 @@ internal sealed class HarnessForm : Form
         catch { return null; }
     }
 
+    // AppendStartupLog / AppendUpdateLog 的读-改-写互斥。两边调用点分布在 UI 线程与
+    // 多个后台线程（tail 循环、Task.Run 的归档/清扫、Swallow.Quiet），File.ReadAllText
+    // （FileShare.Read）与并发的 WriteAllText 撞上时 IOException 被各自的方法兜掉——
+    // 整条日志无声丢失；两个执行者都读完再写还会互相覆盖（丢更新）。
+    // 进程内 lock 消掉最常见的丢条目形态；跨登录会话（Local\ 互斥体按会话隔离）
+    // 仍存在跨进程窗口，那属于可接受的日志瑕疵，不值得为它改追加式轮转。
+    private static readonly object logGate = new();
+
     internal static void AppendStartupLog(string text)
     {
         try
         {
-            var logDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "DeepSeekHarness");
-            Directory.CreateDirectory(logDir);
-            var path = Path.Combine(logDir, "startup-log.txt");
-            // 读-改-写而不是 AppendAllText：与 update-log 同一条截断策略，
-            // 超过上限按整条记录从头部滚动（此前它无限增长，刷新反复失败时会一直胖下去）。
-            // 调用点都是低频事件（失败/切换/归档），整读整写不构成负担。
-            var existing = File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : string.Empty;
-            var combined = existing + $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n";
-            File.WriteAllText(path, TrimLogTail(combined), new UTF8Encoding(false));
+            lock (logGate)
+            {
+                var logDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DeepSeekHarness");
+                Directory.CreateDirectory(logDir);
+                var path = Path.Combine(logDir, "startup-log.txt");
+                // 读-改-写而不是 AppendAllText：与 update-log 同一条截断策略，
+                // 超过上限按整条记录从头部滚动（此前它无限增长，刷新反复失败时会一直胖下去）。
+                // 调用点都是低频事件（失败/切换/归档），整读整写不构成负担。
+                var existing = File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : string.Empty;
+                var combined = existing + $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n";
+                File.WriteAllText(path, TrimLogTail(combined), new UTF8Encoding(false));
+            }
         }
         catch { }
     }
@@ -3459,23 +3600,26 @@ internal sealed class HarnessForm : Form
     {
         try
         {
-            Directory.CreateDirectory(LocalAppDir);
-            var logFile = Path.Combine(LocalAppDir, "update-log.txt");
+            lock (logGate)
+            {
+                Directory.CreateDirectory(LocalAppDir);
+                var logFile = Path.Combine(LocalAppDir, "update-log.txt");
 
-            // 先把"表头 + 内容"拼成一条完整记录再落盘。此前是分两次写
-            // （一次写内容、一次补表头），文件长度刚好卡在阈值上时，
-            // 截断会把同一条记录劈成两半。
-            var record = new StringBuilder();
-            record.Append("=== ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append(" ===\n");
-            record.Append(content.Replace("\r\n", "\n").TrimEnd('\n')).Append('\n');
+                // 先把"表头 + 内容"拼成一条完整记录再落盘。此前是分两次写
+                // （一次写内容、一次补表头），文件长度刚好卡在阈值上时，
+                // 截断会把同一条记录劈成两半。
+                var record = new StringBuilder();
+                record.Append("=== ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append(" ===\n");
+                record.Append(content.Replace("\r\n", "\n").TrimEnd('\n')).Append('\n');
 
-            var existing = File.Exists(logFile) ? File.ReadAllText(logFile, Encoding.UTF8) : string.Empty;
+                var existing = File.Exists(logFile) ? File.ReadAllText(logFile, Encoding.UTF8) : string.Empty;
 
-            // 每次更新都会追加整段 pnpm 输出，放任下去会无限增长。
-            // 必须按"整条记录"为单位从头部滚动，不能按字符截断：
-            // ① 字符截断会把多字节汉字劈成半个，写出乱码；
-            // ② 截断点落在记录中间时，表头被切掉，剩下的日志无法判断是哪次跑的。
-            File.WriteAllText(logFile, TrimLogTail(existing + record.ToString()), new UTF8Encoding(false));
+                // 每次更新都会追加整段 pnpm 输出，放任下去会无限增长。
+                // 必须按"整条记录"为单位从头部滚动，不能按字符截断：
+                // ① 字符截断会把多字节汉字劈成半个，写出乱码；
+                // ② 截断点落在记录中间时，表头被切掉，剩下的日志无法判断是哪次跑的。
+                File.WriteAllText(logFile, TrimLogTail(existing + record.ToString()), new UTF8Encoding(false));
+            }
         }
         catch { }
     }
@@ -3672,16 +3816,30 @@ internal sealed class HarnessForm : Form
             var footer = latestBackup is null
                 ? string.Empty
                 : "\n\n（仅当确实要回滚配置时才点「是」——会用最新快照覆盖当前配置；「否」= 只关闭）";
+            // 关窗守卫必须在这里（弹窗前）做：环境检测的 await 段最长几十秒
+            // （ResolveNodeAsync 逐个 node --version、端口探测、netsh），期间关窗，
+            // 续延仍会被分发（见 StartHarnessAsync "取消检查点"那段注释的自证）。
+            // 对已释放窗体 MessageBox.Show(this,…) 抛 ObjectDisposedException，
+            // 落进下面 catch 后 ShowError 会**再抛一次**——异常逃出 async void
+            // 事件处理器（envButton.Click），无人接管。本文件其余弹窗路径
+            // （RunStartAsync/StopClickedAsync/RunEngineUpgradeAsync）都有这道守卫，
+            // 这里是最后一个漏网点。
+            if (closing || IsDisposed) return;
             var restore = MessageBox.Show(this, head + footer, "环境检测",
                 latestBackup is null ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
                 issues.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information,
                 MessageBoxDefaultButton.Button2);
-            if (restore == DialogResult.Yes && latestBackup is not null)
-                RestoreLatestBackup(latestBackup);
+            if (restore == DialogResult.Yes && latestBackup is not null && !closing && !IsDisposed)
+                await RestoreLatestBackupAsync(latestBackup);
         }
         catch (Exception ex)
         {
-            ShowError("环境检测失败", ex.Message);
+            // catch 里同样不能对已释放窗体弹窗——否则上面的守卫形同虚设
+            // （异常从 ShowError 二次逃逸）。窗体没了就退回 startup-log 留痕。
+            if (closing || IsDisposed)
+                try { AppendStartupLog("环境检测失败：" + ex.Message); } catch { }
+            else
+                ShowError("环境检测失败", ex.Message);
         }
         finally
         {
@@ -3698,7 +3856,7 @@ internal sealed class HarnessForm : Form
     /// 用最新快照覆盖回 $DSH_HOME。刻意只覆盖快照里有的文件、不动其他任何东西，
     /// 并在覆盖前把"当前状态"再存一份——万一恢复错了还能退回来。
     /// </summary>
-    private void RestoreLatestBackup(string snapshotDir)
+    private async Task RestoreLatestBackupAsync(string snapshotDir)
     {
         var confirm = MessageBox.Show(this,
             $"用这份快照覆盖当前配置？\n\n快照：{Path.GetFileName(snapshotDir)}\n" +
@@ -3710,13 +3868,24 @@ internal sealed class HarnessForm : Form
         if (confirm != DialogResult.Yes) return;
 
         // 先给"恢复前"的状态留一份，保证这一步本身也可逆。
-        // 返回值必须看：CreateSnapshot 的 null 是二义的（配置没变化无需拍 / 真拍失败了），
-        // 而"可逆"是这里刚刚对用户做出的承诺——不能靠猜，也不能默认它成立。
-        var rollback = ConfigBackup.CreateSnapshot("恢复配置前（当前状态）");
-        if (rollback is null)
-            AppendStartupLog("恢复前未能留底（配置无变化或快照失败）：本次恢复不可逆。");
+        // force: true——留底**不参与**"内容有变化才拍"的去重：若距上次快照只有
+        // 凭据轮换过（易变豁免会判成"不用拍"），不带 force 就不留底，随后照常
+        // 覆盖，用户最新一次登录拿到的 token 被旧快照顶掉——而确认框刚刚
+        // 承诺了"覆盖前我会先把当前状态另存一份"。
+        // 放后台线程：与启动/升级前的快照同一条纪律（真实磁盘 I/O 不上 UI 线程）。
+        var rollback = await Task.Run(
+            () => ConfigBackup.CreateSnapshot("恢复配置前（当前状态）", force: true));
+        // await 期间用户可能关窗：后续两个 MessageBox.Show(this,…) 都会抛
+        // ObjectDisposedException 并从 async void 路径逃逸。恢复动作本身已经
+        // 完成与否都无妨——窗体没了，没有任何反馈可以落到。
+        if (closing || IsDisposed) return;
+        var rollbackMissing = rollback is null;
+        if (rollbackMissing)
+            AppendStartupLog("恢复前未能留底（快照失败）：本次恢复不可逆。");
 
-        var result = ConfigBackup.Restore(snapshotDir);
+        // Restore 也是逐文件覆盖写，同样不挂 UI 线程。
+        var result = await Task.Run(() => ConfigBackup.Restore(snapshotDir));
+        if (closing || IsDisposed) return;
         if (result.Restored == 0 && result.AnyFailed)
         {
             MessageBox.Show(this,
@@ -3727,6 +3896,9 @@ internal sealed class HarnessForm : Form
         }
         MessageBox.Show(this,
             $"已从快照恢复 {result.Restored} 个配置文件。" +
+            (rollbackMissing
+                ? "\n\n⚠ 恢复前没能留下当前状态的备份（快照写入失败），本次覆盖无法回退。"
+                : "") +
             (result.AnyFailed
                 ? $"\n\n⚠ 但有 {result.Failed.Count} 个文件**没能恢复**，" +
                   $"当前配置处于新旧混合状态：\n{DescribeRestoreFailures(result)}" +
@@ -3734,7 +3906,7 @@ internal sealed class HarnessForm : Form
                 : "") +
             "\n\n请点「停止」再点「启动」重启引擎使其生效。",
             "恢复配置", MessageBoxButtons.OK,
-            result.AnyFailed ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            result.AnyFailed || rollbackMissing ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
     }
 
     /// <summary>失败清单的展示形态：最多列 12 条，其余只报数量。</summary>
@@ -3763,6 +3935,13 @@ internal sealed class HarnessForm : Form
             };
             proc = new Process { StartInfo = psi };
             if (!proc.Start()) return null;
+
+            // 取消击杀挂同步回调（理由见 RunCmdAsync 同款注释）；超时（本方法的唯一
+            // 取消源）同样经 CancelAfter 触发回调，node --version 挂死也不会留孤儿。
+            using var killOnCancel = cts.Token.Register(() =>
+            {
+                try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
 
             // 与 RunCmdAsync 同一套纪律：① stderr 必须读掉（管道写满会让子进程卡死）；
             // ② 不给 ReadToEndAsync 传 token——被取消后剩余数据就没人读，任务会带着
@@ -4032,11 +4211,12 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>
-    /// 启动新引擎前截断日志：保留文件末尾 8 MB，其余丢弃。
+    /// 启动新引擎前清理日志：保留文件末尾 8 MB，其余丢弃；同时把历史日志里的
+    /// 认证 token 脱敏（见 AuthTokenRedactRegex）。
     /// 引擎 stdio 文件化后，日志由 cmd 以追加句柄持有、引擎运行期间持续增长。
     /// 不做轮转的话，长期复用（数周不重启）会让它膨胀到 GB 级。
-    /// 这里在**每次真启动**（到得了 StartHarnessAsync 的路径）时截断，保留尾部供排查。
-    /// 调用方保证截断之后才为新游标取起点（见 StartHarnessAsync 的换代顺序），
+    /// 这里在**每次真启动**（到得了 StartHarnessAsync 的路径）时清理，保留尾部供排查。
+    /// 调用方保证清理之后才为新游标取起点（见 StartHarnessAsync 的换代顺序），
     /// 截掉的头部连同其余历史内容都不会被回放。
     /// </summary>
     private static void TruncateEngineLog()
@@ -4044,21 +4224,33 @@ internal sealed class HarnessForm : Form
         const long MaxKeepBytes = 8L * 1024 * 1024;
         if (!File.Exists(engineStdioLog)) return;
         var info = new FileInfo(engineStdioLog);
-        if (info.Length <= MaxKeepBytes) return;
+        if (info.Length == 0) return;
 
-        // 保留末尾 8 MB。注意不能按字节硬切——可能截断多字节 UTF-8 序列的中间。
+        // 最多保留末尾 8 MB。注意不能按字节硬切——可能截断多字节 UTF-8 序列的中间。
         // 所以先按字节读，再从第一个完整换行符之后开始保留。
-        var buffer = new byte[MaxKeepBytes];
+        var keepBytes = (int)Math.Min(info.Length, MaxKeepBytes);
+        var buffer = new byte[keepBytes];
         using (var fs = new FileStream(engineStdioLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
         {
-            fs.Seek(-MaxKeepBytes, SeekOrigin.End);
+            fs.Seek(-keepBytes, SeekOrigin.End);
             var read = fs.Read(buffer, 0, buffer.Length);
             // 找第一个完整行：跳过可能被截断的半个 UTF-8 字符（行首的不完整字节）
             var firstNewLine = Array.IndexOf(buffer, (byte)'\n', 0, read);
             // 没找到换行（极端情况）时**整段都保留**——此前这里把 firstNewLine 置 0 之后
             // 仍然 +1，于是"从头保留"实际变成了"丢掉第 1 个字节"，与本行注释相反。
             var keepFrom = firstNewLine < 0 ? 0 : firstNewLine + 1;
-            File.WriteAllBytes(engineStdioLog, buffer[keepFrom..read]);
+
+            // 历史日志里的认证 token 落盘前一律脱敏：web-url.txt 已经 DPAPI 加密，
+            // 但同一个 token 还明文躺在引擎日志里，而且这份文件跨启动长期保留——
+            // 能读磁盘的人不用碰 DPAPI 就能拿到旧 token，"token 加密落盘"的目标
+            // 被同目录的这个文件抵消。脱敏只发生在换代清理这一刻：当前会话新写入的
+            // 行不经过这里（tail 读取路径必须看到明文才能捕获认证链接），所以盘上
+            // 只会留有"当前会话正在用"的那一个 token，下次重启即被清掉。
+            // 此前小文件（≤8 MB）直接早退，旧 token 就一直躺在盘上——清理必须
+            // 无条件执行，而不是只在文件超大时顺带做。
+            var text = Encoding.UTF8.GetString(buffer, keepFrom, read - keepFrom);
+            text = AuthTokenRedactRegex.Replace(text, "$1token=<redacted>");
+            File.WriteAllBytes(engineStdioLog, Encoding.UTF8.GetBytes(text));
         }
     }
 
