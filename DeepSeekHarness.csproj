@@ -92,16 +92,29 @@
        xmlns="urn:schemas-microsoft-com:asm.v1" 只能靠 XPath 的 local-name() 绕开——
        不带前缀的 /assembly/assemblyIdentity/@version 实测匹配为空。
        这么写比字符串匹配更抗改：属性顺序、单双引号、缩进怎么变都照样匹配得到。
-       更新启动器.bat 不在这条 Target 的检查范围内：那句 echo 和文件里其它注释出现过
-       同一个版本号，单纯搜版本号在"忘了改 echo 那行"时照样通过，是假的安全感；
-       那处只能靠人记得同步，见下面的错误提示。 -->
+       更新启动器.bat 那句 echo 的版本号**可以**机械校验：此前注释说"单纯搜版本号
+       在忘了改 echo 那行时照样通过"只对搜任意版本号成立——定向搜「更新到 $(Version)」
+       即可精确钉住 echo 那一行（.bat 里其余版本号 1.3.0/1.4.0/1.4.1 都出现在
+       注释里、不带"更新到"前缀，不会误命中；忘了改 echo 时构建直接失败，
+       不再依赖人记得同步）。 -->
   <Target Name="VerifyManifestAssemblyVersion" BeforeTargets="PrepareForBuild">
+    <!-- &lt;Version&gt; 必须是 x.y.z 三段式：下面的清单校验按 "$(Version).0" 补第四段，
+         四段式/预发布（1.4.2.0、1.4.3-rc.1）会拼出不存在的五段版本号，
+         清单怎么改都编不过，报错误导人去改清单。先卡格式，报错才有意义。 -->
+    <Error Condition="!$([System.Text.RegularExpressions.Regex]::IsMatch('$(Version)', '^\d+\.\d+\.\d+$'))"
+           Text="&lt;Version&gt;$(Version)&lt;/Version&gt; 不是 x.y.z 三段式（当前为「$(Version)」）。本项目的版本校验按「三段 + .0」与 app.manifest 对照，请把 &lt;Version&gt; 写成 1.4.3 这样的三段式；预发布信息不要写进 &lt;Version&gt;。" />
     <XmlPeek XmlInputPath="$(MSBuildProjectDirectory)/$(ApplicationManifest)"
             Query="/*[local-name()='assembly']/*[local-name()='assemblyIdentity']/@version">
       <Output TaskParameter="Result" ItemName="ManifestAssemblyVersion" />
     </XmlPeek>
     <Error Condition="'@(ManifestAssemblyVersion)' != '$(Version).0'"
-           Text="app.manifest 的 assemblyIdentity version 是「@(ManifestAssemblyVersion)」，与本项目的 &lt;Version&gt;$(Version)&lt;/Version&gt; 不一致——清单里应写成 $(Version).0（Windows 只认四段数字）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改；前两处漏改会在这里编不过，.bat 里 echo 给用户看的那句仍需人工同步。" />
+           Text="app.manifest 的 assemblyIdentity version 是「@(ManifestAssemblyVersion)」，与本项目的 &lt;Version&gt;$(Version)&lt;/Version&gt; 不一致——清单里应写成 $(Version).0（Windows 只认四段数字）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改；前两处漏改会在这里编不过。" />
+    <!-- 第三处（.bat echo）的机械校验，理由见上方注释。 -->
+    <PropertyGroup>
+      <_LauncherBatText>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\更新启动器.bat'))</_LauncherBatText>
+    </PropertyGroup>
+    <Error Condition="!$(_LauncherBatText.Contains('更新到 $(Version)'))"
+           Text="更新启动器.bat 里 echo 给用户看的版本号没有同步成 $(Version)（找不到「更新到 $(Version)」）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改。" />
   </Target>
 
   <!-- 单测要直接跑几个 internal 纯函数：进程匹配内核、快照判定、恢复路径守卫、

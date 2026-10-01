@@ -154,13 +154,13 @@ tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些�
 
 流程五步：
 
-1. **升版本号**：`DeepSeekHarness.csproj` 的 `<Version>`，同步 `app.manifest` 的
-   `assemblyIdentity version`（写成 `x.y.z.0`）和 `更新启动器.bat` 开头 echo 的版本说明。
-   前两处漏改现在会**直接构建失败**：csproj 的 `VerifyManifestAssemblyVersion` 目标在
+1. **升版本号**：`DeepSeekHarness.csproj` 的 `<Version>`（必须 x.y.z 三段式，不是会构建失败），
+   同步 `app.manifest` 的 `assemblyIdentity version`（写成 `x.y.z.0`）和 `更新启动器.bat` 开头 echo 的版本说明。
+   三处漏改任何一处都会**直接构建失败**：csproj 的 `VerifyManifestAssemblyVersion` 目标在
    `PrepareForBuild` 之前拿 `<Version>` 去清单里找 `assemblyIdentity version="<版本>.0"`，
-   找不到就 `Error`。版本号是手工写在三处的，不同步的后果是"exe 属性显示 1.4.3、
+   再读一遍 `更新启动器.bat` 确认里面有「更新到 <版本>」那句 echo——找不到就 `Error`。
+   版本号是手工写在三处的，不同步的后果是"exe 属性显示 1.4.3、
    Windows 看到的文件版本还是 1.4.2"，**没有任何地方会报错**——所以干脆让它变成构建失败。
-   `.bat` 那处管不到（不在构建输入里），仍要手工同步，别因为前两处被拦住了就忘了它。
 2. **发布单文件包**（旧启动器在跑，用独立输出目录绕开 `bin\` 锁）：
    ```powershell
    dotnet publish DeepSeekHarness.csproj -c Release -p:OutDir=D:\tmp\dsh-pub\bin\ -o D:\tmp\dsh-pub\out
@@ -298,6 +298,12 @@ tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些�
   （在第一个完整换行符处切开，避免截断多字节 UTF-8 字符），日志体量从此有界。
   截断本身走后台线程——超过 8 MB 时那是整整 8 MB 的同步读写，留在 UI 线程上是一次
   可感知的停顿（同「递归删除与日志截断一律后台线程」那条）。
+- **引擎日志里的认证 token 落盘前脱敏（1.4.2）**：`web-url.txt` 的 token 走 DPAPI 加密，
+  但同一个 token 也被引擎打进 `engine-stdio.log` 明文落盘、且跨启动长期保留——加密就被
+  同目录这个文件绕开了。现在每次真启动清理日志时，把历史日志里的 `?token=…` 统一改写成
+  `<redacted>` 再落盘；盘上只会留有当前会话正在用的那一个，重启即被清掉。
+  当前会话的行不受影响（tail 读取路径必须看到明文才能捕获认证链接），
+  文件变小（≤8 MB）时同样执行清理——旧 token 不再一直躺在盘上。
 - **引擎日志重启不回放（1.4.1）**：tail 游标改为从截断后的文件末尾起步（此前从 0 读，
   而 cmd 是 `>>` 追加——第二次起的「重启」会把历史日志整体回放：浏览器弹出旧会话的
   死 token 链接、启动等待循环在引擎就绪前就提前判"成功"），且分发处**逐行**核对代际

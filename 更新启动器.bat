@@ -43,13 +43,23 @@ rem 分隔字节对输出（"ab cd ef"），不含空格的正则会把哈希行
 rem 老系统上永远中止；空格由下一行 !COMPUTED: =! 去掉。② 必须加 /c:——
 rem findstr /r 会把带空格的引号串**拆成多个模式**（实测表头/提示行反而被误命中），
 rem /c: 才让整串是"一个"正则。
-setlocal enabledelayedexpansion
+rem ⚠ 1.4.2 修复：存在性判断必须在 enabledelayedexpansion **之前**做。
+rem %LOCALAPPDATA% 含 "!"（合法用户名，如 C:\Users\yule!）时，延迟展开会把
+rem % 展开结果里的 "!" 当延迟变量标记吃掉，路径被改坏、if exist 恒为假，
+rem 整个校验块被**静默跳过**——fail-open，与上面"有则必须比对通过才继续"的承诺相反。
+rem 所以先在延迟展开未启用的环境里判一次存在性，用 DO_SHA 把结果带进块内；
+rem 块内引用路径一律用 !VAR!（延迟展开的取值结果不会被二次扫描，"!" 安全），
+rem 不能再退回 %VAR% 内联展开。
 set "SHA256FILE=%STAGED%.sha256"
-if exist "%SHA256FILE%" (
+set "DO_SHA=0"
+if exist "%SHA256FILE%" set "DO_SHA=1"
+
+setlocal enabledelayedexpansion
+if "!DO_SHA!"=="1" (
   set "COMPUTED="
-  for /f "tokens=*" %%a in ('certutil -hashfile "%STAGED%" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
+  for /f "tokens=*" %%a in ('certutil -hashfile "!STAGED!" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
   set "COMPUTED=!COMPUTED: =!"
-  set /p EXPECTED=<"%SHA256FILE%"
+  set /p EXPECTED=<"!SHA256FILE!"
   if not defined COMPUTED (
     echo.
     echo ✗ 无法计算 staging 文件的 SHA256（certutil 失败）。
@@ -92,9 +102,24 @@ timeout /t 1 /nobreak >nul
 set /a _w+=1
 goto poll_exit
 :exited
+rem 没有 bin\Release 输出目录（.bat 连 exe 一起分发给别人、或 bin 被清理）时，
+rem 只更新脚本旁边的副本并启动它——不能因为"工程目录不存在"整体失败，
+rem 那会把本可成功的更新变成报错退出（1.4.2 修复：原先连桌面副本都不更新）。
+if exist "%ROOT%bin\Release\net8.0-windows\win-x64\" goto update_bin
+copy /y "%STAGED%" "%ROOT%DeepSeekHarness.exe"
+if errorlevel 1 (
+  echo 更新失败：桌面副本写不进去（可能只读或被占用）。
+  pause
+  exit /b 1
+)
+echo 更新完成，正在启动新版本（会自动接上还在跑的引擎）...
+start "" "%ROOT%DeepSeekHarness.exe"
+exit /b 0
+
+:update_bin
 copy /y "%STAGED%" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
 if errorlevel 1 (
-  echo 复制到 bin\Release 失败：目标 exe 可能仍被占用。
+  echo 复制到 bin\Release 失败：目标 exe 可能仍被占用或只读。
   echo 旧启动器可能没被杀干净——确认 DeepSeekHarness.exe 已退出后重跑脚本。
   echo （引擎不受影响，会话不会因此中断。）
   pause
@@ -104,3 +129,4 @@ copy /y "%STAGED%" "%ROOT%DeepSeekHarness.exe" >nul 2>&1
 if errorlevel 1 echo （提示：脚本旁边的桌面副本没更新成功，不影响本次启动，可之后手动复制。）
 echo 更新完成，正在启动新版本（会自动接上还在跑的引擎）...
 start "" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
+exit /b 0
