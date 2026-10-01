@@ -28,6 +28,33 @@ public class ProcessMatchTests
     }
 
     [Fact]
+    public void 引擎的cmd包装层_命中_stdio重定向就靠它()
+    {
+        // 真实启动形态：cmd /d /s /c ""node.exe" "…bin.js" web … >> engine-stdio.log 2>&1"。
+        // 包装层与 node 本体都必须命中，否则「停止」杀不干净。
+        Assert.True(Match("cmd.exe",
+            $@"""C:\Program Files\nodejs\node.exe"" ""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"" web --port {Port}"));
+    }
+
+    [Fact]
+    public void 编辑器打开了引擎目录下的文件_不命中_否则关窗停止会整树杀掉编辑器()
+    {
+        // 真实误伤面（1.4.3 修复）：此前"命令行含引擎目录"对**任意进程名**生效，
+        // 用编辑器打开 bin.js 这么普通的动作就会让该编辑器在「停止」/关窗时被
+        // 连树带孙杀掉。匹配必须同时核对进程类型与实际引擎入口。
+        Assert.False(Match("Code.exe",
+            $@"""C:\Program Files\Microsoft VS Code\Code.exe"" ""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"" --standalone"));
+    }
+
+    [Fact]
+    public void node跑了用户自己放在引擎目录下的脚本_不命中()
+    {
+        // 进程类型对了（node.exe），但命令行里没有引擎内的 dsh 包目录——
+        // 那不是我们的引擎，是用户恰好把脚本存在了引擎目录下。
+        Assert.False(Match("node.exe", $@"""{EngineDir}\tools\my-script.js"""));
+    }
+
+    [Fact]
     public void 启动器自身_不命中_免得把自己杀了()
     {
         Assert.False(Match("DeepSeekHarness.exe", @"C:\app\DeepSeekHarness.exe"));

@@ -25,6 +25,21 @@ public class EngineSweepTests
     }
 
     [Fact]
+    public void 编辑器打开了引擎目录下的文件_不命中_与停止路径同一口径()
+    {
+        // 与 ProcessMatchTests 的同名用例互为镜像：两条杀进程路径已经分叉过一次，
+        // 误伤面（编辑器以引擎目录下文件为参数）两边都必须钉住。
+        Assert.False(Match("Code.exe",
+            $@"""C:\Program Files\Microsoft VS Code\Code.exe"" ""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"""));
+    }
+
+    [Fact]
+    public void node跑了用户自己放在引擎目录下的脚本_不命中_与停止路径同一口径()
+    {
+        Assert.False(Match("node.exe", $@"""{EngineDir}\tools\my-script.js"""));
+    }
+
+    [Fact]
     public void 启动器自身_不命中_不能把自己杀了()
     {
         Assert.False(Match("DeepSeekHarness.exe", @"C:\app\DeepSeekHarness.exe"));

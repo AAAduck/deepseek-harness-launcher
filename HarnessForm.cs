@@ -1327,11 +1327,32 @@ internal sealed class HarnessForm : Form
         MatchesEngineProcess(p.Name, p.CommandLine, engineDir);
 
     /// <summary>
+    /// 引擎进程的镜像名形态：node（引擎本体）、cmd（stdio 重定向到 engine-stdio.log
+    /// 的包装层）、npx（早期残留的启动方式）。其余进程名——编辑器、资源管理器、任何
+    /// GUI 工具——即便命令行里带着引擎目录下的文件路径（用户用编辑器打开了 bin.js
+    /// 是最现实的形状），也不是引擎，绝不能进杀进程名单。两条杀进程路径共用本判定。
+    /// </summary>
+    private static bool IsEngineProcessShape(string name) =>
+        name.Equals("node.exe", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("npx.cmd", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 引擎目录下 dsh 包的完整路径。命令行里出现它，进程才可能与本引擎有关——
+    /// 这是比"引擎目录"更精确一档的锚点：引擎目录本身会被任何"以该目录下文件为
+    /// 参数"的进程撞上（编辑器、node 跑用户自己放在引擎目录下的脚本……）。
+    /// internal（而非 private）：匹配口径要被单测直接钉住。
+    /// </summary>
+    internal static string EnginePackageDirUnder(string engineDir) =>
+        Path.Combine(engineDir, "node_modules", "@deepseek-ai", "dsh");
+
+    /// <summary>
     /// 退出清扫的匹配内核（纯函数、可单测）。它与 <see cref="MatchesHarnessCommand"/>
     /// 是**两条彼此独立的杀进程路径**（这里=关窗，那边=点「停止」），两者只有一条交集：
     /// 都绝不能碰桌面客户端的引擎宿主。改其中一个时别忘了另一个——它们已经分叉过一次了。
     ///
-    /// 判据刻意比「停止」那条窄：只认命令行里带本启动器引擎目录的进程，不做宽松兜底。
+    /// 判据刻意比「停止」那条窄：只认"命令行带引擎内 dsh 包目录"的进程，不做宽松兜底。
     /// 关窗时宁可漏掉一个陌生残留（下次启动的端口探测会给出明确报错兜住），
     /// 也不能整树杀掉一个和本启动器毫无关系的进程。
     ///
@@ -1348,7 +1369,11 @@ internal sealed class HarnessForm : Form
         if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
         if (commandLine.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
         if (commandLine.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
-        return commandLine.Contains(engineDir, StringComparison.OrdinalIgnoreCase);
+        // 双重核对：进程形态（node/cmd/npx）+ 命令行里带引擎内的 dsh 包目录。
+        // 此前只认"命令行含引擎目录"的目录子串——编辑器以引擎目录下的文件为参数
+        // 时同样命中，关窗清扫会把它整树带走。
+        if (!IsEngineProcessShape(name)) return false;
+        return commandLine.Contains(EnginePackageDirUnder(engineDir), StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -1453,16 +1478,20 @@ internal sealed class HarnessForm : Form
         if (c.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
         if (c.Contains("dsh-subprocess", StringComparison.OrdinalIgnoreCase)) return false;
 
-        // 本启动器自己安装的引擎：命令行里必然带这个目录。这是最精确的一条。
-        if (c.Contains(engineDir, StringComparison.OrdinalIgnoreCase)) return true;
+        // 进程形态收窄：引擎及其包装层只可能是 node / cmd / npx（两条杀进程路径
+        // 共用同一判定）。编辑器、资源管理器等任何其他进程名直接出局——无论命令行
+        // 长什么样。此前这道收窄只挡在宽松匹配前面，"引擎目录精确匹配"对任意进程名
+        // 生效：一个以引擎目录下文件为参数的无关进程（编辑器打开了 bin.js）会被
+        // 整树杀掉——匹配必须同时核对进程类型与实际引擎入口，不能仅凭目录子串。
+        if (!IsEngineProcessShape(name)) return false;
 
-        // 其余宽松匹配只对 node / npx 生效。此前对任意进程名都套用，
-        // 一个恰好含 "dsh web" 字样的非 node 进程也会被整树杀掉。
-        var isNode = name.Equals("node.exe", StringComparison.OrdinalIgnoreCase);
-        var isNpx = name.Equals("npx.cmd", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase);
-        if (!isNode && !isNpx) return false;
+        // 本启动器自己拉起的引擎：命令行里带着**引擎内的 dsh 包目录**——比"引擎
+        // 目录"更精确一档的锚点（目录本身会被任何"以该目录下文件为参数"的进程
+        // 撞上，见 IsEngineProcessShape 处的注释）。与退出清扫同一口径。
+        if (c.Contains(EnginePackageDirUnder(engineDir), StringComparison.OrdinalIgnoreCase)) return true;
+
+        // 宽松匹配只对 node / npx / cmd 生效，进程形态已由 IsEngineProcessShape
+        // 统一收窄（此前这里各算一份 isNode/isNpx，两边迟早漂移）。
 
         // 宽松匹配只认**本用户**的残留：另一个登录会话里的引擎 / npx 缓存命令行
         // 同样含 @deepseek-ai/dsh，不加这道限定会把别人会话的进程整树杀掉
@@ -1470,8 +1499,9 @@ internal sealed class HarnessForm : Form
         // （LOCALAPPDATA、.dsh、npm 全局目录）都在 %USERPROFILE% 之下。
         // 误杀别人进程的代价远大于漏杀一个残留——真残留占着端口有启动前报错兜底。
         //
-        // **这道收窄必须待在这里、不能提到函数开头**。上面那条 engineDir 精确匹配
-        // 不需要 userHomeDir：命令行里带着本启动器的引擎目录，本身就是确定性的证据。
+        // **这道收窄必须待在这里、不能提到函数开头**。上面那条引擎包目录精确匹配
+        // 不需要 userHomeDir：命令行里带着本启动器的引擎内 dsh 包目录，本身就是
+        // 确定性的证据。
         // 要是把"userHomeDir 为空就返回 false"提到最前面，在 USERPROFILE 缺失 /
         // 用户配置文件 hive 未加载 / 受限容器这类机器上（本项目自己的文档就说
         // GetFolderPath 无法确定时返回空串），就变成**连自己的引擎都杀不掉**：
@@ -2106,6 +2136,13 @@ internal sealed class HarnessForm : Form
         }
     }
 
+    /// <summary>
+    /// ActivateEngineVersionAsync 返回值的**警告标记**：以此开头的返回串表示切换本体
+    /// 已成功、但有需要用户知道的警告（旧版本归档失败、副本保留在 engine.tmp）。
+    /// 版本管理对话框据此区分标题与图标——不能把成功误报成"切换失败"。
+    /// </summary>
+    internal const string ActivateSwitchedWithWarningPrefix = "新版本已启用";
+
     private async Task<string?> ActivateEngineVersionAsync(string version)
     {
         try
@@ -2134,9 +2171,10 @@ internal sealed class HarnessForm : Form
             // 串行化之后谁先谁后都得到自洽状态（不影响"改名认领"那层跨进程互斥，
             // 两者守的是不同粒度的竞态）。
             await migrateGate.WaitAsync();
+            string? archiveWarning;
             try
             {
-                await Task.Run(() =>
+                archiveWarning = await Task.Run<string?>(() =>
                 {
                     // 持闸后复查活动版本：上面的 active 是停引擎+等端口（最长 8 秒+）
                     // 之前读的，而互斥体是 Local\（每个登录会话各一个实例），另一会话的
@@ -2198,11 +2236,28 @@ internal sealed class HarnessForm : Form
                         }
                         catch { }
                         // 已在后台线程，不再需要 Task.Run（锁内也不允许 await）。
-                        if (!saved) ForceDeleteDirectory(engineStageDir);
+                        if (saved) return null;
+                        // 两个归档落点都失败：**绝不能删**。此前这里的兜底是
+                        // ForceDeleteDirectory(engineStageDir)——删掉的恰恰是切换前的
+                        // 完整引擎（新版本此刻已顶上成功），等于把唯一回退副本丢掉。
+                        // 原样保留：「环境」检测会提示 engine.tmp 残留，下次安装引擎
+                        // 才清理；位置如实报给用户，由他决定手动改名或等待。
+                        return ActivateSwitchedWithWarningPrefix +
+                            $"，但旧版本未能归档（版本槽与 broken- 槽两处落点都失败），" +
+                            $"已原样保留在：\n{engineStageDir}\n\n" +
+                            "在下次安装引擎之前它是旧版本唯一的副本，请不要手动删除；" +
+                            "可稍后在「版本管理」重试，或手动把该目录改名为 engine.<版本号>。\n\n" +
+                            $"原始错误：{ex.Message}";
                     }
+                    return null;
                 });
             }
             finally { migrateGate.Release(); }
+            if (archiveWarning is not null)
+            {
+                AppendStartupLog($"引擎版本已切换到 {version}，但旧版本归档失败：副本保留在 engine.tmp");
+                return archiveWarning;
+            }
             AppendStartupLog($"引擎版本已切换到 {version}");
             return null;
         }
@@ -3630,6 +3685,17 @@ internal sealed class HarnessForm : Form
     }
 
     /// <summary>
+    /// 把 package.json 里 link: 依赖的目标解析成待检查的路径。相对路径以
+    /// <paramref name="profileDir"/>（包所在目录）为基准——这是 pnpm 的语义；
+    /// 此前原样塞给 Directory.Exists，相对路径按**启动器的当前工作目录**解析，
+    /// 有效的 <c>link:../plugin</c> 会被判成断链、整轮插件更新被跳过——
+    /// 检测自己诱发了它要防的失败。绝对路径原样。internal（而非 private）：
+    /// "相对基准是 profile 不是 CWD"这条口径要被单测钉住。
+    /// </summary>
+    internal static string ResolveLinkTarget(string profileDir, string linkSpec) =>
+        Path.IsPathRooted(linkSpec) ? linkSpec : Path.Combine(profileDir, linkSpec);
+
+    /// <summary>
     /// 找出 profile 里路径已失效的 link: 依赖（pnpm 遇到断链会整体失败，
     /// 提前检测并给出具体路径，比笼统的"更新失败"更可定位）。
     /// </summary>
@@ -3646,7 +3712,8 @@ internal sealed class HarnessForm : Form
                 var value = dep.Value.GetString();
                 if (value is null || !value.StartsWith("link:", StringComparison.OrdinalIgnoreCase)) continue;
                 var linkPath = value.Substring(5);
-                if (!Directory.Exists(linkPath)) broken.Add($"{dep.Name} -> {linkPath}");
+                if (!Directory.Exists(ResolveLinkTarget(profile, linkPath)))
+                    broken.Add($"{dep.Name} -> {linkPath}");
             }
         }
         catch { }
@@ -4123,9 +4190,24 @@ internal sealed class HarnessForm : Form
         // ObjectDisposedException 并从 async void 路径逃逸。恢复动作本身已经
         // 完成与否都无妨——窗体没了，没有任何反馈可以落到。
         if (closing || IsDisposed) return;
-        var rollbackMissing = rollback is null;
-        if (rollbackMissing)
-            AppendStartupLog("恢复前未能留底（快照失败）：本次恢复不可逆。");
+        if (rollback is null)
+        {
+            // 留底失败就**中止**：确认框刚刚承诺"覆盖前我会先把当前状态另存一份"，
+            // 而恢复的全部安全性都建立在这份留底上。备份目录写不进（磁盘满/权限被撤/
+            // 路径无法解析）而配置目录写得进时，硬着头皮恢复 = 用旧快照覆盖当前配置
+            // 且没有任何回退副本——宁可让用户多排查一步，也不能替他做不可逆的决定。
+            // 此前只是记一条 startup-log 后照常恢复、覆盖完才在结果框里补一句警告，
+            // 承诺兑现不了仍然执行——正是"留底"要防的那种不可逆覆盖。
+            AppendStartupLog("恢复前未能留底（快照失败）：已中止恢复，当前配置未被改动。");
+            MessageBox.Show(this,
+                "恢复已中止，当前配置没有任何改动。\n\n" +
+                "原因：覆盖前需要先把当前状态另存一份（留底），但这一步失败了——" +
+                "最常见的原因是磁盘空间不足，或 config-backups 目录写入被拒。\n\n" +
+                "排查后重新点「环境」再试；确实要恢复时，也可以手动把快照目录里的文件" +
+                "按相同相对路径复制回 .dsh（覆盖前先点「停止」）。",
+                "恢复配置", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
 
         // Restore 也是逐文件覆盖写，同样不挂 UI 线程。
         var result = await Task.Run(() => ConfigBackup.Restore(snapshotDir));
@@ -4140,9 +4222,6 @@ internal sealed class HarnessForm : Form
         }
         MessageBox.Show(this,
             $"已从快照恢复 {result.Restored} 个配置文件。" +
-            (rollbackMissing
-                ? "\n\n⚠ 恢复前没能留下当前状态的备份（快照写入失败），本次覆盖无法回退。"
-                : "") +
             (result.AnyFailed
                 ? $"\n\n⚠ 但有 {result.Failed.Count} 个文件**没能恢复**，" +
                   $"当前配置处于新旧混合状态：\n{DescribeRestoreFailures(result)}" +
@@ -4150,7 +4229,7 @@ internal sealed class HarnessForm : Form
                 : "") +
             "\n\n请点「停止」再点「启动」重启引擎使其生效。",
             "恢复配置", MessageBoxButtons.OK,
-            result.AnyFailed || rollbackMissing ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            result.AnyFailed ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
     }
 
     /// <summary>失败清单的展示形态：最多列 12 条，其余只报数量。</summary>

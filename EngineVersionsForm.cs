@@ -445,8 +445,16 @@ internal sealed class EngineVersionsForm : Form
         SetBusy(false);
         if (error is not null)
         {
-            hint.Text = "切换失败：" + error;
-            MessageBox.Show(this, error, "切换失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // ActivateEngineVersionAsync 的返回值约定：以 ActivateSwitchedWithWarningPrefix
+            // 开头 = 切换本体已成功、但有警告（旧版本归档失败、副本保留在 engine.tmp）。
+            // 标题与图标据此区分，不能把成功误报成"切换失败"。
+            var switchedWithWarning = error.StartsWith(
+                HarnessForm.ActivateSwitchedWithWarningPrefix, StringComparison.Ordinal);
+            hint.Text = (switchedWithWarning ? "切换完成（有警告）：" : "切换失败：") + error;
+            MessageBox.Show(this, error,
+                switchedWithWarning ? "切换完成（有警告）" : "切换失败",
+                MessageBoxButtons.OK,
+                switchedWithWarning ? MessageBoxIcon.Warning : MessageBoxIcon.Error);
             // 失败也必须回到磁盘真相：目录交换走到一半才失败的情况（新的顶上失败、
             // 旧的搬回也失败）会让列表里显示的"使用中"版本与磁盘实际状态不一致，
             // 而界面上没有任何提示。SetBusy 恢复了「刷新」，但数据没人去重读。
