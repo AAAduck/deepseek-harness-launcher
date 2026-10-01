@@ -75,7 +75,13 @@ internal static class ConfigBackup
     /// 生成一份快照。只有内容相对上一份有变化时才写新目录，避免每次启动都堆一份。
     /// 返回新快照路径；未变化或失败返回 null。
     /// </summary>
-    internal static string? CreateSnapshot(string reason)
+    /// <param name="reason">写进 backup-info.txt 的原因。</param>
+    /// <param name="force">跳过"内容有变化才拍"的去重判定，无条件拍一份。
+    /// 恢复配置前的留底必须用它：回滚快照的价值恰恰在"覆盖前"这一刻，
+    /// 若此刻只有凭据轮换过（易变豁免判成"不用拍"）就不留底，
+    /// 用户最新一次登录拿到的 token 会被旧快照覆盖——UI 承诺了
+    /// "覆盖前我会先把当前状态另存一份"，这条路径不能例外。</param>
+    internal static string? CreateSnapshot(string reason, bool force = false)
     {
         try
         {
@@ -117,7 +123,7 @@ internal static class ConfigBackup
                 }
             }
 
-            if (!NeedsSnapshot(hashes, previous, VolatileConfigFiles))
+            if (!force && !NeedsSnapshot(hashes, previous, VolatileConfigFiles))
                 return null;   // 只有易变文件动过（或什么都没变），不占用快照名额
 
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
@@ -127,27 +133,52 @@ internal static class ConfigBackup
                 target = Path.Combine(BackupRoot, $"{stamp}-{n}");
             Directory.CreateDirectory(target);
 
+            // 逐文件记复制成败。此前失败只是静默跳过，manifest 却仍按完整 hashes
+            // 落盘——快照目录里没有这个文件，清单却说"已备份"；只要源文件内容
+            // 不再变，NeedsSnapshot 永远判"不用拍"，这个文件就再也不会被重试备份。
+            // 现在 manifest 只写**确实复制成功**的文件：失败项在清单里缺席，
+            // 下一轮 NeedsSnapshot 按"键集合变化"判为要拍，自动重试。
+            // （若某文件永久复制失败——权限被撤/磁盘满——每轮都会重拍一份，
+            // 但 backup-info 每份都列着失败清单，是可见信号而非静默缺口。）
+            var copied = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var failedCopies = new List<string>();
             foreach (var rel in files)
             {
                 var src = Path.Combine(DshHome, rel);
                 var dst = Path.Combine(target, rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-                try { File.Copy(src, dst, overwrite: true); } catch { }
+                try
+                {
+                    File.Copy(src, dst, overwrite: true);
+                    copied[rel] = hashes[rel];
+                }
+                catch (Exception ex)
+                {
+                    failedCopies.Add($"{rel}（{ex.GetType().Name}: {ex.Message}）");
+                }
             }
 
-            File.WriteAllText(Path.Combine(target, "backup-info.txt"),
-                $"时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n" +
+            var info = new StringBuilder();
+            info.Append($"时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n" +
                 $"原因: {reason}\n" +
                 $"引擎: {EngineVersionAtBackup()}\n" +
-                $"文件: {files.Count} 个\n" +
+                $"文件: {copied.Count} 个\n");
+            if (failedCopies.Count > 0)
+            {
+                info.Append("未备份（复制失败，下次启动会自动重试）:\n");
+                foreach (var f in failedCopies) info.Append($"  · {f}\n");
+            }
+            info.Append(
                 "恢复方法：把这里的文件按相同相对路径覆盖回 %USERPROFILE%\\.dsh\\ " +
                 "（覆盖前建议先关掉引擎）\n" +
                 "注意：快照内含 .credentials.yaml（明文密钥，且随快照保留多份），" +
-                "整个 config-backups 目录请勿外传、勿贴进截图。\n",
+                "整个 config-backups 目录请勿外传、勿贴进截图。\n");
+            File.WriteAllText(Path.Combine(target, "backup-info.txt"),
+                info.ToString(),
                 new UTF8Encoding(false));
 
             File.WriteAllText(manifestPath,
-                string.Join("\n", hashes.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                string.Join("\n", copied.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                                         .Select(kv => kv.Key + "\t" + kv.Value)),
                 new UTF8Encoding(false));
             PruneOldSnapshots();
