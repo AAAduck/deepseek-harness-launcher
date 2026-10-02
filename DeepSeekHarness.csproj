@@ -115,6 +115,19 @@
     <!-- 第三处（.bat echo）的机械校验，理由见上方注释。 -->
     <PropertyGroup>
       <_LauncherBatName>更新启动器-更新到$(Version).bat</_LauncherBatName>
+      <!-- ⚠ 这个 .bat 是 **GBK** 存的，不是 UTF-8。cmd.exe 在中文 Windows 上按系统
+           ANSI/OEM 代码页（936）解析批处理，用 UTF-8 存会让**每一行**都解析错乱：
+           BOM 被读成「锘」、注释里的中文被当成命令执行（用户实测报
+           "'锘緻cho' 不是内部或外部命令"）。
+           但**这一侧仍然用默认的 UTF-8 读，而且是对的**：GBK 与 UTF-8 在 ASCII
+           范围（0x00–0x7F）字节完全相同，而下面要匹配的 `set "TARGET_VERSION=…"`
+           **整行都是 ASCII**，解码成乱码的只有中文注释那部分，不影响这个子串。
+           即检查与脚本的实际编码**天然解耦**——换 GBK/UTF-8 都照样生效。
+           （曾试过显式 GetEncoding(936) 与 Encoding.ASCII，前者被 MSBuild 的属性函数
+           限制挡下（MSB4186），后者是属性不是方法（MSB4185）——绕这一圈不如讲清楚
+           为什么默认的就够。）
+           ※ 仓库里存一个 GBK 文件是代价，但脚本那边的编码不能改（改了 cmd 读不动），
+           只能改读它的这一侧。 -->
       <_LauncherBatText>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\$(_LauncherBatName)'))</_LauncherBatText>
     </PropertyGroup>
     <!-- 文件名也要带着版本号：资源管理器里常同时躺着好几份历史脚本，功能完全相同、
