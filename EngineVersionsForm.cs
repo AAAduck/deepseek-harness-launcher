@@ -154,7 +154,7 @@ internal sealed class EngineVersionsForm : Form
         // （要扫 2.5 万个文件、必然让出）侥幸躲过，那是时序上的运气。Program 的布局自检
         // 给的正是已完成的 Task.FromResult，所以自检每次跑的都是这条"空列表"分支——
         // 也就是说它量到的布局状态在生产里根本不会出现。Load 时句柄已建，没这个问题。
-        Load += async (_, _) => await ReloadAsync();
+        Load += async (_, _) => await ReloadAsyncCore();
         FormClosing += (_, e) => ConfirmClose(e);
     }
 
@@ -347,22 +347,10 @@ internal sealed class EngineVersionsForm : Form
     internal Control[] DumpControls() =>
         new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
 
-    /// <summary>
-    /// 版本槽大小的人读格式。**纯函数、可单测**。
-    ///
-    /// 原先一律 <c>N0</c>：不足 1 MB 的槽（半截安装、被删到一半的目录、
-    /// 只剩元数据的槽）会显示成 "0 MB"——一个看起来像"这个版本是空的"、
-    /// 实则只是没统计到的结论。1 MB 以下给一位小数、1 MB 以上才取整。
-    /// 统计失败（枚举抛异常）时返回 0，此时显示"—"而不是 "0 MB"。
-    /// </summary>
-    internal static string FormatSize(long bytes)
-    {
-        if (bytes <= 0) return "—";
-        const double mb = 1024.0 * 1024.0;
-        return bytes < mb
-            ? $"{bytes / mb:0.0} MB"
-            : $"{bytes / mb:N0} MB";
-    }
+    // 版本槽大小的人读格式见 HumanSize.FormatSize（**纯函数、可单测**）。它必须
+    // 住在非 UI 的类型里：本窗体的类型初始化器会 new 三个 GDI+ Font，单测若经由
+    // 这里调用纯函数，就会在无 GUI 的机器上被拖进字体初始化（StaticCouplingTests
+    // 声明要消灭的形状）。窗体内不保留转发器——留一条转发路径，测试早晚会走回去。
 
     private EngineVersionEntry? Selected =>
         !Gone && list.SelectedItems.Count > 0
@@ -410,6 +398,29 @@ internal sealed class EngineVersionsForm : Form
         if (busy || Gone) return;
 
         SetBusy(true);
+        try { await ReloadAsyncCore(); }
+        finally
+        {
+            // 与 FoldersForm 同一套纪律：busy 是状态（无条件复位），
+            // 控件写入是副作用（Gone 之后不再做）。
+            busy = false;
+            if (!Gone) SetBusy(false);
+        }
+    }
+
+    /// <summary>
+    /// 重读列表的本体，**不碰 busy**：busy 的置位与复位归入口（按钮/Load 走
+    /// <see cref="ReloadAsync"/>，切换/删除的 Core 自管）。
+    ///
+    /// 拆出它只有一个理由：切换/删除的四个内部调用点跑在 busy 窗口**之内**——
+    /// 走 ReloadAsync 会被顶部的守卫当场退回，一行都不执行。此前正是这个形状：
+    /// 列表停在旧状态（旧版本仍标"● 使用中"、已删条目还在）、hint 永远停在
+    /// "正在切换/正在删除…"，与"失败也必须回到磁盘真相"的承诺相反，而且后续
+    /// 按钮按陈旧 Tag 判定，整个对话框会话都停在错的状态上。
+    /// </summary>
+    private async Task ReloadAsyncCore()
+    {
+        if (Gone) return;
         hint.Text = "正在读取已安装的引擎版本…";
         try
         {
@@ -430,7 +441,7 @@ internal sealed class EngineVersionsForm : Form
                 {
                     var item = new ListViewItem(entry.Version);
                     item.SubItems.Add(entry.IsActive ? "● 使用中" : "可切换");
-                    item.SubItems.Add(FormatSize(entry.SizeBytes));
+                    item.SubItems.Add(HumanSize.FormatSize(entry.SizeBytes));
                     item.SubItems.Add(entry.InstalledAt.ToString("yyyy-MM-dd HH:mm"));
                     item.Tag = entry;
                     if (entry.IsActive) item.ForeColor = Color.FromArgb(34, 120, 60);
@@ -459,13 +470,6 @@ internal sealed class EngineVersionsForm : Form
         catch (Exception ex)
         {
             if (!Gone) hint.Text = "读取版本列表失败：" + ex.Message;
-        }
-        finally
-        {
-            // 与 FoldersForm 同一套纪律：busy 是状态（无条件复位），
-            // 控件写入是副作用（Gone 之后不再做）。
-            busy = false;
-            if (!Gone) SetBusy(false);
         }
     }
 
@@ -560,11 +564,11 @@ internal sealed class EngineVersionsForm : Form
                 // 提示文案**必须排在 ReloadAsync 之后**再设：ReloadAsync 自己会把 hint
                 // 改成"正在读取…"再改成统计文案，先设后刷的话失败原因当场就被覆盖掉了
                 // ——用户看到列表刷新了一下，错误却消失得无影无踪。
-                await ReloadAsync();
+                await ReloadAsyncCore();
                 if (!Gone) hint.Text = failureHint;
                 return;
             }
-            await ReloadAsync();
+            await ReloadAsyncCore();
             if (Gone) return;
             MessageBox.Show(this,
                 $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
@@ -617,11 +621,11 @@ internal sealed class EngineVersionsForm : Form
                 MessageBox.Show(this, error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 // 文案排在 ReloadAsync **之后**：ReloadAsync 自己会改 hint，
                 // 先设后刷等于把失败原因当场抹掉。
-                await ReloadAsync();
+                await ReloadAsyncCore();
                 if (!Gone) hint.Text = failureHint;
                 return;
             }
-            await ReloadAsync();
+            await ReloadAsyncCore();
         }
         finally
         {

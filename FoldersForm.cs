@@ -568,10 +568,24 @@ internal sealed class FoldersForm : Form
             // 与 ConfigBackup 的"闸门设在真正动用的那一刻"同一纪律。
             if (!File.Exists(sel.Path) && !Directory.Exists(sel.Path))
             {
+                // 与列表侧 KeepReadable 同一口径：Exists 对"无权限访问"也返回 false，
+                // 用会抛的 GetAttributes 复核一遍。列表里标着"存在，但当前账户无权
+                // 访问"的条目，绝不能在这里被说成"它已经不在了"——两条信息自相矛盾，
+                // 恰好在最需要排查的位置上误导排查方向。
+                try { File.GetAttributes(sel.Path); }
+                catch
+                {
+                    MessageBox.Show(this,
+                        $"它已经不在了：\n{sel.Path}\n\n" +
+                        "多半是刚刚被引擎安装或插件更新清理掉了。点「刷新」重新列出即可。",
+                        "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
                 MessageBox.Show(this,
-                    $"它已经不在了：\n{sel.Path}\n\n" +
-                    "多半是刚刚被引擎安装或插件更新清理掉了。点「刷新」重新列出即可。",
-                    "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    $"它还在，但当前账户无权访问：\n{sel.Path}\n\n" +
+                    "权限被撤、Defender 锁定或 OneDrive 占位符未下载都会这样，" +
+                    "先解决访问权限再打开。",
+                    "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             if (sel.IsFile)

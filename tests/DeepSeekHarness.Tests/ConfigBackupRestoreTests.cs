@@ -190,13 +190,19 @@ public class ConfigBackupRestoreTests : IDisposable
         // 用户看到"已恢复 3 个文件"而 $DSH_HOME 停在新旧混合态，比整体失败更难排查。
         PutInSnapshot("settings.yaml", "new");
         PutInSnapshot("settings.yaml.imported", "imported");
-        // 造一个写不进去的目标：目录占住同名文件的落点。
-        Directory.CreateDirectory(Path.Combine(Home, "blocked"));
+        // 造一个写不进去的目标：**目录**占住文件 blocked\x 的落点。此前只建了父目录
+        // Home\blocked——写入照样成功，失败路径从未被走进过，这条测试等于空转；
+        // 且当时对记账零断言，把 RestoreInto 的失败清单整段删掉它照样绿。
+        // AtomicWrite 的最后一步 Move 会落在已存在的**目录**上抛 IOException →
+        // 记账分支被真实走进。
+        Directory.CreateDirectory(Path.Combine(Home, "blocked", "x"));
         PutInSnapshot(Path.Combine("blocked", "x"), "x");
 
         var result = ConfigBackup.RestoreInto(Snapshot, Home);
 
         Assert.True(result.Restored >= 1);
+        Assert.True(result.AnyFailed, "失败必须记账：只报成功数会把新旧混合态说成已恢复");
+        Assert.Contains(result.Failed, f => f.Contains("blocked"));
         Assert.Equal("new", ReadFromHome("settings.yaml"));
         Assert.Equal("imported", ReadFromHome("settings.yaml.imported"));
     }

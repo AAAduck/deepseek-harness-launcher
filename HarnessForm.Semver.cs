@@ -704,8 +704,18 @@ internal sealed partial class HarnessForm : Form
             SetInfo($"引擎已升级到 {installed}，正在重启…");
             await StartHarnessAsync(cts.Token);
         }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            // 用户主动取消（Esc / 主按钮）：他知道自己刚取消了，无需多言。
+        }
         catch (OperationCanceledException)
         {
+            // 没人取消却收到 OCE = **安装超时**：InstallEngineAsync 里
+            // installCts.CancelAfter(EngineInstallTimeoutSeconds) 触发的取消同样以 OCE
+            // 收场，此前它和用户取消共用上面那条静默路径——用户点完「升级」，15 分钟
+            // 后一切悄然复位，信息栏无一字，既不知道发生了什么，也不知道引擎没被换掉。
+            // （版本查询超时走不到这里：GetLatestEngineVersionAsync 自己吞成 null。）
+            SetInfo($"引擎安装超时（{EngineInstallTimeoutSeconds} 秒），已中止升级；当前引擎未受影响。");
         }
         catch (Exception ex)
         {

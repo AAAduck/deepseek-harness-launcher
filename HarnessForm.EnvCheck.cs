@@ -70,7 +70,7 @@ internal sealed partial class HarnessForm : Form
             // 端口：只有被占才算问题；空闲时不必占一行。
             if (await IsPortListeningAsync(DefaultPort))
             {
-                if (await ProbeServerAsync(DefaultPort))
+                if (await ProbeServerAsync(DefaultPort, CancellationToken.None))
                     sb.AppendLine($"✓ 端口 {DefaultPort}：DSH 正在运行");
                 else
                 {

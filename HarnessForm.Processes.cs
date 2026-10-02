@@ -35,12 +35,21 @@ internal sealed partial class HarnessForm : Form
         // 引擎没了，它的 tail 循环也必须在这一刻退役：否则旧循环的退场排空
         // （最多 4×150 ms）还能以当前代令牌通过逐行守卫，把刚删掉的 web-url.txt
         // 重写成过期 token、复活 authenticatedUrl。见 RetireEngineTail。
-        RetireEngineTail();
-        // 引擎进程没了，上一份认证链接就是过期 token。不在这里清空的话，
-        // 「重启」/「升级后重启」的等待循环会在下一个引擎还没输出任何日志时
-        // 因 authenticatedUrl != null 立刻"成功返回"，浏览器先弹出过期 token 的失败页。
-        authenticatedUrl = null;
-        TryDeleteUrlFile();
+        //
+        // 退役 + 清字段 + 删文件三步必须与 tail 线程的写入（HandleProcessLine）
+        // 同持 authUrlGate：否则"tail 通过代际核对后被 OS 挂起几秒，恢复后把刚删掉
+        // 的 web-url.txt 重写成过期 token"的窄缝始终敞着。锁内重新核对令牌后，
+        // 要么 tail 先写完（这里的清理随后覆盖它，终态正确），要么退役先发生
+        //（tail 的锁内核对失败，不再写）——check-then-act 的缝就此焊死。
+        lock (authUrlGate)
+        {
+            RetireEngineTail();
+            // 引擎进程没了，上一份认证链接就是过期 token。不在这里清空的话，
+            // 「重启」/「升级后重启」的等待循环会在下一个引擎还没输出任何日志时
+            // 因 authenticatedUrl != null 立刻"成功返回"，浏览器先弹出过期 token 的失败页。
+            authenticatedUrl = null;
+            TryDeleteUrlFile();
+        }
         // 刚杀完必须让进程快照缓存作废：否则紧接着的 ClearOrphanProfileLock
         // 拿到的是"杀之前"的缓存（1 秒 TTL，而端口通常几百毫秒内就关、等不到过期），
         // 把已死进程当成活残留，拒绝清孤儿锁——恰好复现这个功能本来要防的启动失败。
@@ -51,11 +60,14 @@ internal sealed partial class HarnessForm : Form
     {
         var records = GetProcessRecords();
         // 读 WMI 取 CreationDate 是"这是不是当初那个进程"的依据，但 WMI 查询本身
-        // 会失败（服务被拦、权限不足、瞬时故障），而失败时 GetProcessRecords 返回的是
-        // **空字典**——不是抛异常。原先空字典直接让下面整个杀进程循环空转：
-        // 一个都杀不掉、界面回到"未运行"、日志里一个字都没有。
-        // 这条必须有痕迹：它正是"界面说停了、引擎其实还在 3080 上活着"那种故障。
-        if (records.Count == 0)
+        // 会失败（服务被拦、权限不足、瞬时故障）。GetProcessRecords 拿不到或**残缺**
+        // 时返回 null——不是抛异常。原先空字典直接让下面整个杀进程循环空转：
+        // 一个都杀不掉、界面回到"未运行"、日志里一个字都没有。这条必须有痕迹：
+        // 它正是"界面说停了、引擎其实还在 3080 上活着"那种故障。残缺同理且更险：
+        // 拿半截快照做定向清扫只会静默漏杀，不如只用句柄那条必中的路。
+        if (records is null)
+            AppendStartupLog("进程快照残缺或不可用（WMI 中途故障）：本轮只结束本启动器自己拉起的引擎进程树。");
+        else if (records.Count == 0)
             AppendStartupLog("进程快照为空（WMI 查询失败或被拦截）：本轮只结束本启动器自己拉起的引擎进程树。");
 
         var current = Volatile.Read(ref dshProcess);
@@ -71,16 +83,10 @@ internal sealed partial class HarnessForm : Form
             catch (Exception ex) { AppendStartupLog("结束本启动器拉起的引擎进程树失败：" + ex.Message); }
         }
 
-        var seeds = records.Values.Where(IsHarnessCommand).Select(x => x.Id).ToHashSet();
+        var snapshot = records ?? new Dictionary<int, ProcessRecord>();
+        var seeds = snapshot.Values.Where(IsHarnessCommand).Select(x => x.Id).ToHashSet();
         // dshProcess 只在上面读一次（取不在这里用：句柄那条路已经直接杀过了）。
-        var all = new HashSet<int>(seeds);
-        var queue = new Queue<int>(seeds);
-        while (queue.Count > 0)
-        {
-            var parent = queue.Dequeue();
-            foreach (var child in records.Values.Where(x => x.ParentId == parent).Select(x => x.Id))
-                if (all.Add(child)) queue.Enqueue(child);
-        }
+        var all = CollectProcessTreeIds(seeds, snapshot);
 
         foreach (var id in all.OrderByDescending(x => x))
         {
@@ -89,7 +95,7 @@ internal sealed partial class HarnessForm : Form
             // 严格相等在 WMI 的微秒精度下连"同一个进程"都判不等，实测单进程命中率仅约 1/5，
             // 曾经让「停止」大概率空转且不报错）。PID 被复用时创建时间必然相差秒级以上，
             // 容差比对照样跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
-            if (!records.TryGetValue(id, out var expected)) continue;
+            if (!snapshot.TryGetValue(id, out var expected)) continue;
             // WMI 没给出 CreationDate 时回退成 DateTime.MinValue，于是
             // IsSameProcessStart 必然判不等 → 这个进程**永远杀不掉、且无任何痕迹**。
             // 与其那样，不如在没有对照依据时**跳过并留痕**：PID 刚被系统复用的
@@ -122,6 +128,36 @@ internal sealed partial class HarnessForm : Form
         // await 之后、在 UI 续延上做，避免后台线程写 UI 所属状态的跨线程写。
         // 只读字段（拿句柄去 Kill）不受此限——Process 对象本身线程安全，
         // 而且这一步必须能在 WMI 快照不可用时独立生效（见上面那段注释）。
+    }
+
+    /// <summary>
+    /// 从种子出发沿 ParentId 边收集整棵进程树（含种子）。**纯函数、可单测**——
+    /// "杀哪些进程"是本项目最贵的判断（会崩掉用户正在用的桌面客户端），
+    /// 而它错了不报错，必须被单测钉住。
+    ///
+    /// **边也要防伪**：Windows 会把已退出进程的 PID 复用给引擎——孤儿进程的
+    /// ParentId 于是指向引擎的 PID，快照里它看起来就像引擎的子进程。此前对边不做
+    /// 任何校验，撞上就把**无关进程连同它的整棵子树**误杀（对每个受害者还开
+    /// entireProcessTree）。真实子进程必然**晚于**父进程创建，所以创建时间不晚于
+    /// 父进程的一律不收编；CreationDate 缺失（MinValue）的没有对照依据，同样不收编。
+    /// 代价只是漏收一个"父 PID 恰好撞上复用"的残留——与本文件"宁可漏掉一个残留，
+    /// 也不能误杀同 PID 的新进程"的信条同向。
+    /// </summary>
+    internal static HashSet<int> CollectProcessTreeIds(
+        IReadOnlyCollection<int> seeds, IReadOnlyDictionary<int, ProcessRecord> records)
+    {
+        var all = new HashSet<int>(seeds);
+        var queue = new Queue<int>(seeds);
+        while (queue.Count > 0)
+        {
+            var parent = queue.Dequeue();
+            if (!records.TryGetValue(parent, out var parentRecord)) continue;
+            foreach (var child in records.Values
+                         .Where(x => x.ParentId == parent && x.StartTime > parentRecord.StartTime)
+                         .Select(x => x.Id))
+                if (all.Add(child)) queue.Enqueue(child);
+        }
+        return all;
     }
 
     /// <summary>
@@ -191,7 +227,17 @@ internal sealed partial class HarnessForm : Form
     {
         try
         {
-            foreach (var record in GetProcessRecords().Values.Where(IsEngineProcess))
+            var records = GetProcessRecords();
+            if (records is null)
+            {
+                // 残缺快照不进清扫：枚举半途失败时"没看到"不等于"不在"，
+                // 与「停止」对空/残缺快照的留痕降级同一口径。
+                Swallow.Quiet(
+                    new InvalidOperationException("进程快照残缺（WMI 中途故障），关窗清扫跳过定向扫描"),
+                    "kill-engine-sweep-incomplete");
+                return;
+            }
+            foreach (var record in records.Values.Where(IsEngineProcess))
             {
                 if (record.StartTime == DateTime.MinValue)
                 {
@@ -355,7 +401,7 @@ internal sealed partial class HarnessForm : Form
     private static DateTime lastMigrateAttemptAt = DateTime.MinValue;
     private static readonly TimeSpan MigrateThrottle = TimeSpan.FromHours(1);
 
-    private static Dictionary<int, ProcessRecord> GetProcessRecords()
+    private static Dictionary<int, ProcessRecord>? GetProcessRecords()
     {
         var now = DateTime.UtcNow;
         // 缓存读取必须跨线程安全：关窗清扫在 UI 线程、停止路径与孤儿锁清理在后台线程。
@@ -367,7 +413,7 @@ internal sealed partial class HarnessForm : Form
             return cached;
 
         var result = new Dictionary<int, ProcessRecord>();
-        var completed = false;
+        var complete = true;
         try
         {
             using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name, CommandLine, CreationDate FROM Win32_Process");
@@ -378,8 +424,8 @@ internal sealed partial class HarnessForm : Form
             using var results = searcher.Get();
             // 逐条 try：WMI 提供程序半途故障、或个别对象的某个属性读不出来时，
             // 坏的那一条**不该让整份快照作废**——那等于把一台本来还能枚举 400/500
-            // 个进程的机器降级成"什么都没有"。代价是这一份**不完整**，
-            // 所以 completed 保持 false、下面不发布缓存（见下）。
+            // 个进程的机器降级成"什么都没有"。代价是这一份**不完整**：
+            // complete 置 false，整个快照按"拿不到"处理（不返回给下游、不发布缓存）。
             foreach (var item in results.Cast<ManagementObject>())
             {
                 using (item)
@@ -402,24 +448,26 @@ internal sealed partial class HarnessForm : Form
                             : DateTime.MinValue;
                         result[id] = new ProcessRecord(id, parent, item["Name"] as string ?? string.Empty, item["CommandLine"] as string ?? string.Empty, startTime);
                     }
-                    catch (Exception ex) { Swallow.Quiet(ex, "process-record-row"); }
+                    catch (Exception ex) { Swallow.Quiet(ex, "process-record-row"); complete = false; }
                 }
             }
-            completed = true;
         }
         catch (Exception ex)
         {
             // 整份快照拿不到：留痕，而不是把一个空/半截字典静悄悄交给下游。
             Swallow.Quiet(ex, "process-records");
+            complete = false;
         }
 
-        // **部分结果绝不发布为缓存**。下游把这份快照当"全量进程表"用：
-        // 停止/清扫会漏掉没被枚举到的残留（静默漏杀、无痕），孤儿锁清理会把
-        // "没看到持锁者"读成"没人持锁"。而空快照本来就有守卫（跳过并留痕），
-        // **半截快照此前却绕过了它**——Count != 0。
-        // 不缓存的代价只是下一次调用重跑一次 WMI（本机约 140ms）；
-        // 缓存一份残缺快照的代价是"漏杀 + 误删锁"，两者不可比。
-        if (!completed) return result;
+        // **残缺的快照一律当"拿不到"处理：返回 null、不发布缓存**。下游把这份快照
+        // 当"全量进程表"用：停止/清扫会漏掉没被枚举到的残留（静默漏杀、无痕），
+        // 孤儿锁清理会把"没看到持锁者"读成"没人持锁"→ 删掉活锁——锁没了，
+        // 并发写者就能同时进场，正是本文件最不能犯的错。此前只挡"空"快照，
+        // 半截快照（Count != 0）两头都绕了过去；逐行丢行时甚至还会被发布进缓存，
+        // 与上面的逐条 try 注释自相矛盾。返回 null（而不是把半截字典交出去）让
+        // 调用方显式选择降级路径；不缓存的代价只是下一次调用重跑一次 WMI
+        //（本机约 140ms），残缺快照的代价是"漏杀 + 误删锁"，两者不可比。
+        if (!complete) return null;
         Volatile.Write(ref processRecordCache, result);
         Interlocked.Exchange(ref processRecordCacheAtTicks, now.Ticks);
         return result;
@@ -622,12 +670,19 @@ internal sealed partial class HarnessForm : Form
             // 绝大多数启动这里根本没有锁文件：先判存在再决定要不要付出全量进程扫描的代价。
             if (!File.Exists(lockPath)) return;
             var records = GetProcessRecords();
-            // 快照为空（WMI 查询失败/被拦截）时**不能**把 Any()==false 当"没有残留进程"：
-            // 那会删掉一个可能仍被活着的引擎持有的锁——删锁正是本方法最不能犯的错
-            // （锁没了，并发写者就能同时进场）。宁可跳过：锁若真是孤儿，下次启动
-            // WMI 正常时仍会清掉；锁若被持有，跳过恰好避免一次真实的踩踏。
-            // 杀进程两条路径对空快照早已按异常处理并留痕（StopHarnessProcessesCore），
-            // 这里此前是唯一把空快照当"一切正常"的调用方。
+            // 快照为空（WMI 查询失败/被拦截）或**残缺**（枚举半途失败、个别行被丢弃）
+            // 时**不能**把 Any()==false 当"没有残留进程"：那会删掉一个可能仍被活着的
+            // 引擎持有的锁——删锁正是本方法最不能犯的错（锁没了，并发写者就能同时
+            // 进场）。宁可跳过：锁若真是孤儿，下次启动 WMI 正常时仍会清掉；锁若被
+            // 持有，跳过恰好避免一次真实的踩踏。杀进程两条路径对空/残缺快照早已
+            // 按异常处理并留痕（StopHarnessProcessesCore），这里此前是唯一把"空"
+            // 当"一切正常"的调用方——残缺更是连守卫都没有，半截快照直接流到了
+            // 下面的 File.Delete。
+            if (records is null)
+            {
+                AppendStartupLog("进程快照残缺（WMI 中途故障），跳过孤儿锁清理，避免误删仍被持有的锁。");
+                return;
+            }
             if (records.Count == 0)
             {
                 AppendStartupLog("进程快照为空（WMI 查询失败或被拦截），跳过孤儿锁清理，避免误删仍被持有的锁。");
@@ -685,7 +740,16 @@ internal sealed partial class HarnessForm : Form
                "或先执行 net stop winnat & net start winnat 释放。";
     }
 
-    private static (int Start, int Count)? dynamicPortRange;
+    /// <summary>
+    /// 动态端口范围查询结果。**引用类型 + Volatile**：(int,int)? 是 12 字节结构，
+    /// 跨线程裸读不保证原子——撕裂读会得到 HasValue=true 但 Start/Count 半新半旧
+    /// 的值（后果仅是提示文案算错范围，但同文件 line 345 一带刚为 8 字节 DateTime
+    /// 立了纪律，12 字节更不能裸奔）。比照 processRecordCache 的做法走
+    /// "引用类型快照 + Volatile"那一支：唯一写入点在闸内，读侧免锁。
+    /// </summary>
+    private sealed record DynamicPortRangeSnapshot(int Start, int Count);
+
+    private static DynamicPortRangeSnapshot? dynamicPortRange;
     private static bool dynamicPortRangeRead;
     private static DateTime dynamicPortRangeLastAttempt = DateTime.MinValue;
     private static readonly SemaphoreSlim dynamicPortRangeGate = new(1, 1);
@@ -694,16 +758,18 @@ internal sealed partial class HarnessForm : Form
     {
         // 失败 60 秒后重试：netsh 偶发失败（权限/服务未就绪）不该让之后所有端口
         // 报错都永久缺提示——与 localProxyOpen 的"失败 60 秒后重探"同一策略。
-        if (dynamicPortRangeRead && dynamicPortRange is not null) return dynamicPortRange;
-        if (dynamicPortRangeRead && dynamicPortRange is null &&
+        var cached = Volatile.Read(ref dynamicPortRange);
+        if (dynamicPortRangeRead && cached is not null) return (cached.Start, cached.Count);
+        if (dynamicPortRangeRead && cached is null &&
             DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
             return null;
         await dynamicPortRangeGate.WaitAsync();
         try
         {
             // 双检：等锁期间可能已有人查过了
-            if (dynamicPortRangeRead && dynamicPortRange is not null) return dynamicPortRange;
-            if (dynamicPortRangeRead && dynamicPortRange is null &&
+            cached = Volatile.Read(ref dynamicPortRange);
+            if (dynamicPortRangeRead && cached is not null) return (cached.Start, cached.Count);
+            if (dynamicPortRangeRead && cached is null &&
                 DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
                 return null;
             dynamicPortRangeRead = true;
@@ -724,8 +790,9 @@ internal sealed partial class HarnessForm : Form
                               out var start)) return null;
             if (!int.TryParse(countMatch.Groups[1].Success ? countMatch.Groups[1].Value : countMatch.Groups[2].Value,
                               out var count)) return null;
-            dynamicPortRange = (start, count);
-            return dynamicPortRange;
+            var range = new DynamicPortRangeSnapshot(start, count);
+            Volatile.Write(ref dynamicPortRange, range);
+            return (range.Start, range.Count);
         }
         finally { dynamicPortRangeGate.Release(); }
     }

@@ -358,7 +358,11 @@ public class RegressionGuardTests
     public void 脏输入一律拒绝(string candidate, string root) =>
         Assert.False(ConfigBackup.IsSafeRestoreTarget(candidate, root, _ => Plain));
 
-    // ---- EngineVersionsForm.FormatSize：小于 1 MB 不再显示 "0 MB" ------------
+    // ---- HumanSize.FormatSize：小于 1 MB 不再显示 "0 MB" ------------
+    //
+    // 注意引用的是 HumanSize（纯类型），**不是** EngineVersionsForm.FormatSize——
+    // 后者的类型初始化器会 new 三个 GDI+ Font，经由它调用纯函数会在无 GUI 的
+    // 机器上把整套测试拖进字体初始化（见 StaticCouplingTests 的声明）。
 
     [Theory]
     [InlineData(0L, "—")]                 // 统计失败
@@ -368,7 +372,7 @@ public class RegressionGuardTests
     [InlineData(1024L * 1024, "1 MB")]     // 满 1 MB 起才取整
     [InlineData(214L * 1024 * 1024, "214 MB")]
     public void 版本大小显示(long bytes, string expected) =>
-        Assert.Equal(expected, EngineVersionsForm.FormatSize(bytes));
+        Assert.Equal(expected, HumanSize.FormatSize(bytes));
 
     // ---- semver 地基：ParseVersion / CompareVersionStrings -------------------
     //

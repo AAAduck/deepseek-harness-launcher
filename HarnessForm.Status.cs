@@ -22,9 +22,10 @@ internal sealed partial class HarnessForm : Form
 
     // ---- 状态刷新 -----------------------------------------------------------
 
-    private async Task<string?> ResolveUsableUrlAsync()
+    private async Task<string?> ResolveUsableUrlAsync(CancellationToken ct)
     {
-        // 并发探测：两个候选最多 2 秒一起等（原来串行，最坏 4 秒界面假死）。
+        // 并发探测：两个候选最多 4 秒一起等（LocalHttp.Timeout 2 秒拿到响应头，
+        // ProbeBodyTimeout 预算罩住 body；原来串行，最坏 4 秒界面假死）。
         // 候选顺序即**优先级**：内存里的 authenticatedUrl 在前，文件里的在后。
         // ⚠ 这里曾写着"先到先得"，那是串行时代的说法，现在不成立——
         // 实际是 Task.WhenAll 之后按**候选数组顺序**取第一个探测成功的。
@@ -36,7 +37,7 @@ internal sealed partial class HarnessForm : Form
             .ToArray();
         if (candidates.Length == 0) return null;
 
-        var probeTasks = candidates.Select(async c => (url: c, ok: await ProbeUrlAsync(c!))).ToArray();
+        var probeTasks = candidates.Select(async c => (url: c, ok: await ProbeUrlAsync(c!, ct))).ToArray();
         var results = await Task.WhenAll(probeTasks);
         var winner = results.FirstOrDefault(r => r.ok).url;
         if (winner is null) return null;
@@ -75,19 +76,43 @@ internal sealed partial class HarnessForm : Form
         };
 
     /// <summary>
+    /// 探针的**总预算**（连接 + 响应头 + body 一并计）。<c>HttpClient.Timeout</c>
+    /// **不覆盖** ResponseHeadersRead 模式下 body 的读取——这是 .NET 的既定行为：
+    /// 超时 CTS 在 SendAsync 返回响应头后即失效，此后的 ReadAsync 完全不受约束。
+    /// 3080 上坐着一个"秒回头、慢慢滴漏 body"的不相干服务时（端口预检注释里的
+    /// 威胁模型），没有这个预算的探针会无限期挂着：状态轮询的 refreshing 恒为
+    /// true（状态灯与文案永久冻结），启动路径的探针又未必接收 startCts，
+    /// busy 解除不了、Esc 失效。响应头最多吃掉 LocalHttp.Timeout 的 2 秒，
+    /// body 至少还剩 2 秒；正常 DSH 的标记都在第一个 4 KB 缓冲里，远用不到。
+    /// </summary>
+    private static readonly TimeSpan ProbeBodyTimeout = TimeSpan.FromSeconds(4);
+
+    /// <summary>
+    /// 探针统一入口的预算封装：链入调用方的取消令牌（Esc/关窗能立即打断），
+    /// 再叠加 <see cref="ProbeBodyTimeout"/>。两个探针都必须走这里，不能各写各的。
+    /// </summary>
+    private static CancellationTokenSource ProbeBudget(CancellationToken ct)
+    {
+        var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(ProbeBodyTimeout);
+        return budget;
+    }
+
+    /// <summary>
     /// 复用路径的探针。<b>必须验身份，不能只看 200</b>：这是唯一会把 token 作为
     /// query 发出去的调用点，而 3080 是本机端口——开发服务器（本项目自己的 web
     /// profile 就跑在 Vite 上）对 <c>/?token=…</c> 回 200 是再正常不过的事。
     /// 只看状态码的后果是：浏览器被开到不相干的进程上、token 进了它的访问日志，
     /// 而界面显示"运行中"、启动前的端口预检也被绕过（见 <see cref="ProbeServerAsync"/>）。
     /// </summary>
-    private static async Task<bool> ProbeUrlAsync(string url)
+    private static async Task<bool> ProbeUrlAsync(string url, CancellationToken ct)
     {
         try
         {
-            using var response = await LocalHttp.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            using var budget = ProbeBudget(ct);
+            using var response = await LocalHttp.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, budget.Token);
             // 认证通过时引擎回 200 + SPA 首页，标记是标题那一行。
-            var spa = await BodyContainsAsync(response, SpaTitleMarker);
+            var spa = await BodyContainsAsync(response, SpaTitleMarker, budget.Token);
             return IsDshHandshake(response.StatusCode, authMarkerSeen: false, spa);
         }
         catch { return false; }
@@ -103,19 +128,20 @@ internal sealed partial class HarnessForm : Form
     /// 误判方向：宁可说"不是 DSH"（多一次重新拉起），也不要把浏览器和 token
     /// 送到不相干的服务上。
     /// </summary>
-    private static async Task<bool> ProbeServerAsync(int port)
+    private static async Task<bool> ProbeServerAsync(int port, CancellationToken ct)
     {
         try
         {
-            using var response = await LocalHttp.GetAsync($"http://127.0.0.1:{port}/", HttpCompletionOption.ResponseHeadersRead);
+            using var budget = ProbeBudget(ct);
+            using var response = await LocalHttp.GetAsync($"http://127.0.0.1:{port}/", HttpCompletionOption.ResponseHeadersRead, budget.Token);
             // 不带 token 时引擎回 401 + 那句提示；万一这条请求被认成了已认证（代理、
             // 未来版本的免登录开关），回的是 200 + SPA 首页——两条都验标记。
             // 分块读、命中即返回：RefreshStatusAsync 每 1.5 秒调一次本方法，
             // 正常场景第一个缓冲就够（那句话和那个 <title> 都在靠前的位置）。
             var auth = response.StatusCode == HttpStatusCode.Unauthorized
-                && await BodyContainsAsync(response, AuthRequiredMarker);
+                && await BodyContainsAsync(response, AuthRequiredMarker, budget.Token);
             var spa = response.StatusCode == HttpStatusCode.OK
-                && await BodyContainsAsync(response, SpaTitleMarker);
+                && await BodyContainsAsync(response, SpaTitleMarker, budget.Token);
             return IsDshHandshake(response.StatusCode, auth, spa);
         }
         catch { return false; }
@@ -125,9 +151,12 @@ internal sealed partial class HarnessForm : Form
     /// 响应 body 是否含指定子串：分块读、命中即返回。保留"尾部 = 子串长 - 1"的
     /// 滑动窗口，跨块边界的命中不会丢；body 异常长时内存也有界。
     /// </summary>
-    private static async Task<bool> BodyContainsAsync(HttpResponseMessage response, string needle)
+    private static async Task<bool> BodyContainsAsync(HttpResponseMessage response, string needle, CancellationToken ct)
     {
-        using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+        // token 一路带到 stream 与 ReadAsync：预算到点（或调用方取消）时读必须能断，
+        // 否则上面的预算只挡住了"拿响应头"，挡不住"读 body"——见 ProbeBodyTimeout。
+        // 注意 StreamReader 只在 Memory<char> 重载上接收 token（char[] 四参重载不存在）。
+        using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var reader = new StreamReader(stream, Encoding.UTF8);
         var buffer = new char[4096];
         var window = new StringBuilder(needle.Length * 2);
@@ -141,7 +170,7 @@ internal sealed partial class HarnessForm : Form
         // ConfigureAwait(false) 同样必要：它保证续延**不回到 UI 上下文**。
         // 只把 Read 换成 ReadAsync 而留着默认的上下文捕获，阻塞只是被挪到了下一帧，
         // UI 线程照样被占——那等于没修。
-        while ((read = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+        while ((read = await reader.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false)) > 0)
         {
             window.Append(buffer, 0, read);
             if (window.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -159,7 +188,7 @@ internal sealed partial class HarnessForm : Form
         refreshing = true;
         try
         {
-            var serverOn = await ProbeServerAsync(DefaultPort);
+            var serverOn = await ProbeServerAsync(DefaultPort, CancellationToken.None);
             var ownProcess = Volatile.Read(ref dshProcess);
             var ownOn = ownProcess is not null && !ProcessHasExited(ownProcess);
             isOn = serverOn || ownOn;

@@ -65,7 +65,7 @@ internal sealed partial class HarnessForm : Form
         {
             if (reuseExisting)
             {
-                var known = await ResolveUsableUrlAsync();
+                var known = await ResolveUsableUrlAsync(cts.Token);
                 if (cts.IsCancellationRequested) return;
                 if (known is not null)
                 {
@@ -219,8 +219,13 @@ internal sealed partial class HarnessForm : Form
             // 只 Cancel、不 Dispose——CTS 归创建它的操作（见 CancelPendingStart）。
             CancelPendingStart();
             await StopHarnessProcessesAsync();
-            authenticatedUrl = null;
-            TryDeleteUrlFile();
+            // 与停止本体（StopHarnessProcessesCore）同持 authUrlGate：清空/删除
+            // 必须与 tail 线程的写入互斥，否则"清完又被旧值写回"的窄缝始终敞着。
+            lock (authUrlGate)
+            {
+                authenticatedUrl = null;
+                TryDeleteUrlFile();
+            }
         }
         catch (Exception ex)
         {
@@ -285,7 +290,7 @@ internal sealed partial class HarnessForm : Form
         // 端口被别的程序占用时，node 只会报 EADDRINUSE 然后立刻退出，
         // 界面最终显示的是"立即退出（代码 1）"——同学完全无从判断。
         // 这里在启动前先说清楚（走到这一步，本启动器自己的实例已被停干净）。
-        if (await IsPortListeningAsync(DefaultPort, ct) && !await ProbeServerAsync(DefaultPort))
+        if (await IsPortListeningAsync(DefaultPort, ct) && !await ProbeServerAsync(DefaultPort, ct))
         {
             var hint = await DescribeDynamicPortRangeAsync(DefaultPort);
             throw new InvalidOperationException(
@@ -512,17 +517,32 @@ internal sealed partial class HarnessForm : Form
         // 那会把刚清掉的死 token 又写回去，重启等待循环随即在**新引擎起跑前**误判
         // "启动成功"。这正是 1.4.1 修过两次的"authenticatedUrl 复活"失效形状剩下的
         // 一条 check-then-act 缝：守卫在上游查过一次，不等于写进数据库的那一刻还成立。
+        //
+        // 核对与写入同持 authUrlGate 后，这条缝只剩"锁内核对通过"这一种通过方式：
+        // 停止路径的"退役 + 清字段 + 删文件"在另一侧持同一把锁——要么本写先完成
+        //（停止的清理随后覆盖它，终态正确），要么退役先发生（下面的核对失败，
+        // 不再写）。
+        // 同代只认**第一条**：引擎重启内部 web server、请求日志回显带 token 的完整
+        // URL、drain 阶段的尾行，都会再走一遍这里——每条都采纳等于每条都多开一个
+        // 浏览器标签，还可能拿一条过期/陌生 URL 顶掉对的（authenticatedUrl 与
+        // web-url.txt 都是"最后一次写赢"）。跨代不受影响：停止路径清空字段，
+        // 新引擎起跑后第一条照常捕获。
         if (!TailGenerationAlive(token, engineTailToken)) return;
-        authenticatedUrl = url;
-        lastPort = ExtractPort(url) ?? DefaultPort;
-
-        try
+        lock (authUrlGate)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(urlFile)!);
-            // DPAPI 加密落盘：token 只有当前 Windows 用户能解开，其他进程拿到文件也没用。
-            DpapiFile.WriteAllText(urlFile, url);
+            if (!TailGenerationAlive(token, engineTailToken)) return;
+            if (authenticatedUrl is not null) return;
+            authenticatedUrl = url;
+            lastPort = ExtractPort(url) ?? DefaultPort;
+
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(urlFile)!);
+                // DPAPI 加密落盘：token 只有当前 Windows 用户能解开，其他进程拿到文件也没用。
+                DpapiFile.WriteAllText(urlFile, url);
+            }
+            catch { }
         }
-        catch { }
 
         if (closing || IsDisposed) return;
         try

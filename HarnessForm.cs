@@ -301,6 +301,16 @@ internal sealed partial class HarnessForm : Form
     // 但本文件对 engineTailToken 的可见性用的是 Interlocked（语言规范保证，不靠
     // "x86 上恰好没出事"），这两个字段是同一并发形状，执行同一纪律。
     private volatile string? authenticatedUrl;
+    /// <summary>
+    /// 认证链接的写入互斥：tail 线程的写入（HandleProcessLine）与停止路径的
+    /// "退役 + 清字段 + 删文件"（StopHarnessProcessesCore、StopClickedAsync）必须
+    /// 同持这一把锁。否则 tail 通过代际核对后被 OS 挂起几秒、恢复后把刚删掉的
+    /// web-url.txt 重写成过期 token 的窄缝始终敞着——正是 HandleProcessLine 注释里
+    /// 自认的那条 check-then-act 缝。锁内最重的动作是一次 DPAPI 落盘（毫秒级），
+    /// UI 线程等它无感；与 migrateGate 不同，它只护这几个字段/文件，不串行化
+    /// 任何目录操作。
+    /// </summary>
+    private readonly object authUrlGate = new();
     private volatile bool isOn;
     private volatile bool busy;
     private volatile bool refreshing;

@@ -540,24 +540,37 @@ internal sealed partial class HarnessForm : Form
         // 留在 UI 线程上就是一次"未响应"幻窗——与 RunStartAsync 里那句纪律同源。
         // 与「切换版本」入口同一处置：engine.tmp 里若是**完整**引擎就挪进 broken- 槽保住，
         // 而不是直接删（它是"死在两次改名之间"的上一活动版本，可能是唯一副本）。
-        await Task.Run(PreserveOrDiscardStagedEngine, CancellationToken.None);
-        Directory.CreateDirectory(engineStageDir);
+        //
+        // staging 的清点、建目录、写 package.json **全程持 migrateGate**：后台「切换
+        // 版本」的持闸临界区会把旧活动引擎整体改名进 engine.tmp（此刻它是唯一副本），
+        // 这些写点若无闸，轻则把切换刚填进去的引擎挪进 broken- 槽（切换的告警指向
+        // 落空的位置），重则与之互踩出半截目录。npm 本体（可能跑几分钟）刻意放在
+        // 闸外：闸只保护目录级的原子操作，不值得把临界区拉长到分钟级；安装中途
+        // engine.tmp 被切换动过的残余，由替换前的持闸复查（expectedActiveVersion）兜住。
+        // 取消路径的清理（下方 OCE catch）同样持闸——理由见那里。
+        await migrateGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            await Task.Run(PreserveOrDiscardStagedEngine, CancellationToken.None);
+            Directory.CreateDirectory(engineStageDir);
 
-        // 预置最小 package.json：npm 在清单齐全的目录里会写 package-lock.json，
-        // 配合 --prefer-offline 命中本地 cacache，重装基本不重新下载。
-        // 这里写的 spec 就是最终 spec（调用方传精确版本号，不是 latest/caret），
-        // 再配合下面的 --save-exact，manifest 与 lock 才会真正一致 → 装出来的版本可复现。
-        // 用序列化器生成，不再手工拼 JSON 字符串。
-        File.WriteAllText(
-            Path.Combine(engineStageDir, "package.json"),
-            JsonSerializer.Serialize(new Dictionary<string, object>
-            {
-                ["name"] = "dsh-engine",
-                ["private"] = true,
-                ["version"] = "0.0.0",
-                ["dependencies"] = new Dictionary<string, string> { [EnginePackageName] = versionSpec },
-            }, new JsonSerializerOptions { WriteIndented = true }) + "\n",
-            new UTF8Encoding(false));
+            // 预置最小 package.json：npm 在清单齐全的目录里会写 package-lock.json，
+            // 配合 --prefer-offline 命中本地 cacache，重装基本不重新下载。
+            // 这里写的 spec 就是最终 spec（调用方传精确版本号，不是 latest/caret），
+            // 再配合下面的 --save-exact，manifest 与 lock 才会真正一致 → 装出来的版本可复现。
+            // 用序列化器生成，不再手工拼 JSON 字符串。
+            File.WriteAllText(
+                Path.Combine(engineStageDir, "package.json"),
+                JsonSerializer.Serialize(new Dictionary<string, object>
+                {
+                    ["name"] = "dsh-engine",
+                    ["private"] = true,
+                    ["version"] = "0.0.0",
+                    ["dependencies"] = new Dictionary<string, string> { [EnginePackageName] = versionSpec },
+                }, new JsonSerializerOptions { WriteIndented = true }) + "\n",
+                new UTF8Encoding(false));
+        }
+        finally { migrateGate.Release(); }
 
         // 闸门设在拼接点（GuardRegistryForCommandLine 的理由见那里）。
         registry = GuardRegistryForCommandLine(registry);
@@ -602,17 +615,23 @@ internal sealed partial class HarnessForm : Form
             });
 
             await proc.WaitForExitAsync(installCts.Token);
-            // ⚠ **必须再等一次且不给超时**，否则 RecentOutputSummary() 可能缺尾巴。
-            // OutputDataReceived / ErrorDataReceived 是**异步**投递的：进程一退出，
-            // 管道里剩下的那些行还排在线程池队列上没派发。WaitForExitAsync(token)
-            // 只保证"进程退了"，不保证"输出处理完了"——于是紧接着取摘要，
-            // 恰好在失败时最容易丢的 **npm error 那一行**往往不在里面：
-            // 用户看到的是"引擎安装失败（退出码 1）。最后输出：…"外加一段不完整的
-            // 上下文，而真正的报错在他看不到的地方。
-            // .NET 文档给的标准解法就是"退出了再无参等一次"（无参版会一直等到
-            // 异步读取真正结束）。这里它是安全的：进程已死，管道只会 EOF，
-            // 不存在"等不到"的情形。
-            await proc.WaitForExitAsync(CancellationToken.None);
+            // ⚠ 进程退出 ≠ 输出处理完：OutputDataReceived / ErrorDataReceived 是
+            // **异步**投递的，进程一退出，管道里剩下的行还排在线程池队列上没派发。
+            // 带不带 token 的 WaitForExitAsync 都**没有**"等异步输出处理完"的保证——
+            // 那是无参**同步** WaitForExit() 才有的文档语义。此前这里调的是
+            // WaitForExitAsync(None)，进程已死时立即返回已完成任务，等于没等，
+            // 于是下面三处 RecentOutputSummary() 恰好在失败时缺掉最关键的
+            // npm error 尾巴，用户拿到的是一段不完整的报错上下文。
+            // 改用同步 WaitForExit()（Task.Run 包住，不占 UI 线程），再配
+            // DrainTimeoutMs 兜底：孙进程若继承了管道写端且自己不退出，EOF 迟迟
+            // 不来，不能为它挂死升级流程——与 GetLatestEngineVersionAsync 已确立的
+            // 排干兜底同一条纪律。
+            var drained = Task.Run(() =>
+            {
+                try { proc.WaitForExit(); }
+                catch (Exception ex) { Swallow.Quiet(ex, "install-output-drain"); }
+            });
+            await Task.WhenAny(drained, Task.Delay(DrainTimeoutMs));
 
             if (proc.ExitCode != 0)
                 throw new InvalidOperationException(
@@ -717,7 +736,15 @@ internal sealed partial class HarnessForm : Form
             // 清理必须自带 catch：ForceDeleteDirectory 会把"目录被占用"包装成
             // InvalidOperationException 抛出来，让它顶掉本该上抛的 OperationCanceledException
             // ——用户点了取消，看到的却是"升级失败"，方向完全反了（见下面注释）。
+            //
+            // 删除本身**持 migrateGate**：后台「切换版本」的持闸临界区此刻可能正把
+            // 旧活动引擎（唯一副本）暂存在 engine.tmp 里等归档——无闸强删会把那份
+            // 唯一副本删掉，而切换随后的告警还在承诺"已原样保留在 engine.tmp"。
+            // 取闸用 None：OCE 不会在 651 的持闸 try 内产生（里面没有可取消的等待），
+            // 走到这里时闸要么从未被本方法持有、要么已由 finally 释放，不存在自等待。
+            await migrateGate.WaitAsync(CancellationToken.None);
             try { await Task.Run(() => ForceDeleteDirectory(engineStageDir)); } catch { }
+            finally { migrateGate.Release(); }
             throw;
         }
         finally

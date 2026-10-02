@@ -27,6 +27,19 @@ internal static class ConfigBackup
     /// </summary>
     private const int KeepSnapshots = 8;
 
+    /// <summary>撕裂快照目录（没有 backup-info.txt）的最长存活期，见 <see cref="PruneOldSnapshots"/>。</summary>
+    private static readonly TimeSpan TornSnapshotMaxAge = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// 快照的进程级互斥。三个调用点（启动前 / 升级前 / 恢复配置前的留底）各自包在
+    /// Task.Run 里、彼此无互斥，而目录名撞车只对"前一个目录已存在"的时序防得住
+    /// （<see cref="CreateSnapshotCore"/> 里的 for 序号岔开）：两个线程同一秒并发进入时，
+    /// 双方都能在对方 CreateDirectory 之前通过 Directory.Exists 检查——两份快照写进
+    /// 同一个目录，恢复方可能读到写一半的文件。函数体全程同步 IO，lock 就够；
+    /// 写快照的只有本进程，跨会话场景由单实例互斥兜住。
+    /// </summary>
+    private static readonly object SnapshotGate = new();
+
     /// <summary>
     /// 会被引擎例行改写、不该消耗快照名额的文件。
     ///
@@ -106,6 +119,11 @@ internal static class ConfigBackup
     /// 用户最新一次登录拿到的 token 会被旧快照覆盖——UI 承诺了
     /// "覆盖前我会先把当前状态另存一份"，这条路径不能例外。</param>
     internal static string? CreateSnapshot(string reason, bool force = false)
+    {
+        lock (SnapshotGate) return CreateSnapshotCore(reason, force);
+    }
+
+    private static string? CreateSnapshotCore(string reason, bool force)
     {
         try
         {
@@ -238,13 +256,19 @@ internal static class ConfigBackup
                     if (isCredential)
                     {
                         var plain = File.ReadAllText(src);
-                        if (plain.Trim().Length == 0) continue;
-                        // 源文件本身可能已是 dpapi 格式（用户手工放进去的旧版状态），
-                        // 那就原样搬，不做二次加密——DpapiFile.WriteAllText 期望的是明文。
-                        var alreadyEncrypted = DpapiFile.IsEncryptedFile(src);
-                        DpapiFile.WriteAllText(dst, plain);
-                        if (alreadyEncrypted != DpapiFile.IsEncryptedFile(dst))
-                            throw new InvalidOperationException("凭据快照加密失败（DPAPI 不可用），本次未备份该文件");
+                        if (plain.Trim().Length == 0)
+                        {
+                            // 空/全空白凭据不值得备份，但**必须从 hashes 里同时摘掉**：
+                            // 留着它，manifest 就永远缺这个键（copied 不含空文件），下一轮
+                            // NeedsSnapshot 按"键缺席"恒判要拍——每次启动都重拍一份、
+                            // 8 个名额被无差别轮换，而 failedCopies 里一个字都没有，
+                            // 谁也看不出为什么（本类的设计标准是失败"可见"而非静默）。
+                            // 摘掉之后两张表都不含它，判等自然通过；下轮凭据非空时键重新
+                            // 出现 → 按规则②老老实实拍一份。
+                            hashes.Remove(rel);
+                            continue;
+                        }
+                        CopyCredentialIntoSnapshot(plain, dst);
                     }
                     else
                     {
@@ -306,6 +330,27 @@ internal static class ConfigBackup
             return target;
         }
         catch (Exception ex) { Swallow.Quiet(ex, "config-snapshot"); return null; }
+    }
+
+    /// <summary>
+    /// 把凭据内容写进快照落点。唯一的死规矩：**落进快照的那份必须是密文**，否则抛
+    /// （异常由逐文件 catch 收进 failedCopies，宁可少备份一份凭据，也不在盘上摊明文）。
+    ///
+    /// 独立成 internal 是为了可单测：判定错了不报错，而"加密校验条件写反"正是这里
+    /// 出过的事故——此前写成与**源文件**状态比较（alreadyEncrypted != dst 是否密文），
+    /// 明文源 + DPAPI 正常时必然抛假异常（凭据从此进不了 manifest、快照每轮重拍），
+    /// DPAPI 真失效时反而放行明文入库，恰好把该挡的放走、把该过的拦下。
+    /// 无条件验"dst 是密文"，明文降级与写入失败两种情形一并挡住。
+    ///
+    /// 源文件本身可能已是 dpapi 格式（用户手工放进去的旧版状态）：WriteAllText 会把它
+    /// 再包一层密文，恢复时解开一层得到的正是原始 dpapi 串，写回 .credentials.yaml
+    /// 仍是合法密文——往返无损，不需要特判。
+    /// </summary>
+    internal static void CopyCredentialIntoSnapshot(string plainText, string dst)
+    {
+        DpapiFile.WriteAllText(dst, plainText);
+        if (!DpapiFile.IsEncryptedFile(dst))
+            throw new InvalidOperationException("凭据快照加密失败（DPAPI 不可用），本次未备份该文件");
     }
 
     /// <summary>
@@ -373,7 +418,22 @@ internal static class ConfigBackup
                 .Where(d => d.Name.Length >= 15 && d.Name[8] == '-')
                 .OrderByNewestFirst()
                 .ToList();
-            foreach (var old in dirs.Skip(KeepSnapshots))
+            // 保留名额只留给**完整**的快照（有 backup-info.txt）。LatestSnapshot 把
+            // 撕裂目录排除在可恢复集之外，这里若仍按名字形状计入名额，快照中途被强杀、
+            // backup-info 写失败留下的目录就会一次次挤掉最旧的**完整**快照——名义上
+            // "保留最近 8 份"，实际混着几份根本恢复不了的空壳。
+            var complete = new List<DirectoryInfo>(dirs.Count);
+            var torn = new List<DirectoryInfo>();
+            foreach (var d in dirs)
+            {
+                try
+                {
+                    if (File.Exists(Path.Combine(d.FullName, "backup-info.txt"))) complete.Add(d);
+                    else torn.Add(d);
+                }
+                catch { torn.Add(d); }
+            }
+            foreach (var old in complete.Skip(KeepSnapshots))
             {
                 try { old.Delete(recursive: true); }
                 catch (Exception ex)
@@ -383,6 +443,19 @@ internal static class ConfigBackup
                     // 纪律不能只落到外层。Swallow 的每小时节流天然防刷屏。
                     Swallow.Quiet(ex, "prune-snapshot");
                 }
+            }
+            // 撕裂目录不占名额，但也不能永久累积：满 TornSnapshotMaxAge 就清。
+            // 它们没有任何可恢复的内容（backup-info 都没写出来），留着只是让
+            // config-backups 越长越乱。
+            var cutoff = DateTime.UtcNow - TornSnapshotMaxAge;
+            foreach (var old in torn)
+            {
+                try
+                {
+                    if (old.CreationTimeUtc >= cutoff) continue;
+                    old.Delete(recursive: true);
+                }
+                catch (Exception ex) { Swallow.Quiet(ex, "prune-snapshot-torn"); }
             }
         }
         catch (Exception ex) { Swallow.Quiet(ex, "prune-snapshots"); }

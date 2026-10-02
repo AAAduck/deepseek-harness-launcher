@@ -218,10 +218,17 @@ internal sealed partial class HarnessForm : Form
             }
 
             // ⚠ 同 InstallEngineAsync：OutputDataReceived 是**异步**投递的，
-            // 进程一退出不等于管道里剩下的行已经派发完。少这一次"无超时再等一次"，
-            // 失败时展示给用户的输出摘要恰好会缺掉最关键的那几行 npm error，
-            // 而用户拿到的正是一段不完整的报错上下文。
-            await proc.WaitForExitAsync(CancellationToken.None);
+            // 进程一退出不等于管道里剩下的行已经派发完。此前写的"无超时再等一次"
+            // 调的是 WaitForExitAsync(None)——它**没有**"等异步输出处理完"的保证
+            //（那是无参同步 WaitForExit() 才有的文档语义），进程已死时立即返回
+            // 已完成任务，等于没等，失败摘要照样缺掉最关键的 npm error 尾巴。
+            // 改同步等（Task.Run 包住）+ DrainTimeoutMs 兜底，理由见 InstallEngineAsync。
+            var drained = Task.Run(() =>
+            {
+                try { proc.WaitForExit(); }
+                catch (Exception ex) { Swallow.Quiet(ex, "plugin-output-drain"); }
+            });
+            await Task.WhenAny(drained, Task.Delay(DrainTimeoutMs));
 
             if (proc.ExitCode == 0)
             {

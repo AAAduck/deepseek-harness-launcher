@@ -284,5 +284,7 @@ internal sealed partial class HarnessForm : Form
         try { return new Uri(url).Port; } catch { return null; }
     }
 
-    private sealed record ProcessRecord(int Id, int ParentId, string Name, string CommandLine, DateTime StartTime);
+    // internal：CollectProcessTreeIds（杀进程树的纯函数内核）吃它、单测要构造它
+    //（InternalsVisibleTo）。此前 private，那个内核就没法被钉住。
+    internal sealed record ProcessRecord(int Id, int ParentId, string Name, string CommandLine, DateTime StartTime);
 }
