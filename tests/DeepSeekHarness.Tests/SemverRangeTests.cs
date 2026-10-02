@@ -115,6 +115,11 @@ public class SemverRangeTests
     [InlineData("0.1.5", ">=0.2.0 || 0.1.5", true)]   // 第二个候选项满足 → 整条满足
     [InlineData("0.1.5", ">=0.2.0 || 0.3.0", false)]  // 全部候选项明确不满足
     [InlineData("0.1.5", ">=0.2.0 || *", null)]        // 有一个候选项判不出来 → 整体不猜
+    // —— 短路边界：第一个满足/第二个无法判定，与第一个无法判定/第二个满足 ——
+    // >=0.1.5 确实满足 0.1.5，所以返回 true（不是 null）——"无法判定"只在所有
+    // 候选项都判不出来时才整体返回 null。
+    [InlineData("0.1.5", ">=0.1.5 || *", true)]         // 左满足、右无法判定 → 左侧结果就是整条结果
+    [InlineData("0.1.5", "* || >=0.1.5", true)]          // 左无法判定、右满足 → 右侧结果就是整条结果
     public void 或组合(string candidate, string range, bool? expected)
     {
         Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));

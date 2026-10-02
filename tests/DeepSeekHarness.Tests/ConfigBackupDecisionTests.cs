@@ -125,6 +125,21 @@ public class ConfigBackupDecisionTests
     }
 
     [Theory]
+    // —— null/空串退化：守卫必须返回 false，不能抛 ——
+    // 调用方（Restore）传入 null 的路径段时，守卫若抛 ArgumentNullException，
+    // 会被外层 catch 吞成"读取快照目录失败"，把一条本该静默跳过的越界路径
+    // 变成整个恢复动作的报错中止——方向反了。
+    [InlineData(null, @"C:\Users\me\.dsh")]
+    [InlineData(@"C:\Users\me\.dsh\settings.yaml", null)]
+    [InlineData(null, null)]
+    [InlineData("", @"C:\Users\me\.dsh")]
+    [InlineData(@"C:\Users\me\.dsh\settings.yaml", "")]
+    public void 恢复路径守卫_null或空串一律拒绝(string? candidate, string? root)
+    {
+        Assert.False(ConfigBackup.IsWithinRoot(candidate!, root!));
+    }
+
+    [Theory]
     // —— 未展开的 ".." 必须在守卫内部被规范化掉 ——
     // 原实现只比"前缀 + 第 N 位是分隔符"，这三条全都会判成 true。当时没出事，
     // 纯粹因为 Restore 恰好在调用前做了 Path.GetFullPath；而本守卫的文档

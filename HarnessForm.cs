@@ -24,9 +24,24 @@ internal sealed class HarnessForm : Form
     private const int EngineInstallTimeoutSeconds = 900;
     private const int EngineQueryTimeoutSeconds = 60;
     private const int RecentOutputLines = 10;
-    private static readonly string LocalAppDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "DeepSeekHarness");
+    /// <summary>
+    /// LOCALAPPDATA 解析为空（受限账户/组策略）时得到的是**相对路径**——后续所有
+    /// Directory.CreateDirectory / File 操作会按当前工作目录解析，把引擎装到不明位置、
+    /// 快照也写到不明位置。构造阶段宁可直接报出"无法定位数据目录"，也不要静默落到 CWD。
+    /// </summary>
+    private static readonly string LocalAppDir = ResolveLocalAppDir();
+
+    private static string ResolveLocalAppDir()
+    {
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DeepSeekHarness");
+        if (!Path.IsPathFullyQualified(dir))
+            throw new InvalidOperationException(
+                "无法定位 %LOCALAPPDATA% 目录（系统返回了相对路径）。\n" +
+                "请检查当前用户的环境变量配置后重试。");
+        return dir;
+    }
     private static readonly string EnginePackageName = "@deepseek-ai/dsh";
     /// <summary>npm 官方源。用户改过 npm 配置时以用户配置为准（见 ResolveNpmRegistry）。</summary>
     private const string DefaultRegistry = "https://registry.npmjs.org/";
@@ -148,6 +163,9 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private static readonly string userHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
+    // UI 线程写（启动/停止路径）、tail 循环与 Exited 回调（线程池）读。
+    // 引用读写在所有平台上都是原子的，但可见性没有语言规范保证——与本文件对
+    // engineTailToken 的同一纪律：读侧一律走 Volatile.Read。
     private Process? dshProcess;
     private CancellationTokenSource? startCts;
     private readonly List<string> recentOutput = new();
@@ -205,14 +223,18 @@ internal sealed class HarnessForm : Form
     // 但本文件对 engineTailToken 的可见性用的是 Interlocked（语言规范保证，不靠
     // "x86 上恰好没出事"），这两个字段是同一并发形状，执行同一纪律。
     private volatile string? authenticatedUrl;
-    private bool isOn;
-    private bool busy;
-    private bool refreshing;
-    private bool closing;
+    private volatile bool isOn;
+    private volatile bool busy;
+    private volatile bool refreshing;
+    private volatile bool closing;
     // 与 authenticatedUrl 同点写入（tail 线程）、跨线程读；只用于界面展示
     // （状态文案与提示），不参与任何判定分支，int 原子读写即可。
     private int lastPort = DefaultPort;
-    private DateTime lastInstallInfoAt = DateTime.MinValue;
+    // 安装进度的 200ms 节流戳记：npm 的 stdout/stderr 各是一个线程池线程并发调用
+    // TrackInstallLine，"读-比较-写"无锁时两个线程会同时通过节流检查（后果只是多刷
+    // 一次界面，无害），但 x86 上 8 字节 DateTime 读不保证原子。存 UTC ticks 用
+    // Interlocked 读，与 engineTailToken 同一纪律（语言规范保证，不靠平台恰好没出事）。
+    private long lastInstallInfoAtTicks;
     private readonly CheckBox autoUpdateCheckbox = new();
     private readonly ToolTip tooltip = new();
     internal HarnessForm()
@@ -570,9 +592,24 @@ internal sealed class HarnessForm : Form
 
     private async Task StopClickedAsync()
     {
-        if (busy) return;
-        // 独立停止按钮已并入主按钮（随状态切换语义），停止动作的忙碌态显示在主按钮上。
-        EnterBusy(startButton, "停止中");
+        // busy 期间"停止"不再静默丢弃：启动/升级最长要几分钟，这段时间里按 Esc 或
+        // 主按钮没有任何反馈，用户只能等或强杀。busy 时先取消 CTS——StartHarnessAsync
+        // 在 process.Start() 前有 ThrowIfCancellationRequested；万一进程已拉起，
+        // 紧接着的 StopHarnessProcessesAsync 会在同一 UI 线程上把它杀掉（不存在
+        // 并发间隙，RunStartAsync 的 await 续延不可能插进来赋值新的 dshProcess）。
+        // EnterBusy/EndBusy 的所有权：非忙碌时本方法自己占忙碌态；忙碌时忙归
+        // RunStartAsync / RunEngineUpgradeAsync 所有，它们的 finally 会自行复位。
+        var ownsBusy = !busy;
+        if (ownsBusy)
+        {
+            // 独立停止按钮已并入主按钮（随状态切换语义），停止动作的忙碌态显示在主按钮上。
+            EnterBusy(startButton, "停止中");
+        }
+        else
+        {
+            CancelPendingStart();
+            SetInfo("正在取消当前操作并停止引擎…");
+        }
         try
         {
             CancelPendingStart();
@@ -586,7 +623,7 @@ internal sealed class HarnessForm : Form
         }
         finally
         {
-            EndBusy();
+            if (ownsBusy) EndBusy();
             if (!closing && !IsDisposed) await RefreshStatusAsync();
         }
     }
@@ -708,7 +745,9 @@ internal sealed class HarnessForm : Form
         process.Exited += (_, _) =>
         {
             if (closing || IsDisposed) return;
-            if (ReferenceEquals(dshProcess, process))
+            // 读侧必须走 Volatile.Read：Exited 回调在线程池线程上跑，而 dshProcess
+            // 由 UI 线程写（见字段注释的纪律）。
+            if (ReferenceEquals(Volatile.Read(ref dshProcess), process))
             {
                 try { BeginInvoke(UpdateButtons); } catch { }
             }
@@ -722,7 +761,7 @@ internal sealed class HarnessForm : Form
         ct.ThrowIfCancellationRequested();
 
         if (!process.Start()) throw new InvalidOperationException("无法启动 DSH 引擎。");
-        dshProcess = process;
+        Volatile.Write(ref dshProcess, process);
         // 文件 tail 替代原来的管道事件：认证链接捕获、进度行、recentOutput 摘要都走它。
         // 文件 tail 放到后台线程跑：循环体每 250ms 要开一次日志文件读增量，
         // 留在 UI 线程上时（async 方法沿 WinForms 上下文恢复）一次磁盘卡顿
@@ -989,17 +1028,21 @@ internal sealed class HarnessForm : Form
 
     private async Task<string?> ResolveUsableUrlAsync()
     {
-        var candidates = new[] { authenticatedUrl, TryReadUrlFile() };
-        foreach (var candidate in candidates.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            if (await ProbeUrlAsync(candidate!))
-            {
-                authenticatedUrl = candidate;
-                lastPort = ExtractPort(candidate!) ?? DefaultPort;
-                return candidate;
-            }
-        }
-        return null;
+        // 并发探测：两个候选最多 2 秒一起等（原来串行，最坏 4 秒界面假死）。
+        // 先到先得——内存里的 authenticatedUrl 多半已经死了，文件里的才是活的。
+        var candidates = new[] { authenticatedUrl, TryReadUrlFile() }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (candidates.Length == 0) return null;
+
+        var probeTasks = candidates.Select(async c => (url: c, ok: await ProbeUrlAsync(c!))).ToArray();
+        var results = await Task.WhenAll(probeTasks);
+        var winner = results.FirstOrDefault(r => r.ok).url;
+        if (winner is null) return null;
+        authenticatedUrl = winner;
+        lastPort = ExtractPort(winner) ?? DefaultPort;
+        return winner;
     }
 
     /// <summary>
@@ -1108,7 +1151,8 @@ internal sealed class HarnessForm : Form
         try
         {
             var serverOn = await ProbeServerAsync(DefaultPort);
-            var ownOn = dshProcess is not null && !ProcessHasExited(dshProcess);
+            var ownProcess = Volatile.Read(ref dshProcess);
+            var ownOn = ownProcess is not null && !ProcessHasExited(ownProcess);
             isOn = serverOn || ownOn;
             if (serverOn) lastPort = DefaultPort;
             if (busy) return;
@@ -1177,8 +1221,8 @@ internal sealed class HarnessForm : Form
         // dshProcess 的 Dispose/置 null 收回到 UI 续延上做（Core 里曾经顺手做了，
         // 但那是后台线程写 UI 所属字段）。杀干净后句柄上的进程必然已退出，
         // Dispose 只是释放内核句柄、无副作用，放这里与原先语义一致。
-        try { dshProcess?.Dispose(); } catch { }
-        dshProcess = null;
+        try { Volatile.Read(ref dshProcess)?.Dispose(); } catch { }
+        Volatile.Write(ref dshProcess, null);
         // 引擎没了，它的 tail 循环也必须在这一刻退役：否则旧循环的退场排空
         // （最多 4×150 ms）还能以当前代令牌通过逐行守卫，把刚删掉的 web-url.txt
         // 重写成过期 token、复活 authenticatedUrl。见 RetireEngineTail。
@@ -1205,7 +1249,7 @@ internal sealed class HarnessForm : Form
         if (records.Count == 0)
             AppendStartupLog("进程快照为空（WMI 查询失败或被拦截）：本轮只结束本启动器自己拉起的引擎进程树。");
 
-        var current = dshProcess;
+        var current = Volatile.Read(ref dshProcess);
         if (current is not null && !ProcessHasExited(current))
         {
             // **手里握着活句柄本身就是同一性证明**：这个 Process 对象是我们自己 Start
@@ -1264,15 +1308,16 @@ internal sealed class HarnessForm : Form
     /// </summary>
     private void StopEngineForExit()
     {
-        var ownEngine = dshProcess is not null;
+        var ownProcess = Volatile.Read(ref dshProcess);
+        var ownEngine = ownProcess is not null;
         try
         {
-            if (dshProcess is not null && !ProcessHasExited(dshProcess))
-                dshProcess.Kill(entireProcessTree: true);
+            if (ownProcess is not null && !ProcessHasExited(ownProcess))
+                ownProcess.Kill(entireProcessTree: true);
         }
         catch (Exception ex) { AppendStartupLog("退出时结束引擎失败：" + ex.Message); }
-        try { dshProcess?.Dispose(); } catch { }
-        dshProcess = null;
+        try { ownProcess?.Dispose(); } catch { }
+        Volatile.Write(ref dshProcess, null);
         // 退出路径同样要退役 tail 代际：HandleProcessLine 是在写入 authenticatedUrl
         // 与 web-url.txt **之后**才检查 closing 的，所以引擎临死前最后几行日志里的
         // token 行仍会被这条排空路径吃掉并落盘（下一双击时就是一条死链）。
@@ -1630,16 +1675,27 @@ internal sealed class HarnessForm : Form
 
     private static (int Start, int Count)? dynamicPortRange;
     private static bool dynamicPortRangeRead;
+    private static DateTime dynamicPortRangeLastAttempt = DateTime.MinValue;
     private static readonly SemaphoreSlim dynamicPortRangeGate = new(1, 1);
 
     private static async Task<(int Start, int Count)?> GetDynamicPortRangeAsync()
     {
-        if (dynamicPortRangeRead) return dynamicPortRange;
+        // 失败 60 秒后重试：netsh 偶发失败（权限/服务未就绪）不该让之后所有端口
+        // 报错都永久缺提示——与 localProxyOpen 的"失败 60 秒后重探"同一策略。
+        if (dynamicPortRangeRead && dynamicPortRange is not null) return dynamicPortRange;
+        if (dynamicPortRangeRead && dynamicPortRange is null &&
+            DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
+            return null;
         await dynamicPortRangeGate.WaitAsync();
         try
         {
-            if (dynamicPortRangeRead) return dynamicPortRange;   // 等锁期间已经有人查过了
-            dynamicPortRangeRead = true;                          // 只查一次，成功与否都不重试
+            // 双检：等锁期间可能已有人查过了
+            if (dynamicPortRangeRead && dynamicPortRange is not null) return dynamicPortRange;
+            if (dynamicPortRangeRead && dynamicPortRange is null &&
+                DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
+                return null;
+            dynamicPortRangeRead = true;
+            dynamicPortRangeLastAttempt = DateTime.UtcNow;
             var text = await RunCmdAsync(
                 "netsh int ipv4 show dynamicport tcp", TimeSpan.FromSeconds(2));
             if (text is null) return null;
@@ -2215,8 +2271,7 @@ internal sealed class HarnessForm : Form
                         if (active is not null && IsSafeVersionToken(active))
                             Directory.Move(engineStageDir, EngineSlotDirFor(active));
                         else if (Directory.Exists(engineStageDir))
-                            Directory.Move(engineStageDir,
-                                EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
+                            Directory.Move(engineStageDir, BrokenSlotDirFor());
                     }
                     catch (Exception ex)
                     {
@@ -2229,8 +2284,7 @@ internal sealed class HarnessForm : Form
                         {
                             if (Directory.Exists(engineStageDir))
                             {
-                                Directory.Move(engineStageDir,
-                                    EngineSlotDirFor("broken-" + DateTime.Now.ToString("yyyyMMdd-HHmmss")));
+                                Directory.Move(engineStageDir, BrokenSlotDirFor());
                                 saved = true;
                             }
                         }
@@ -2324,6 +2378,16 @@ internal sealed class HarnessForm : Form
     private const string EngineSlotPrefix = "engine.";
 
     private static string EngineSlotDirFor(string version) => Path.Combine(LocalAppDir, EngineSlotPrefix + version);
+
+    /// <summary>broken- 槽名加序号岔开：同一秒内两次归档失败会撞名，Directory.Move 抛 IOException。</summary>
+    private static string BrokenSlotDirFor()
+    {
+        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        var candidate = EngineSlotDirFor("broken-" + stamp);
+        for (var n = 2; Directory.Exists(candidate); n++)
+            candidate = EngineSlotDirFor($"broken-{stamp}-{n}");
+        return candidate;
+    }
 
     /// <summary>
     /// 版本号必须是一个纯粹的目录名片段：它会被拼成 <c>engine.&lt;版本&gt;</c>
@@ -2870,8 +2934,12 @@ internal sealed class HarnessForm : Form
             while (recentOutput.Count > RecentOutputLines) recentOutput.RemoveAt(0);
         }
         // npm --loglevel=http 每行都很密，节流到 200ms 一次，避免频繁跨线程刷新界面。
-        if ((DateTime.UtcNow - lastInstallInfoAt).TotalMilliseconds < 200) return;
-        lastInstallInfoAt = DateTime.UtcNow;
+        // stdout/stderr 两条线程并发到这一步：CompareExchange 保证只有真正更新了戳记的那条
+        // 线程会走到 SetInfo——两条同时通过节流检查、把界面连刷两次的情况被挡在门外。
+        var nowTicks = DateTime.UtcNow.Ticks;
+        var lastTicks = Interlocked.Read(ref lastInstallInfoAtTicks);
+        if (nowTicks - lastTicks < TimeSpan.FromMilliseconds(200).Ticks) return;
+        if (Interlocked.CompareExchange(ref lastInstallInfoAtTicks, nowTicks, lastTicks) != lastTicks) return;
         SetInfo(text.Length > 96 ? text[..96] + "…" : text);
     }
 
@@ -4600,7 +4668,8 @@ internal sealed class HarnessForm : Form
         // DPAPI 解密 + 旧版明文自动升级，全部封装在 DpapiFile.ReadAllText 里。
         var value = DpapiFile.ReadAllText(urlFile);
         if (string.IsNullOrWhiteSpace(value)) return null;
-        return AuthUrlRegex.IsMatch(value) ? AuthUrlRegex.Match(value).Value : null;
+        var match = AuthUrlRegex.Match(value);
+        return match.Success ? match.Value : null;
     }
 
     private void TryDeleteUrlFile()

@@ -1,5 +1,3 @@
-using System.Text;
-
 namespace DeepSeekHarness;
 
 /// <summary>
@@ -97,6 +95,7 @@ internal sealed class EngineVersionsForm : Form
         hint.Location = new Point(16, 126);
         hint.Size = new Size(528, 34);
         hint.ForeColor = Color.FromArgb(108, 114, 126);
+        hint.AutoEllipsis = true;
         Controls.Add(hint);
 
         activateButton = NewButton("切换到此版本", Color.FromArgb(34, 170, 85));
@@ -400,7 +399,10 @@ internal sealed class EngineVersionsForm : Form
     private async Task GuardedAsync(Func<Task> body)
     {
         try { await body(); }
-        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        // 关窗竞态的判据必须带 Gone：裸吞 InvalidOperationException 会把真实逻辑 bug
+        // （比如"在错误的线程上读控件"）也当成关窗竞态静默吞掉，与项目"坏了要报错"的
+        // 纪律相反。窗体没消失时的 InvalidOperationException 是代码错误，该报就得报。
+        catch (Exception ex) when (Gone && ex is ObjectDisposedException or InvalidOperationException)
         {
             // 关窗竞态：操作多半已经执行完，只是反馈没地方显示。正常路径，不打扰用户。
         }

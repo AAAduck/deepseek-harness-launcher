@@ -53,6 +53,10 @@ public class VersionTokenTests
         // 删掉它，测试立刻红，而"版本指定不合法"的报错文案仍然在说"不能含空白"。
         Assert.False(HarnessForm.IsSafeVersionToken("0.1.5 rc.2"));
         Assert.False(HarnessForm.IsSafeVersionToken("0.1.5\trc.2"));
+        // Unicode 空白同样拒绝：char.IsWhiteSpace 覆盖的不止 ASCII 空格，
+        // 全角空格/不换行空格拼进目录名同样会被 Windows 当非法字符处理。
+        Assert.False(HarnessForm.IsSafeVersionToken("0.1.5 rc.2"));  // U+00A0
+        Assert.False(HarnessForm.IsSafeVersionToken("0.1.5　rc.2"));  // U+3000 全角空格
     }
 
     [Fact]

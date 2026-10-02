@@ -37,7 +37,7 @@
 - **环境**：检测 Node / npm / pnpm / 引擎 / 插件兼容性 / 端口占用。报告只列结论与需要处理的问题；若已有配置快照，弹窗会问要不要从最近一份恢复——**默认按钮是「否」**（「是」会用快照覆盖当前配置，只在确实要回滚时点）。
   检测期间也占 busy：「启动/升级」变灰、Esc 不响应。理由见「已实现的增强」里「环境检测期间也占 busy」那条。
 
-键盘：**回车** = 启动/停止（随主按钮），**Esc** = 停止引擎（忙碌期间——启动/升级/环境检测——不响应，等本次操作收尾），**Tab** 可遍历所有控件。
+键盘：**回车** = 启动/停止（随主按钮），**Esc** = 停止引擎；启动/升级进行中点「停止」会先取消当前操作再杀引擎，不会静默吞掉。**Tab** 可遍历所有控件。
 
 ### 生命周期与单实例
 
@@ -170,6 +170,8 @@ tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些�
    Copy-Item D:\tmp\dsh-pub\out\DeepSeekHarness.exe "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe" -Force
    certutil -hashfile "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe" SHA256 | Select-Object -Skip 1 -First 1 | ForEach-Object { $_.Replace(' ','') } | Out-File "$env:LOCALAPPDATA\DeepSeekHarness\update-staging\DeepSeekHarness.exe.sha256" -Encoding ascii
    ```
+
+   `.sha256` 文件**请勿用记事本"UTF-8"格式保存**——那会引入 BOM（EF BB BF），脚本读取时会把 BOM 当十六进制字符，校验永远失败。用上面的 `-Encoding ascii` 命令生成即可。
 4. **双击 `更新启动器.bat`，按任意键**。脚本依次：按映像名强杀旧启动器（绝不碰 node）→
    覆盖 `bin\Release\net8.0-windows\win-x64\` 与脚本旁的桌面副本 → 启动新实例。
 5. **验收**：新窗口出现、浏览器自动接回 3080 正在跑的会话；点「环境」确认版本与状态。
@@ -418,7 +420,7 @@ tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些�
   只对配套测试工程开放几个 internal 纯函数；同时用 `DefaultItemExcludes` 把整个 `tests\`
   从默认通配里摘掉（只挡 `.cs` 的话，测试工程的 bin/obj 产物仍会被逐个求值，
   将来谁在 `tests\` 下放个 `.resx` 还会被编进启动器资源）。
-- `tests\DeepSeekHarness.Tests\`：xunit 单测（239 条）。刻意只覆盖"判错了不报错"的决策：
+- `tests\DeepSeekHarness.Tests\`：xunit 单测（248 条）。刻意只覆盖"判错了不报错"的决策：
   两条杀进程路径（点「停止」与关窗清扫）、PID 复用 StartTime 容差、端口收窄、快照判定、
   恢复路径守卫、版本号白名单、版本归档的规划顺序、semver 范围判定（含预发布门槛——
   caret/tilde 的基准三元组门槛与 1.4.3 补上的比较器集合级门槛、build 段连字符不是

@@ -115,6 +115,9 @@ internal sealed class FoldersForm : Form
         Controls.Add(refreshButton);
 
         CancelButton = closeButton;
+        // 「打开」是本窗的主操作，与「版本管理」的 AcceptButton = activateButton 同一条纪律：
+        // 键盘用户按回车应当触发最常用的动作，不是毫无反应。
+        AcceptButton = openButton;
 
         // 与"版本管理"同一套自适应：列表吃掉中间的剩余高度，提示与按钮锚在底部。
         // 只设 Anchor 不够——列表锚 Top 时拉高窗口它不动，按钮更是纵向写死。
@@ -263,15 +266,16 @@ internal sealed class FoldersForm : Form
     internal Control[] DumpControls() =>
         new Control[] { title, list, hint, openButton, copyButton, closeButton, refreshButton };
 
-    /// <summary>
-    /// 收集所有相关位置。只返回真实存在的，按"常用的排前面"排序。
-    /// 路径全部从环境变量推导，不写死任何机器专属位置。
-    /// </summary>
     /// <summary>「相关目录」里最多列出的会话项目目录数，超出部分只报个数。</summary>
     private const int MaxSessionProjects = 200;
 
     /// <summary>收集结果：条目 + 因超过上限而未列出的会话项目数。</summary>
     private readonly record struct CollectResult(List<Entry> Entries, int SessionOverflow);
+
+    /// <summary>
+    /// 收集所有相关位置。只返回真实存在的，按"常用的排前面"排序。
+    /// 路径全部从环境变量推导，不写死任何机器专属位置。
+    /// </summary>
 
     private static CollectResult Collect()
     {
@@ -312,18 +316,28 @@ internal sealed class FoldersForm : Form
         // 很久的账号能把这个"相关目录"窗口撑成上千行——而它的用途是挑几个位置跳过去，
         // 没人需要翻到第 800 个项目。超限时在提示行里说明总数。
         var overflow = 0;
-        try
+        var skipped = 0;
+        var sessions = Path.Combine(dshHome, "sessions");
+        if (Directory.Exists(sessions))
         {
-            var sessions = Path.Combine(dshHome, "sessions");
-            if (Directory.Exists(sessions))
+            List<string> projects;
+            try
             {
-                var projects = Directory.GetDirectories(sessions)
+                projects = Directory.GetDirectories(sessions)
                     .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
                     .ToList();
-                var shown = Math.Min(projects.Count, MaxSessionProjects);
-                for (var i = 0; i < shown; i++)
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 整个 sessions 目录读不到（被占用/权限被撤）：主列表照常显示。
+                return new CollectResult(candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList(), 0);
+            }
+            var shown = Math.Min(projects.Count, MaxSessionProjects);
+            for (var i = 0; i < shown; i++)
+            {
+                var dir = projects[i];
+                try
                 {
-                    var dir = projects[i];
                     var count = Directory.GetDirectories(dir).Length;
                     candidates.Add(new Entry(
                         "  └ " + Path.GetFileName(dir),
@@ -331,13 +345,14 @@ internal sealed class FoldersForm : Form
                         $"{count} 个会话",
                         false));
                 }
-                overflow = projects.Count - shown;
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // 单个项目目录读不到（权限/被占用），跳过但计数——
+                    // 原先整批丢弃且 overflow 丢失，用户看到"共 3 项"实际有 47 项。
+                    skipped++;
+                }
             }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // 只是部分会话子目录读不到（权限/被占用），主列表照常显示。
-            // 收窄异常类型：不该把 OutOfMemory 之类一并吞掉。
+            overflow = projects.Count - shown + skipped;
         }
 
         var visible = candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList();
@@ -518,7 +533,9 @@ internal sealed class FoldersForm : Form
         finally
         {
             copying = false;
-            if (!Gone) copyButton.Enabled = true;
+            // 与 ReloadAsync 的 SetBusy 并发：复制重试最长 600ms，与刷新窗口可重叠——
+            // 无条件下 enable 会在刷新中途把按钮复活，读到的是上一轮的陈旧 Tag。
+            if (!Gone && !busy) copyButton.Enabled = true;
         }
     }
 }

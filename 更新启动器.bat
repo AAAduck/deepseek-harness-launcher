@@ -59,7 +59,12 @@ if "!DO_SHA!"=="1" (
   set "COMPUTED="
   for /f "tokens=*" %%a in ('certutil -hashfile "!STAGED!" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
   set "COMPUTED=!COMPUTED: =!"
-  set /p EXPECTED=<"!SHA256FILE!"
+  rem .sha256 若用记事本以"UTF-8"保存会带 BOM（EF BB BF），"set /p" 会把这 3 字节
+  rem 读进 EXPECTED 开头，与纯十六进制的 COMPUTED 永不相等 → 校验永远失败且提示误导
+  rem （"文件可能已损坏"）。用 findstr 只认十六进制行读取，天然滤掉 BOM/空白/换行。
+  set "EXPECTED="
+  for /f "tokens=*" %%a in ('findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$" "!SHA256FILE!"') do set "EXPECTED=%%a"
+  set "EXPECTED=!EXPECTED: =!"
   if not defined COMPUTED (
     echo.
     echo ✗ 无法计算 staging 文件的 SHA256（certutil 失败）。
@@ -92,6 +97,7 @@ pause >nul
 rem 只按映像名杀启动器（taskkill 无法按登录会话过滤，可能命中其他会话的启动器实例；
 rem 强杀不走 FormClosing，所以对方的引擎与会话不受影响，重开窗口即可）。
 taskkill /im DeepSeekHarness.exe /f >nul 2>&1
+if errorlevel 1 echo （当前没有运行中的启动器，直接更新文件。）
 rem 等进程真的退出（最多 10 秒），比固定 timeout 2 稳——复制失败分支仍在兜底。
 set /a _w=0
 :poll_exit

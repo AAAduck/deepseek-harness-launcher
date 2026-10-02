@@ -35,6 +35,17 @@ public class LinkTargetTests
     }
 
     [Fact]
+    public void 越界相对路径_解析结果保留相对段_由调用方决定如何处置()
+    {
+        // link:../../evil 经 Path.Combine 后保留 ".."（ResolveLinkTarget 不做规范化），
+        // 由 Directory.Exists 在检查时按 OS 语义解析——这是 pnpm 的行为对齐。
+        // 这里钉住的是"解析结果确实包含 ../.. 段"这一事实：调用方若将来加了
+        // IsWithinRoot 守卫，这里需要同步更新；守卫缺失时调用方测试红，不是这里红。
+        var resolved = HarnessForm.ResolveLinkTarget(Profile, "../../evil");
+        Assert.Equal(Path.Combine(Profile, "../../evil"), resolved);
+    }
+
+    [Fact]
     public void 绝对目标_原样检查_不再二次拼接()
     {
         var absolute = @"D:\yule\work\DSH插件\dsh-free-search";

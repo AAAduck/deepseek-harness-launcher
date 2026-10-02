@@ -28,6 +28,10 @@ public class IsSafeNpmValueTests
     [InlineData("https://a b/")]           // 空格：把命令行拆成两个参数
     [InlineData("https://x/\t")]           // 制表符（char.IsWhiteSpace）
     [InlineData("https://x/\nhttps://y")]  // 换行：伪造第二条命令
+    // —— Unicode 空白：char.IsWhiteSpace 覆盖的不止 ASCII 空格，全角空格/不换行空格同样危险 ——
+    [InlineData("https://x/ ")]      // U+00A0 NO-BREAK SPACE
+    [InlineData("https://x/　")]      // U+3000 全角空格
+    [InlineData("https://x/ ")]      // U+2000 EN QUAD
     // —— cmd 元字符：引号外拼接时能改写命令结构 ——
     [InlineData("https://x/&calc")]        // 命令连接
     [InlineData("https://x/|calc")]        // 管道
