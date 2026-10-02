@@ -25,7 +25,11 @@ internal sealed partial class HarnessForm : Form
     private async Task<string?> ResolveUsableUrlAsync()
     {
         // 并发探测：两个候选最多 2 秒一起等（原来串行，最坏 4 秒界面假死）。
-        // 先到先得——内存里的 authenticatedUrl 多半已经死了，文件里的才是活的。
+        // 候选顺序即**优先级**：内存里的 authenticatedUrl 在前，文件里的在后。
+        // ⚠ 这里曾写着"先到先得"，那是串行时代的说法，现在不成立——
+        // 实际是 Task.WhenAll 之后按**候选数组顺序**取第一个探测成功的。
+        // 行为本身合理（WhenAll 保证不再多等），而按优先级取更稳：
+        // 两者同时可用时，内存里那个多半对应本会话，文件里那个可能是上一个会话的。
         var candidates = new[] { authenticatedUrl, TryReadUrlFile() }
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)

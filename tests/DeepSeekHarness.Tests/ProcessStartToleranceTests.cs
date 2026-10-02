@@ -71,11 +71,21 @@ public class ProcessStartToleranceTests
     [Fact]
     public void Kind不同的同一时刻_也判同()
     {
-        // WMI 转出来的 CreationDate 是 Utc Kind，Process.StartTime 是 Local Kind。
-        // DateTime 的 == 只比 Ticks 不比 Kind，容差比较用 Ticks 差同样不受影响；
-        // 钉住这一点，防止将来有人"好心"改成 Equals（那是比 Kind 的）。
-        var utc = DateTime.SpecifyKind(Base, DateTimeKind.Utc);
+        // ⚠ 注释曾把这里的前提写反过一次，现已按**实测**订正：
+        // WMI 侧 ManagementDateTimeConverter.ToDateTime 返回的是 **Kind=Unspecified**，
+        // 而且值是**本地挂钟时间**——DMTF 串尾部带 +480 这类本地偏移（实测本机样本：
+        // "20261002101841.683036+480" → Kind=Unspecified）。它不是 UTC。
+        // 另一侧 Process.StartTime 是 Kind=Local，值同样是本地挂钟时间。
+        // 所以两边 Ticks 可比，靠的是"都是本地挂钟"，**不是**"一边 UTC 一边 Local"。
+        //
+        // 这条订正有实际后果：哪天有人读到"WMI 是 UTC"的注释而"好心"加一句
+        // ToUniversalTime()，立刻会把所有 StartTime 比对推到差 8 小时的远端，
+        // 于是「停止」对每一个真正的目标都跳过——而且**静默**（判不等 = 跳过，
+        // 不报任何错）。钉住"Kind 不参与比较"本身，防止有人把容差改成 Equals。
+        var unspecified = DateTime.SpecifyKind(Base, DateTimeKind.Unspecified);
         var local = DateTime.SpecifyKind(Base, DateTimeKind.Local);
-        Assert.True(HarnessForm.IsSameProcessStart(utc, local));
+        Assert.True(HarnessForm.IsSameProcessStart(unspecified, local));
+        // 反向也成立，且容差判定用的是 Ticks 差而非时区换算。
+        Assert.True(HarnessForm.IsSameProcessStart(local, unspecified));
     }
 }

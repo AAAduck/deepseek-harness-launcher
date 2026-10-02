@@ -27,9 +27,20 @@ internal sealed partial class HarnessForm : Form
     /// <summary>
     /// LOCALAPPDATA 解析为空（受限账户/组策略）时得到的是**相对路径**——后续所有
     /// Directory.CreateDirectory / File 操作会按当前工作目录解析，把引擎装到不明位置、
-    /// 快照也写到不明位置。构造阶段宁可直接报出"无法定位数据目录"，也不要静默落到 CWD。
+    /// 快照也写到不明位置。宁可直接报出"无法定位数据目录"，也不要静默落到 CWD。
+    ///
+    /// ⚠ 刻意做成**惰性**的（原为 static readonly 字段，在类型初始化器里求值）。
+    /// 静态字段初始化器会在**任何**静态成员首次被访问时执行——哪怕那个成员只是
+    /// <c>HarnessForm.ParseVersion</c>这样一个纯字符串函数。于是整套单测都经这条路径
+    /// 连带初始化了数据目录解析与三个 GDI+ 字体（见下方三个 Font）：
+    /// 无 GUI 的 Windows Server Core / 容器 CI 上没有这些字体，也常常没有
+    /// LOCALAPPDATA，于是**与被测逻辑毫无关系**的一条 <c>TypeInitializationException</c>
+    /// 让整套测试全红。惰性化之后，只有真正碰文件系统/字体的代码路径才会付这个代价。
+    /// 抛异常的语义一字未变：只是从"类型首次加载时"推迟到"这条路径首次使用时"。
     /// </summary>
-    private static readonly string LocalAppDir = ResolveLocalAppDir();
+    private static string? localAppDirResolved;
+    private static string LocalAppDir =>
+        localAppDirResolved ??= ResolveLocalAppDir();
 
     private static string ResolveLocalAppDir()
     {
@@ -68,9 +79,20 @@ internal sealed partial class HarnessForm : Form
     // 各 new 了一份，同一个窗体里出现 7 个内容完全相同的 Font 对象；
     // 它们是实例字段，只能等窗体被 GC 才回收（本程序窗体活到进程结束，等于不回收）。
     // 静态共享把 7 份合成 3 份，且只分配一次。
-    private static readonly Font UiFont = new("Microsoft YaHei UI", 9f);
-    private static readonly Font BoldFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
-    private static readonly Font StatusFont = new("Microsoft YaHei UI", 14f, FontStyle.Bold);
+    //
+    // ⚠ 同样**惰性化**（原为 static readonly）：Font 构造要过 GDI+ 并按名解析字体，
+    // 无 GUI 的 Server Core / 容器 CI 上这一步会失败，而它由类型初始化器触发——
+    // 也就是任何一次 HarnessForm.X 的纯函数调用都会撞上。理由同 LocalAppDir。
+    // ??= 不是线程安全的，但 Font 构造幂等且句柄分配失败会抛而不是产生坏对象，
+    // 最坏情况是并发构造出两份——与原先"多 new 几份"的代价同量级。
+    private static Font? uiFontResolved;
+    private static Font UiFont => uiFontResolved ??= new("Microsoft YaHei UI", 9f);
+
+    private static Font? boldFontResolved;
+    private static Font BoldFont => boldFontResolved ??= new("Microsoft YaHei UI", 9f, FontStyle.Bold);
+
+    private static Font? statusFontResolved;
+    private static Font StatusFont => statusFontResolved ??= new("Microsoft YaHei UI", 14f, FontStyle.Bold);
     private static readonly Regex AuthUrlRegex = new(
         "https?://127\\.0\\.0\\.1:\\d+/\\?token=[^\\s\\\"'<>\\x1b]+",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -166,16 +188,23 @@ internal sealed partial class HarnessForm : Form
     /// 现在改为：装到固定目录 → 启动直接跑 bin.js（零网络、零重装、不查版本）；
     /// 升级只在你点「升级引擎」时发生，且先装到 engine.tmp，成功才替换正式目录。
     /// </summary>
-    private static readonly string engineDir = Path.Combine(LocalAppDir, "engine");
-    private static readonly string engineStageDir = Path.Combine(LocalAppDir, "engine.tmp");
-    private static readonly string engineOldDir = Path.Combine(LocalAppDir, "engine.old");
+    /// ⚠ 下面这些路径字段一律惰性求值（原为 static readonly）。它们全都链在
+    /// <see cref="LocalAppDir"/> 上，所以哪怕只把 LocalAppDir 惰性化、这几个仍是
+    /// static readonly，类型初始化器照样会顺带把它们算出来——惰性化就等于没做。
+    private static string? engineDirResolved;
+    private static string engineDir => engineDirResolved ??= Path.Combine(LocalAppDir, "engine");
+    private static string? engineStageDirResolved;
+    private static string engineStageDir => engineStageDirResolved ??= Path.Combine(LocalAppDir, "engine.tmp");
+    private static string? engineOldDirResolved;
+    private static string engineOldDir => engineOldDirResolved ??= Path.Combine(LocalAppDir, "engine.old");
     /// <summary>
     /// 归档认领的中转目录：engine.old 被某个进程原子改名到这里之后、归档成
     /// engine.&lt;版本&gt; 之前，它一直待在这里。存在即表示"这份数据已被认领"。
     /// 它不是新造的一种垃圾，而是 engine.old 本身——中途被杀留下的这一份，
     /// 下一轮启动会先把它收尾（见 MigrateEngineOldToSlot）。
     /// </summary>
-    private static readonly string engineMigratingDir = Path.Combine(LocalAppDir, "engine.migrating");
+    private static string? engineMigratingDirResolved;
+    private static string engineMigratingDir => engineMigratingDirResolved ??= Path.Combine(LocalAppDir, "engine.migrating");
     /// <summary>认领目录名的前缀：engine.migrating.&lt;8 位十六进制&gt;。见 ClaimMigratingDir。</summary>
     private const string EngineClaimPrefix = "engine.migrating.";
     /// <summary>
@@ -183,15 +212,18 @@ internal sealed partial class HarnessForm : Form
     /// "另一个执行者正拿着它"与"上次死在认领之后"。
     /// </summary>
     private static readonly TimeSpan ClaimStaleAfter = TimeSpan.FromMinutes(30);
+    private static string? webProfileDirResolved;
     /// <summary>web profile 目录。此前这个路径在多处各写了一遍，容易写歪，统一到这里。</summary>
-    private static readonly string webProfileDir = Path.Combine(
+    private static string webProfileDir => webProfileDirResolved ??= Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh", "profiles", "web");
     /// <summary>
     /// 当前用户主目录。宽松进程匹配（IsHarnessCommand）只认它之下的路径——
     /// 互斥体是 Local\（每登录会话一个），管不到别的会话，不加这道限定就会把
     /// 另一个会话里的引擎整树杀掉。
     /// </summary>
-    private static readonly string userHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    private static string? userHomeDirResolved;
+    private static string userHomeDir =>
+        userHomeDirResolved ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     // UI 线程写（启动/停止路径）、tail 循环与 Exited 回调（线程池）读。
     // 引用读写在所有平台上都是原子的，但可见性没有语言规范保证——与本文件对
@@ -220,7 +252,8 @@ internal sealed partial class HarnessForm : Form
     // 现在引擎经 cmd 把 stdout/stderr 重定向进 engine-stdio.log，本进程按增量
     // tail 读文件复现代替管道事件。效果：引擎不再随启动器陪葬——更新/崩溃后
     // 新实例探到 web-url.txt 仍可用就直接复用还在跑的引擎，Web 会话零打断。
-    private static readonly string engineStdioLog = Path.Combine(LocalAppDir, "engine-stdio.log");
+    private static string? engineStdioLogResolved;
+    private static string engineStdioLog => engineStdioLogResolved ??= Path.Combine(LocalAppDir, "engine-stdio.log");
     /// <summary>
     /// tail 游标（字节偏移 + UTF8 解码器 + 半行尾巴）。刻意是**引用类型并整体替换**：
     /// 新引擎起跑时 UI 线程直接 new 一个新的换上（volatile 写），旧循环在入口捕获的

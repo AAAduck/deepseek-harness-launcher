@@ -479,6 +479,40 @@ tail 循环凭什么判定自己还是当前代。UI 与 IO 不测——那些�
   测试，而那条命令行**同时含两者**——把两条排除整行删掉，套件照样全绿。这违反
   套件自述的"删掉任何排除项必须红"。现在各补一条只含其中一项的用例，
   并加了反向钉住（去掉该标识后**必须命中**，否则说明那条是靠别的排除项蒙对的）。
+- **测试套件不再被 UI 静态状态绑架**（M-4）：`HarnessForm` 的类型初始化器里原本有
+  三个 `Font` 构造（要过 GDI+）与 `LOCALAPPDATA` 解析（可能抛）。而类型初始化器会在
+  **任何**静态成员首次被访问时执行——哪怕那个成员只是 `ParseVersion` 这样一个纯字符串
+  函数。于是无 GUI 的 Windows Server Core / 容器 CI 上，整套测试会被一条**与被测逻辑
+  毫无关系**的 `TypeInitializationException` 炸成全红。现在 `LocalAppDir`、三个字体、
+  以及链在 `LocalAppDir` 上的五个路径字段全部改成惰性属性；抛异常的语义一字未变，
+  只是从"类型首次加载时"推迟到"这条路径首次使用时"。新增 `StaticCouplingTests`
+  断言这些名字**不再是静态字段**（已反向验证：把 `UiFont` 改回 `static readonly`
+  恰好 1 条转红）。
+- **`InvariantGlobalization`**：整套套件的存活不该取决于测试机上装了什么语言包。
+  .NET 默认启用 ICU，而 ICU 的解析按当前 culture——区域设置成了测试结果的输入。
+- **WMI `CreationDate` 注释订正（实测）**：它**不是 UTC**。`ManagementDateTimeConverter
+  .ToDateTime` 返回 `Kind=Unspecified` 的**本地挂钟时间**（DMTF 串尾部带 `+480`
+  这类本地偏移，本机实测样本 `"20261002101841.683036+480"`），另一侧
+  `Process.StartTime` 是 `Kind=Local`——两边 Ticks 可比靠的是"都是本地挂钟"。
+  原注释写成"Utc Kind"是错的，而按它去"修正"的人会补一句 `ToUniversalTime()`，
+  那会把差值推到 8 小时量级，让**每一个**真正目标的 StartTime 比对都失败——
+  「停止」静默空转。两处注释已订正，并补了反向用例。
+- **npm/pnpm 的输出排干**：`OutputDataReceived` 是**异步**投递的，进程退出不等于管道里
+  剩下的行已经派发完。此前在 `WaitForExitAsync(token)` 之后立刻取摘要，失败时最容易丢的
+  **npm error 那一行**往往不在里面——用户拿到的是一段不完整的报错上下文。
+  两处（安装引擎、更新插件）都补了"退出了再无超时等一次"。
+  （审查原报告把它指在 `GetLatestEngineVersionAsync`，那里用的是 `ReadToEndAsync`
+  且**本就**在读 ExitCode 前显式排干过——前提不对，竞态实际在另外两处。）
+- **升级 warning 路径不再谎称"完全成功"**：旧版本归档失败而挪进 `broken-` 槽时，
+  此前直接 `return null`，用户看到的是"切换完成"，而「版本管理」里那个他记得的旧版本
+  条目不见了、取而代之的是一个看着像垃圾的名字——真相只在 startup-log 的一行里。
+  现在返回带警告前缀的文案并报出**真实落点**（`BrokenSlotDirFor()` 带时间戳，
+  必须在 Move 前取一次复用，否则提示里会指向另一个不存在的目录）。
+- **「目录」窗口两处纪律对齐**：空路径护栏从 `IsNullOrWhiteSpace` 改成
+  `IsPathFullyQualified`（与 LocalAppDir / ConfigBackup / 孤儿锁三处统一；且它是唯一一处
+  还要拿结果去**开文件**的）；打开前临用前复核存在性——`/select` 分支的
+  `Process.Start` 只要 explorer 起来就返回成功，路径没了会静默打开空窗口，
+  而目录分支会抛、用户看得到报错，两个分支的反馈此前完全不对称。
 - **配置恢复如实报告部分失败**：`ConfigBackup.Restore` 现在返回 `RestoreResult`
   （成功数 + 失败清单）。此前逐文件 `catch { }` 吞掉异常、只把成功数带回去，于是
   "引擎正在运行、正占着这些文件"这个**最常见**的失败场景走的恰恰是成功分支：
@@ -672,7 +706,7 @@ partial 之间共享全部字段与成员，行为完全不变。
   只对配套测试工程开放几个 internal 纯函数；同时用 `DefaultItemExcludes` 把整个 `tests\`
   从默认通配里摘掉（只挡 `.cs` 的话，测试工程的 bin/obj 产物仍会被逐个求值，
   将来谁在 `tests\` 下放个 `.resx` 还会被编进启动器资源）。
-- `tests\DeepSeekHarness.Tests\`：xunit 单测（412 条）。刻意只覆盖"判错了不报错"的决策：
+- `tests\DeepSeekHarness.Tests\`：xunit 单测（425 条）。刻意只覆盖"判错了不报错"的决策：
   两条杀进程路径（点「停止」与关窗清扫）、**两条排除项各自独立钉住**（`app.asar` 与
   `dsh-desktop-host` 此前共用一条测试、删掉任一条都全绿）、PID 复用 StartTime 容差、
   端口收窄、引擎包目录精确匹配**早于**端口收窄这条既定语义的显式钉住、用户目录
@@ -693,6 +727,11 @@ partial 之间共享全部字段与成员，行为完全不变。
   引擎换代 tail 游标的起点钳制（1.4.1，防"重启回放旧 token 行"）、tail 代际令牌退役后的
   守卫是否仍拦得住旧循环、版本槽名白名单对认领副本 `engine.migrating.<8 位十六进制>`
   的排除。
+- `StaticCouplingTests`：断言 `HarnessForm` 的三个字体与八个数据目录路径**不再是静态字段**。
+  这类断言看着别扭——`TypeInitializationException` 有什么可测的？但它是整套套件能不能在
+  无 GUI 机器上跑的前提（见上「测试套件不再被 UI 静态状态绑架」），不是"某输入该得某输出"，
+  只能用反射直接断言类型形状。已反向验证：把 `UiFont` 改回 `static readonly`，
+  恰好 1 条转红。
   这几处的共同点是错了不会有任何报错，只在用户眼前发生——所以必须有测试钉住。
   几条用例是**专门为了让别的用例变红**而存在的，例如端口收窄那条：把它整行删掉，
   必须有用例失败，否则说明它压根没被测住。

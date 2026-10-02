@@ -281,8 +281,12 @@ internal sealed partial class HarnessForm : Form
         total = widths.Sum() + gap * (buttons.Count - 1);
 
         var x = Math.Max(4, (ClientSize.Width - total) / 2);
-        // 贴底留 12px；不设下限——下限会把行推出客户区（自检抓到过"排到 194 而只高 188"）。
-        // 高度不够是窗体尺寸的问题，已经由下面的 MinimumSize 用窗口尺寸正确表达。
+        // 贴底留 12px。⚠ 下一行的 Math.Max(120, …) 与上面这句注释**长期不一致**：
+        // 注释说"不设下限"，代码却有个 120 的下限。实害为零——MinimumSize 保证了
+        // 客户区不可能低到 120 之下，于是那个下限**永远不生效**，两句话描述的是同一件事。
+        // 但注释与代码对不上本身就是债：下一个人照注释去"修"这个 Math.Max，
+        // 就会在一个它根本没触发的分支上动手。留着 Math.Max（它是无害的冗余保险），
+        // 把注释改成与代码一致。
         var rowY = Math.Max(120, ClientSize.Height - rowHeight - 12);
 
         for (var i = 0; i < buttons.Count; i++)
@@ -492,9 +496,15 @@ internal sealed partial class HarnessForm : Form
                         try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
                         throw;
                     }
-                    // 原活动版本搬到它的版本槽；这步失败就把新版本退回去，不留下"没有引擎"的状态。
-                    // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在 engine.tmp
-                    // 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，至少位置可见、可管理。
+                    // 原活动版本搬到它的版本槽。
+                    // ⚠ 此处曾写着"这步失败就把新版本退回去"，那是**过期**的说法：
+                    // 真实行为是挪进 broken-<时间戳> 槽，或（连它也失败时）原样保留
+                    // 在 engine.tmp 里并把位置报给用户。原因是 1.4.3 修 H-2 时改的——
+                    // 那时发现"归档失败就删掉 engine.tmp"会删掉唯一的回退副本。
+                    // 现在的语义见下面 catch 里那两条分支，不要按旧注释理解。
+                    // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在
+                    // engine.tmp 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，
+                    // 至少位置可见、可管理。
                     // active 同样来自 package.json（可能被篡改/损坏），拼进槽目录名前必须过
                     // IsSafeVersionToken（与 ArchiveClaimedDir 同一道闸）；不合法时走 broken- 槽
                     // ——槽名由本程序生成、不含外部输入，这份旧版本仍然可见、可管理。
@@ -520,17 +530,34 @@ internal sealed partial class HarnessForm : Form
                         // 切换前的活动引擎，删掉等于丢掉唯一的回退副本（新版本顶上后，
                         // 用户想退回就只能重下 214 MB）。至少挪到 broken- 槽，位置可见、可管理。
                         var saved = false;
+                        var brokenDir = (string?)null;
                         try
                         {
                             if (Directory.Exists(engineStageDir))
                             {
-                                Directory.Move(engineStageDir, BrokenSlotDirFor());
+                                brokenDir = BrokenSlotDirFor();   // 取一次，落点与提示共用
+                                Directory.Move(engineStageDir, brokenDir);
                                 saved = true;
                             }
                         }
                         catch { }
                         // 已在后台线程，不再需要 Task.Run（锁内也不允许 await）。
-                        if (saved) return null;
+                        //
+                        // ⚠ 此前这里 `if (saved) return null;`——直接报"完全成功"。
+                        // 但旧版本此刻**没有**进它该进的 engine.<版本> 槽，而是被挪进了
+                        // 一个叫 broken-<时间戳> 的槽。用户看到的是"切换完成"，而
+                        // 「版本管理」里那个他记得的旧版本条目不见了、取而代之的是一个
+                        // 看着像垃圾的名字——真实情况只有 startup-log 里有一行。
+                        // 切换本身确实成功了（新版本已顶上），所以用带警告前缀的返回值，
+                        // 而不是谎称失败让用户去重试一次已经成功的操作。
+                        //
+                        // broken 槽名**必须在 Move 之前取一次并复用**：BrokenSlotDirFor
+                        // 带时间戳且会为同秒冲突加序号，消息里再调一次得到的是**另一个**
+                        // 目录——报出来的位置根本不存在，用户照着找会扑空。
+                        if (saved) return ActivateSwitchedWithWarningPrefix +
+                            $"，但旧版本（{active}）没能归档进它自己的版本槽，" +
+                            $"已挪到「版本管理」里可管理的备用槽：\n{brokenDir}\n\n" +
+                            "旧版本没有丢，可以用它回退；如果你不打算回退，下次安装引擎时会一并清理。";
                         // 两个归档落点都失败：**绝不能删**。此前这里的兜底是
                         // ForceDeleteDirectory(engineStageDir)——删掉的恰恰是切换前的
                         // 完整引擎（新版本此刻已顶上成功），等于把唯一回退副本丢掉。

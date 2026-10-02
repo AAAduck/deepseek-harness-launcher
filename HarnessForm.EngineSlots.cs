@@ -602,6 +602,17 @@ internal sealed partial class HarnessForm : Form
             });
 
             await proc.WaitForExitAsync(installCts.Token);
+            // ⚠ **必须再等一次且不给超时**，否则 RecentOutputSummary() 可能缺尾巴。
+            // OutputDataReceived / ErrorDataReceived 是**异步**投递的：进程一退出，
+            // 管道里剩下的那些行还排在线程池队列上没派发。WaitForExitAsync(token)
+            // 只保证"进程退了"，不保证"输出处理完了"——于是紧接着取摘要，
+            // 恰好在失败时最容易丢的 **npm error 那一行**往往不在里面：
+            // 用户看到的是"引擎安装失败（退出码 1）。最后输出：…"外加一段不完整的
+            // 上下文，而真正的报错在他看不到的地方。
+            // .NET 文档给的标准解法就是"退出了再无参等一次"（无参版会一直等到
+            // 异步读取真正结束）。这里它是安全的：进程已死，管道只会 EOF，
+            // 不存在"等不到"的情形。
+            await proc.WaitForExitAsync(CancellationToken.None);
 
             if (proc.ExitCode != 0)
                 throw new InvalidOperationException(

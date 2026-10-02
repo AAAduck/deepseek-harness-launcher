@@ -329,7 +329,15 @@ internal sealed class FoldersForm : Form
         // 某些受限账户下这两个可能返回空串，而 Path.Combine("", ".dsh") == ".dsh"
         // 是个**相对路径**——后面的 Exists 会按当前工作目录解析，可能误命中，
         // 并把一个相对路径显示甚至打开给用户。宁可少列几项。
-        if (string.IsNullOrWhiteSpace(appData) || string.IsNullOrWhiteSpace(userProfile))
+        //
+        // 判据与全项目其余三处统一：LocalAppDir（解析不到直接 throw）、
+        // ConfigBackup.CreateSnapshot、ClearOrphanProfileLock 都用
+        // **IsPathFullyQualified**。此前这里只判 IsNullOrWhiteSpace，是三处口径里
+        // 唯一的例外——而它恰恰是唯一一处**还要拿结果去开文件**的：
+        // "C:foo"（带盘符但被组策略改成相对形式）在 IsNullOrWhiteSpace 眼里完全正常，
+        // 却被 Path.Combine 与 Exists 按工作目录解析。三个判定是叠在一起的，
+        // 不是三选一。
+        if (!Path.IsPathFullyQualified(appData) || !Path.IsPathFullyQualified(userProfile))
             return new CollectResult(new List<Entry>(), 0, 0);
 
         var appDir = Path.Combine(appData, "DeepSeekHarness");
@@ -551,6 +559,21 @@ internal sealed class FoldersForm : Form
         if (sel is null) return;
         try
         {
+            // **临用前复核存在性**。两个分支的反馈此前完全不对称：
+            // 目录分支用 UseShellExecute=true，路径没了会抛，于是用户看到报错；
+            // 而 /select 分支的 Process.Start 只要 explorer.exe 起来了就返回成功——
+            // 路径此刻不存在的话，资源管理器会静默打开一个错的/空的窗口，
+            // 用户只看到"什么都没发生"。列表是**若干秒前**枚举的，而这两个窗口
+            // 之间引擎正在装/删/profile 正在重建，条目消失并不罕见。
+            // 与 ConfigBackup 的"闸门设在真正动用的那一刻"同一纪律。
+            if (!File.Exists(sel.Path) && !Directory.Exists(sel.Path))
+            {
+                MessageBox.Show(this,
+                    $"它已经不在了：\n{sel.Path}\n\n" +
+                    "多半是刚刚被引擎安装或插件更新清理掉了。点「刷新」重新列出即可。",
+                    "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
             if (sel.IsFile)
             {
                 // 文件用"在资源管理器中选中"而不是"用默认程序打开"：

@@ -224,6 +224,11 @@ internal sealed partial class HarnessForm : Form
     /// StartTime ≥ WMI）。严格相等会把"同一个进程"判成"PID 被复用了"，
     /// 于是杀进程循环对真正的目标也跳过——「停止」大概率空转且不报错。
     ///
+    /// ⚠ 两个读数都是**本地挂钟时间**（WMI 侧 Kind=Unspecified 且值带本地偏移，
+    /// Process 侧 Kind=Local），比的是 Ticks 差、**不涉及时区**。别给 WMI 那一侧
+    /// 补 ToUniversalTime()——那会把差值推到 8 小时量级，本函数对每个真正的目标都
+    /// 返回 false，「停止」静默空转。
+    ///
     /// 容差选 1ms：比最大读数差（0.9 µs）大三个数量级，足以吸收任何精度损失；
     /// 而 PID 复用后新进程的创建时间必然与旧读数相差秒级以上（复用前提是旧句柄
     /// 全部关闭、旧进程已完全退出），1ms 与之相比可忽略——防护语义不变。
@@ -384,7 +389,14 @@ internal sealed partial class HarnessForm : Form
                         var id = Convert.ToInt32(item["ProcessId"]);
                         var parent = Convert.ToInt32(item["ParentProcessId"]);
                         // PID 复用防护：StartTime 用于在 Kill 前比对——PID 被系统复用时 StartTime 必然不同。
-                        // WMI 的 CreationDate 是 FILETIME（UTC），转成 DateTime 供后续比较。
+                        // ⚠ CreationDate **不是 UTC**：ManagementDateTimeConverter.ToDateTime
+                        // 返回 Kind=Unspecified 的**本地挂钟时间**（DMTF 串尾部带 +480
+                        // 这类本地偏移，本机实测样本 "20261002101841.683036+480"）。
+                        // 另一侧 Process.StartTime 是 Kind=Local 的本地挂钟时间——
+                        // 两边 Ticks 可比靠的是"都是本地挂钟"。
+                        // 所以这里**绝对不能**补一句 ToUniversalTime()：那会把它推到
+                        // 差 8 小时的远端，于是 IsSameProcessStart 对每一个真正的目标
+                        // 都返回 false →「停止」静默空转。
                         var startTime = item["CreationDate"] is string creationStr
                             ? ManagementDateTimeConverter.ToDateTime(creationStr)
                             : DateTime.MinValue;

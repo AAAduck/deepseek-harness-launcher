@@ -217,6 +217,12 @@ internal sealed partial class HarnessForm : Form
                 return;
             }
 
+            // ⚠ 同 InstallEngineAsync：OutputDataReceived 是**异步**投递的，
+            // 进程一退出不等于管道里剩下的行已经派发完。少这一次"无超时再等一次"，
+            // 失败时展示给用户的输出摘要恰好会缺掉最关键的那几行 npm error，
+            // 而用户拿到的正是一段不完整的报错上下文。
+            await proc.WaitForExitAsync(CancellationToken.None);
+
             if (proc.ExitCode == 0)
             {
                 succeeded = true;

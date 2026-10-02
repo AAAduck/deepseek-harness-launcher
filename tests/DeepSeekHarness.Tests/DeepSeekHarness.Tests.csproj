@@ -22,6 +22,17 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
     <RootNamespace>DeepSeekHarness.Tests</RootNamespace>
+    <!-- 整套套件的存活不该取决于测试机上装了什么语言包。
+         .NET 默认启用 ICU，而 ICU 的数字解析**按当前 culture**：
+         在把小数点读成逗号的区域设置下，HarnessForm.ParseVersion("1.2.3") 里
+         int.TryParse 之外的路径、以及任何把 "1,5" 当 1.5 解析的地方，都会给出
+         与开发者机器不同的结果——同一份代码在 CI 上与本地结论相反，
+         而且往往复现不出来。
+         切到 Invariant 后，所有格式化/解析走不变 culture，
+         区域设置不再是测试结果的输入。这正是纯判定型单测要的前提。
+         ⚠ 这**不**让 int.TryParse 变得文化无关——它一直只认不变形式，
+         真正被治住的是那些会随区域设置改变的比较与格式化。 -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
