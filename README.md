@@ -97,11 +97,13 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
 
 ### 给使用者：怎么装
 
-把新的 `DeepSeekHarness.exe` **放到脚本旁边的 `out\` 目录**，然后双击 `更新启动器-更新到<版本>.bat` 就行。不想挪文件的话，**把 exe 直接拖到脚本上**也一样。
+**publish 完直接双击 `更新启动器-更新到<版本>.bat` 就行**，不用挪文件。
 
-脚本会先读一遍 exe 自己的版本号（右键→属性 里显示的那个），确认确实是要装的这一版，然后覆盖并启动新版本。**不会**动你的引擎。
+脚本会自己按这个顺序找新 exe：拖到脚本上的 → `bin\Release\...\publish\`（`dotnet publish` 的默认落点）→ 脚本旁的 `out\` → `新版本\` → 带版本号的文件名 → 上级 `out\` → 旧的 `update-staging\`。
 
-出错时窗口会停住等你按任意键，并告诉你出了什么事、该做什么。
+然后它会读一遍 exe 自己的版本号（右键→属性 里显示的那个），确认确实是要装的这一版再覆盖——**不会**动你的引擎。
+
+出错时窗口会停住等你按任意键，并告诉你出了什么事、该做什么。最常见的一种是版本对不上（多半是某个目录里躺着旧版的 exe），它会把实际的版本号报出来。
 
 ### 给维护者：出新版时
 
@@ -116,13 +118,15 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
 
    csproj 的 `VerifyManifestAssemblyVersion` 目标在 `PrepareForBuild` 之前会：拿 `<Version>` 去清单里找 `assemblyIdentity version="<版本>.0"`；确认新名脚本存在且旧名 `更新启动器.bat` 已消失；读一遍脚本内容确认有 `set "TARGET_VERSION=<版本>"`。任何一条不满足就 `Error`。
 
-2. **发布**（旧启动器在跑，用独立输出目录绕开 `bin\` 锁）：
+2. **发布**：
 
    ```powershell
-   dotnet publish DeepSeekHarness.csproj -c Release -p:OutDir=D:\tmp\dsh-pub\bin\ -o D:\tmp\dsh-pub\out
+   dotnet publish DeepSeekHarness.csproj -c Release
    ```
 
-3. **把 `D:\tmp\dsh-pub\out\DeepSeekHarness.exe` 放到脚本旁边的 `out\` 目录**（或出问题时改用拖放）。
+   产物落在 `bin\Release\net8.0-windows\win-x64\publish\` —— 这正是脚本第二个查找的位置，所以**下一步什么都不用做**。旧启动器在跑时这个路径会被锁（报 MSB3027），那时改用独立输出目录并把 exe 挪进脚本旁的 `out\`。
+
+3. **双击 `更新启动器-更新到<版本>.bat`**，然后就是等它自己跑完。
 
    > ⚠ 这个 `.bat` 是 **GBK 存的，不是 UTF-8**。cmd.exe 在中文 Windows 上按系统
    > ANSI/OEM 代码页（936）解析批处理，用 UTF-8 存会让**每一行**都解析错乱：
@@ -130,9 +134,7 @@ Node 查找顺序：PATH → exe 同级的 `node\` → `%ProgramFiles%\nodejs` �
    > `'锘緻cho' 不是内部或外部命令`）。改编码会直接让脚本不能运行——编辑器里
    > 另存为时选「简体中文(GBK)」，换行符 CRLF，不要加 BOM。
 
-4. **双击 `更新启动器-更新到<版本>.bat`**。
-
-5. **验收**：新窗口出现、浏览器自动接回 3080 正在跑的会话；点「环境」确认版本与状态。
+4. **验收**：新窗口出现、浏览器自动接回 3080 正在跑的会话；点「环境」确认版本与状态。
 
 `.sha256` 可选：exe 旁边放同名文件就校验，没放就跳过。要生成的话用
 `certutil -hashfile <exe> SHA256 | Select-Object -Skip 1 -First 1 | ForEach-Object { $_.Replace(' ','') } | Out-File <exe>.sha256 -Encoding ascii`

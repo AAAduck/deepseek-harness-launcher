@@ -14,11 +14,15 @@ set "TARGET_VERSION=1.4.3"
 rem ── 找新 exe ──────────────────────────────────────────────────────────────
 rem 依次尝试，用第一个找到的：
 rem   1) 第一个命令行参数 ——把 exe 直接拖到本脚本上（最省事，也最不容易装错）
-rem   2) 脚本旁 out\  ——与发布输出的同名目录
-rem   3) 脚本旁 新版本\
-rem   4) 脚本旁 DeepSeekHarness-<版本>.exe ——与旧 exe 同名会撞车，所以带版本号
-rem   5) 上级 out\
-rem   6) update-staging\（旧流程，保留是为了不打断已经在用的人）
+rem   2) 脚本旁 bin\Release\...\publish\  ——**本工程 dotnet publish 的默认落点**。
+rem      把它排在第二位，是为了让"publish 完直接双击"成立，而不用再手工挪一份。
+rem      ※ 与脚本的**目标**（...\win-x64\DeepSeekHarness.exe）差一层 publish\，
+rem      是两个不同的目录，不会出现"拿自己盖自己"。
+rem   3) 脚本旁 out\
+rem   4) 脚本旁 新版本\
+rem   5) 脚本旁 DeepSeekHarness-<版本>.exe ——与旧 exe 同名会撞车，所以带版本号
+rem   6) 上级 out\
+rem   7) update-staging\（旧流程，保留是为了不打断已经在用的人）
 rem
 rem ※ **脚本所在目录下的 DeepSeekHarness.exe 绝不作为候选**：那是本脚本的
 rem **目标**（脚本自己就要覆盖它）。把它当来源 = 拿旧版盖旧版，然后报"更新成功"。
@@ -27,6 +31,7 @@ rem 全部判断都在顶层、不在任何 (...) 块里，因此普通 %VAR% 展开就够用——
 rem 块内 %VAR% 会在块执行前一次性展开成空串，是 cmd 最经典的一类坑（见下方校验块）。
 set "SRC="
 if not "%~1"=="" if exist "%~1" set "SRC=%~1"
+if not defined SRC if exist "%ROOT%bin\Release\net8.0-windows\win-x64\publish\DeepSeekHarness.exe" set "SRC=%ROOT%bin\Release\net8.0-windows\win-x64\publish\DeepSeekHarness.exe"
 if not defined SRC if exist "%ROOT%out\DeepSeekHarness.exe" set "SRC=%ROOT%out\DeepSeekHarness.exe"
 if not defined SRC if exist "%ROOT%新版本\DeepSeekHarness.exe" set "SRC=%ROOT%新版本\DeepSeekHarness.exe"
 if not defined SRC if exist "%ROOT%DeepSeekHarness-%TARGET_VERSION%.exe" set "SRC=%ROOT%DeepSeekHarness-%TARGET_VERSION%.exe"
