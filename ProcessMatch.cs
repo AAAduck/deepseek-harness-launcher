@@ -76,22 +76,19 @@ internal static class ProcessMatch
         var c = commandLine;
 
         // —— 绝不能杀的目标：DSH 桌面客户端（Electron）自己的引擎宿主 ——
-        // 客户端不是 node.exe，而是用它自己的可执行文件跑宿主：
-        //   "…\DeepSeek Harness.exe" --expose-internals
-        //   …\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js
-        // 这条命令行里同时含 `app.asar\dsh` 和 `\dsh\`+空白+web，会被下面的宽泛正则
-        // 误判成"残留的 dsh web 进程"，然后整树杀掉——而宿主下挂着客户端的 renderer，
-        // 于是用户正开着的客户端直接白屏崩溃（实测复现：crash-*-renderer.log 两份）。
+        // 客户端宿主形如 "…\DeepSeek Harness.exe" --expose-internals
+        //   …\resources\app.asar\dsh\…，其命令行同时含 `app.asar\dsh` 和
+        // `\dsh\`+空白+web，宽泛正则会把它误判成残留 dsh web 进程并整树杀掉，
+        // 用户正开着的客户端直接白屏崩溃（时间线见 DESIGN-NOTES.md §3）。
         // 启动器只需要管自己拉起的引擎，客户端的引擎归客户端管。
         if (c.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
         if (c.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
         if (c.Contains("dsh-subprocess", StringComparison.OrdinalIgnoreCase)) return false;
 
         // 进程形态收窄：引擎及其包装层只可能是 node / cmd / npx（两条杀进程路径
-        // 共用同一判定）。编辑器、资源管理器等任何其他进程名直接出局——无论命令行
-        // 长什么样。此前这道收窄只挡在宽松匹配前面，"引擎目录精确匹配"对任意进程名
-        // 生效：一个以引擎目录下文件为参数的无关进程（编辑器打开了 bin.js）会被
-        // 整树杀掉——匹配必须同时核对进程类型与实际引擎入口，不能仅凭目录子串。
+        // 共用同一判定）。编辑器、资源管理器等任何其他进程名直接出局——匹配必须
+        // 同时核对进程类型与实际引擎入口，不能仅凭目录子串（否则编辑器打开了
+        // bin.js 也会被整树杀掉）。
         if (!IsEngineProcessShape(name)) return false;
 
         // 本启动器自己拉起的引擎：命令行里带着**引擎内的 dsh 包目录**——比"引擎
@@ -102,31 +99,16 @@ internal static class ProcessMatch
         // 宽松匹配只对 node / npx / cmd 生效，进程形态已由 IsEngineProcessShape
         // 统一收窄（此前这里各算一份 isNode/isNpx，两边迟早漂移）。
 
-        // 宽松匹配只认**本用户**的残留：另一个登录会话里的引擎 / npx 缓存命令行
-        // 同样含 @deepseek-ai/dsh，不加这道限定会把别人会话的进程整树杀掉
-        // （互斥体是 Local\ 每会话一个，管不到别的会话）。一切用户态路径
-        // （LOCALAPPDATA、.dsh、npm 全局目录）都在 %USERPROFILE% 之下。
-        // 误杀别人进程的代价远大于漏杀一个残留——真残留占着端口有启动前报错兜底。
+        // 宽松匹配只认**本用户**的残留（互斥体是 Local\ 每会话一个，管不到别的
+        // 会话；不加限定会把别人会话的进程整树杀掉）。误杀别人进程的代价远大于
+        // 漏杀一个残留——真残留占着端口有启动前报错兜底。
         //
-        // **这道收窄必须待在这里、不能提到函数开头**。上面那条引擎包目录精确匹配
-        // 不需要 userHomeDir：命令行里带着本启动器的引擎内 dsh 包目录，本身就是
-        // 确定性的证据。
-        // 要是把"userHomeDir 为空就返回 false"提到最前面，在 USERPROFILE 缺失 /
-        // 用户配置文件 hive 未加载 / 受限容器这类机器上（本项目自己的文档就说
-        // GetFolderPath 无法确定时返回空串），就变成**连自己的引擎都杀不掉**：
-        // 残留引擎占住端口、孤儿 node_modules.lock 永远清不掉。
-        //
-        // 空串这里也必须拒：原来的写法是 `userHomeDir.Length > 0 && !c.Contains(...)`，
-        // 空串时这道收窄被**跳过**，恰好把"归属不清就不动手"的既定语义反转成
-        // "放行所有用户"——那正是本函数最不能犯的错。
-        //
-        // 段级比较而不是子串：c.Contains(userHomeDir) 只判"用户目录这段文字出现过"。
-        // C:\Users\Dan 是 C:\Users\Daniel 的**前缀**，Contains 照样通过——同机同时存在
-        // Daniel 与 Dan 两个账户时，Daniel 会话的引擎/npx 残留会被判成本启动器的残留，
-        // 而这一分支连端口都不用匹配（见上），于是直接整树杀掉。以管理员运行时
-        // （UAC 提升后 USERPROFILE 可能指向别的账户）更糟：一整棵别的用户的进程树被清。
-        // ClearOrphanProfileLock 借用的也是这个判定，于是同样会永久拒绝对**活锁**动手。
-        // 拼音用户名前缀极常见（li / liwei、zhang / zhangsan），这不是边缘情形。
+        // **这道收窄必须待在这里、不能提到函数开头**：引擎包目录精确匹配不需要
+        // userHomeDir（命令行带着自己的引擎目录本身就是确定性证据），而把
+        // "userHomeDir 为空就返回 false"提前会让 USERPROFILE 缺失的机器连自己的
+        // 引擎都杀不掉。空串也必须拒——放行空串等于把"归属不清就不动手"反转成
+        // "放行所有用户"。段级比较而不是子串（Dan/Daniel 前缀事故见
+        // DESIGN-NOTES.md §3；拼音用户名前缀极常见，不是边缘情形）。
         if (string.IsNullOrEmpty(userHomeDir) ||
             !ContainsPathSegment(c, userHomeDir)) return false;
 
@@ -134,14 +116,9 @@ internal static class ProcessMatch
             c.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase)) return true;
 
         // 两条宽松正则只为兜早期 npx / dsh.cmd 时代留下的残留。再收窄一道：
-        // 命令行里必须出现**恰好等于**本启动器端口的独立数字 token，否则一个碰巧
-        // 提到 "dsh" 的 node/cmd 进程也会被整树杀掉——误杀别人进程的代价远大于漏杀
-        // 一个残留（真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
-        //
-        // 这里必须是 token 级匹配而不是子串匹配：子串写法（c.Contains("3080")）会把
-        // "--port 30801" 也算命中——用户在 %USERPROFILE% 下自己装一份 dsh 跑在 30801
-        // 是很正常的形态（路径无空格 → 命令行不加引号 → 宽泛正则照样命中），
-        // 结果就是点一次「停止」把用户自己的进程整树杀掉。这是真实的误杀面。
+        // 命令行里必须出现**恰好等于**本启动器端口的独立数字 token——子串写法会把
+        // "--port 30801" 算命中，用户自己跑在 30801 的 dsh 会被一次「停止」整树杀掉
+        // （真实的误杀面，见 DESIGN-NOTES.md §3）。
         if (!MentionsLauncherPort(c, port)) return false;
 
         return DshCommandRegex.IsMatch(c) || NpxDshCommandRegex.IsMatch(c);
@@ -212,13 +189,10 @@ internal static class ProcessMatch
     /// "杀哪些进程"是本项目最贵的判断（会崩掉用户正在用的桌面客户端），
     /// 而它错了不报错，必须被单测钉住。
     ///
-    /// **边也要防伪**：Windows 会把已退出进程的 PID 复用给引擎——孤儿进程的
-    /// ParentId 于是指向引擎的 PID，快照里它看起来就像引擎的子进程。此前对边不做
-    /// 任何校验，撞上就把**无关进程连同它的整棵子树**误杀（对每个受害者还开
-    /// entireProcessTree）。真实子进程必然**晚于**父进程创建，所以创建时间不晚于
-    /// 父进程的一律不收编；CreationDate 缺失（MinValue）的没有对照依据，同样不收编。
-    /// 代价只是漏收一个"父 PID 恰好撞上复用"的残留——与本文件"宁可漏掉一个残留，
-    /// 也不能误杀同 PID 的新进程"的信条同向。
+    /// **边也要防伪**：已退出进程的 PID 被复用后，孤儿进程的 ParentId 指向引擎，
+    /// 不校验创建时间就会把无关进程连同整棵子树误杀。真实子进程必然**晚于**父进程
+    /// 创建，创建时间不晚于父进程的一律不收编；CreationDate 缺失（MinValue）的没有
+    /// 对照依据，同样不收编——代价只是漏收一个残留，与"宁可漏杀"的信条同向。
     /// </summary>
     internal static HashSet<int> CollectProcessTreeIds(
         IReadOnlyCollection<int> seeds, IReadOnlyDictionary<int, ProcessRecord> records)
@@ -241,22 +215,14 @@ internal static class ProcessMatch
     /// 两个"进程创建时间"读数是否指向同一个进程的启动。纯函数、可单测——
     /// 它守着两条杀进程路径（「停止」与关窗清扫），判错了不会报错。
     ///
-    /// 为什么必须带容差而不是严格相等：两个读数的精度不同——
-    /// WMI 的 Win32_Process.CreationDate 是 DMTF 微秒精度（6 位小数），
-    /// 而 Process.StartTime 是 100ns 精度（FILETIME 原值）。同一个进程的
-    /// 两个读数因此恒差 0–0.9 µs（实测本机 21 个进程样本里仅 3 个严格相等，
-    /// 新起 5 个 cmd.exe 仅 1 个命中；差值全落在 0.1–0.9 µs、方向恒为
-    /// StartTime ≥ WMI）。严格相等会把"同一个进程"判成"PID 被复用了"，
-    /// 于是杀进程循环对真正的目标也跳过——「停止」大概率空转且不报错。
+    /// 为什么必须带容差而不是严格相等：两个读数精度不同（WMI 微秒 vs Process
+    /// 100ns），同一个进程的两次读数恒差 0–0.9 µs——严格相等会把"同一个进程"
+    /// 判成"PID 被复用"，「停止」大概率空转且不报错（时间线见 DESIGN-NOTES.md §3）。
     ///
-    /// ⚠ 两个读数都是**本地挂钟时间**（WMI 侧 Kind=Unspecified 且值带本地偏移，
-    /// Process 侧 Kind=Local），比的是 Ticks 差、**不涉及时区**。别给 WMI 那一侧
-    /// 补 ToUniversalTime()——那会把差值推到 8 小时量级，本函数对每个真正的目标都
-    /// 返回 false，「停止」静默空转。
-    ///
-    /// 容差选 1ms：比最大读数差（0.9 µs）大三个数量级，足以吸收任何精度损失；
-    /// 而 PID 复用后新进程的创建时间必然与旧读数相差秒级以上（复用前提是旧句柄
-    /// 全部关闭、旧进程已完全退出），1ms 与之相比可忽略——防护语义不变。
+    /// ⚠ 两个读数都是**本地挂钟时间**，比的是 Ticks 差、不涉及时区。别给 WMI 那侧
+    /// 补 ToUniversalTime()——差值会变 8 小时量级，对每个真正的目标都返回 false。
+    /// 容差 1ms：比最大读数差大三个数量级；PID 复用后新进程的创建时间必然相差
+    /// 秒级以上，防护语义不变。
     /// </summary>
     internal static bool IsSameProcessStart(DateTime a, DateTime b) =>
         Math.Abs((a - b).Ticks) <= TimeSpan.TicksPerMillisecond;
@@ -335,8 +301,7 @@ internal static class ProcessMatch
         if (commandLine.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
         if (commandLine.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
         // 双重核对：进程形态（node/cmd/npx）+ 命令行里带引擎内的 dsh 包目录。
-        // 此前只认"命令行含引擎目录"的目录子串——编辑器以引擎目录下的文件为参数
-        // 时同样命中，关窗清扫会把它整树带走。
+        // 只认目录子串的话，编辑器以引擎目录下文件为参数同样命中、会被整树带走。
         if (!IsEngineProcessShape(name)) return false;
         return commandLine.Contains(EnginePackageDirUnder(engineDir), StringComparison.OrdinalIgnoreCase);
     }

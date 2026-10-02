@@ -40,8 +40,7 @@ internal static class Semver
         var nums = new int[4];
         for (var i = 0; i < parts.Length; i++)
             if (!int.TryParse(parts[i], out nums[i])) return null;
-        // 第四段以**输入**有没有为准。此前误写成 nums.Length（恒为 4，条件永真）——
-        // 结果恰好正确（三段输入时 nums[3] 默认 0），但那是靠数组默认值兜底，不是判断本身对。
+        // 第四段以**输入**有没有为准（nums.Length 恒为 4，不能用它判断）。
         return new Version(nums[0], nums[1], nums[2], parts.Length > 3 ? nums[3] : 0);
     }
 
@@ -69,10 +68,8 @@ internal static class Semver
         var vb = ParseVersion(b);
         if (va is null || vb is null) return null;
 
-        // 先比数字段。只有数字段完全相同、才需要看预发布标识——
-        // semver 里预发布只影响"数字段相同"时的排序（0.1.5-rc.2 < 0.1.7-rc.1 就是因为 5 < 7，
-        // 与 rc 无关）。之前把预发布比较写成了无条件分支，导致只要两边预发布标识不同
-        // 就返回"无法判定"，于是 >=0.1.7-rc.1 这类判断全部落空、兼容性检查会漏报。
+        // 先比数字段，数字段相同才看预发布标识：0.1.5-rc.2 < 0.1.7-rc.1 靠的是 5 < 7，
+        // 与 rc 无关。预发布只影响"数字段相同"时的排序。
         var core = va.CompareTo(vb);
         if (core != 0) return Math.Sign(core);
 
@@ -92,8 +89,8 @@ internal static class Semver
     /// "&gt;=0.1.7-rc.1"、"^4.0.1"、"~1.2.3"、裸版本号（= 精确匹配，同 npm 语义）、"A || B"。
     /// 三态返回：true 满足 / false 明确不满足 / null 无法判定。
     ///
-    /// 这里必须把"明确不满足"和"无法判定"分开：之前只要有一个 token 判定不出来
-    /// 就整体返回 null，导致"已知不兼容"被降级成"未知"，护栏会漏报。
+    /// 这里必须把"明确不满足"和"无法判定"分开——把"判不出"当"不满足"会凭空
+    /// 报出插件不兼容（漏报警方向）。
     /// 规则（三值 Kleene：任一候选项满足 → true；全部明确不满足 → false；
     /// 只要还剩一个判不出来 → null）：
     ///   某个候选项的全部 token 都满足 → true；
@@ -184,22 +181,18 @@ internal static class Semver
             var basis = token[1..].Trim();
             var cmp = CompareVersionStrings(candidate, basis);
             if (cmp is null || cmp < 0) return cmp is null ? null : false;
-            // 基准是否带**预发布**必须问 VersionPrerelease，不能用 basis.Contains('-')：
-            // 后者在 build 元数据里有连字符时会误判——"1.2.3+b-1" 是带 build 的**正式版**，
-            // 却被当成"基准带预发布"而返回 null。于是 ^1.2.3+b-1 永远得到"无法判定"，
-            // 而 npm 对它有明确答案（1.5.0 满足 ^1.2.3+b-1）。方向安全（不误判），
-            // 但白白丢能力，且提示的是"未能判定"这种没法排查的话。
-            // VersionPrerelease 先按 '+' 截掉 build 段再找 '-'，与 ParseVersion 的 core
-            // 截断口径一致（见该方法的注释）——两处口径分叉过一次，正是这个 bug 的来源。
+            // 基准是否带**预发布**必须问 VersionPrerelease，不能用 Contains('-')：
+            // "1.2.3+b-1" 是带 build 的正式版，Contains('-') 会把它误判成预发布。
+            // VersionPrerelease 先按 '+' 截掉 build 段再找 '-'，与 ParseVersion 的
+            // core 截断口径一致——两处口径必须同形。
             if (VersionPrerelease(basis) is not null) return null;
             var v = ParseVersion(basis);
             var c = ParseVersion(candidate);
             if (v is null || c is null) return null;
-            // npm 语义：caret/tilde 这类**范围**只接受与基准同 major.minor.patch 的预发布
-            // 候选（如 ^4.0.1 只放行 4.0.1-xxx）。此前不实施这条，0.1.5-rc.9 会被判满足
-            // ^0.1.0——护栏在漏报警方向上出错（本工具最不能犯的那个方向）。
-            // 语义修正后这里是**明确的 false**（npm 对"预发布不进范围"的定义），
-            // 与"拿不准返回 null"的取舍并不冲突：这条不是拿不准，是规则本身。
+            // npm 语义：caret/tilde 范围只接受与基准同 major.minor.patch 的预发布候选
+            // （如 ^4.0.1 只放行 4.0.1-xxx）。不实施这条会让 0.1.5-rc.9 判满足 ^0.1.0
+            // ——漏报警方向（本工具最不能犯的）。这里是**明确的 false**（npm 规则本身），
+            // 与"拿不准返回 null"的取舍不冲突。
             if (!PrereleaseAllowedInRange(candidate, v.Major, v.Minor, v.Build)) return false;
             var majorMatters = v.Major > 0;
             var minorMatters = !majorMatters && v.Minor > 0;
@@ -231,9 +224,8 @@ internal static class Semver
             return c.Major == v.Major && c.Minor == v.Minor;
         }
 
-        // 裸版本号 = **精确匹配**。npm/semver 里 "1.2.3" 的含义是"恰好这个版本"，
-        // 不是"至少这个版本"：之前按 >= 解释，peerDependencies 写死 "0.1.5" 时
-        // 引擎 0.9.0 会被误判成"满足"——护栏恰好在危险方向上漏报。
+        // 裸版本号 = **精确匹配**（npm/semver 语义："1.2.3" 是"恰好这个版本"）。
+        // 按 >= 解释会让引擎 0.9.0 判满足写死的 "0.1.5"——危险方向漏报。
         var bare = CompareVersionStrings(candidate, token);
         return bare is null ? null : bare == 0;
     }
@@ -257,9 +249,8 @@ internal static class Semver
     /// npm 的**比较器集合级**预发布门槛（node-semver Range.test 的收尾规则）：
     /// 候选带预发布时，一个候选项（比较器集合）只有在「集合内至少有一个比较器的基准
     /// **带预发布**、且与候选同 [major, minor, patch] 三元组」时才放行；
-    /// 否则整项明确不满足（false，不是猜）。此前裸比较器（<c>&gt;=0.2.0</c>）对预发布
-    /// 候选只做数字比较，<c>0.3.0-rc.1</c> 被判满足 <c>&gt;=0.2.0</c>——而 npm 语义下
-    /// 这个集合不接受任何预发布（peer 不满足、装不上），护栏恰在漏报警方向出错。
+    /// 否则整项明确不满足（false，不是猜）：裸比较器（<c>&gt;=0.2.0</c>）的集合
+    /// 不接受任何预发布候选（npm 语义，peer 装不上），只做数字比较会在漏报警方向出错。
     /// <paramref name="comparators"/> 是该候选项里全部"比较器形态 token"（含裸精确
     /// 版本）的基准三元组与预发布标记；caret/tilde 不参与：它们对预发布候选的门槛
     /// 已在自己分支内实施（<see cref="PrereleaseAllowedInRange"/>），基准带预发布时的
@@ -328,9 +319,8 @@ internal static class Semver
     ///   <c>dsh@1.2.3(react@18.3.1)</c>          —— 旧式 peer 变体
     ///   <c>dsh@1.2.3_react@18.3.1</c>          —— 新式 peer 变体
     ///
-    /// 分隔版本号的那个 '@' 必须是**包名之后的第一处**。此前用 LastIndexOf：
-    /// 新式变体下会取到 **peer 的版本**（"18.3.1"），连同注释自述要修的那个例子
-    /// 一起取错——交给 semver 比出来的结论是彻底无关的另一个包。
+    /// 分隔版本号的那个 '@' 必须是**包名之后的第一处**：LastIndexOf 会在新式 peer
+    /// 变体下取到 peer 的版本号，比出彻底无关的另一个包。
     /// 取不出合法版本返回 null（宁可判"无法判定"，也不把乱七八糟的目录名当版本）。
     /// </summary>
     internal static string? ParsePnpmDirVersion(string? dirName)
@@ -348,10 +338,9 @@ internal static class Semver
 
     /// <summary>
     /// 从 `npm view &lt;pkg&gt; version` 的结果里取版本号（纯函数、可单测）。
-    /// 拆出来的理由与 <see cref="ProcessMatch.MatchesHarnessCommand"/> 同源：这个值会一路流到
-    /// 「停掉正在跑的引擎 → 装 staging → 替换正式目录」——判错的后果不是报错，
-    /// 是引擎被停掉、替换失败、界面报一句驴唇不对马马的错。原实现把 stdout 与
-    /// stderr 拼起来取末行，于是三条独立的路都能把垃圾喂进去：
+    /// 这个值会一路流到「停掉正在跑的引擎 → 装 staging → 替换正式目录」——判错的
+    /// 后果不是报错，是引擎被停掉、替换失败、界面报一句驴唇不对马马的错。
+    /// stdout/stderr 拼接取末行的旧写法有三条路能把垃圾喂进来：
     ///
     /// ① **不看退出码**：npm 失败时 stdout 也可能有内容（错误摘要、缓存回显），
     ///    它会被当成"最新版"一路带回。

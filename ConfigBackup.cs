@@ -4,17 +4,9 @@ using System.Text.Json;
 namespace DeepSeekHarness;
 
 /// <summary>
-/// DSH 配置快照。
-///
-/// 为什么需要它：实测本机发生过两次真实的数据丢失，都是同一个原因——
-/// DSH 在版本升级时把 <c>$DSH_HOME/settings.yaml</c> 改名成 <c>settings.yaml.imported</c>，
-/// 再按「section id = profile 条目 id」逐段导入；<b>id 对不上任何 profile 条目的段直接丢失</b>。
-/// 受害的是 jet-hub 的账号列表和 llm-pi-ai 的自定义模型供应商（基元 / 商汤）。
-/// 而写在 <c>profiles\&lt;名字&gt;\cordis.patch.yml</c> 里的配置不受影响，
-/// 所以那次是从 desktop profile 的 patch 里把供应商捞回来的。
-///
-/// 这个类只做一件最朴素的事：把「体积小、丢了很痛、且不随版本重建」的那些配置
-/// 按时间戳各存一份。刻意<b>不</b>包含 node_modules / engine 之类可重建的大目录。
+/// DSH 配置快照：把「体积小、丢了很痛、且不随版本重建」的配置按时间戳各存一份，
+/// 刻意<b>不</b>包含 node_modules / engine 之类可重建的大目录。
+/// （它存在的理由——settings 迁移按 id 导入时丢段的真实数据丢失——见 DESIGN-NOTES.md §6。）
 /// </summary>
 internal static class ConfigBackup
 {
@@ -41,13 +33,9 @@ internal static class ConfigBackup
     private static readonly object SnapshotGate = new();
 
     /// <summary>
-    /// 会被引擎例行改写、不该消耗快照名额的文件。
-    ///
-    /// 提成成员而不是留在 <see cref="CreateSnapshot"/> 的方法体里，是因为单测必须能
-    /// 引用**同一份**清单。此前测试只能手抄一份副本，于是"生产把某个文件加进/移出
-    /// 易变集"这类改动会让测试全绿通过——恰好是本类最该防的那种静默漂移。
-    /// 注意别把成员取名成 <c>Volatile</c>：<c>System.Threading</c> 在隐式 using 里，
-    /// 同名会把本类内的 <c>Volatile.Read(...)</c> 变成 CS0119。
+    /// 会被引擎例行改写、不该消耗快照名额的文件。提成成员是因为单测必须引用
+    /// **同一份**清单——测试手抄副本的话，"生产改了清单、测试没红"的静默漂移
+    /// 恰好溜过本类最该防的那道闸。注意别取名 <c>Volatile</c>（与 System.Threading 冲突）。
     /// </summary>
     internal static readonly ISet<string> VolatileConfigFiles =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase) { CredentialFile };
@@ -146,19 +134,13 @@ internal static class ConfigBackup
             var files = ConfigFiles().Where(f => File.Exists(Path.Combine(DshHome, f))).ToList();
             if (files.Count == 0) return null;
 
-            // 逐个文件算内容哈希，而不是把全部内容拼起来算一个总哈希。
-            // 实测教训：.credentials.yaml 每次启动都会被引擎重写（token 轮换），
-            // 字节数常常分毫不差（17051 -> 17051）但内容确实变了。用总哈希判断，
-            // 结果就是"每次启动都算配置有变化"，快照名额会被这种例行改写迅速耗尽，
-            // 真正需要留住的配置快照反而被挤掉。
+            // 逐个文件算内容哈希，而不是拼起来算总哈希：凭据文件每次启动被引擎重写
+            // （字节数不变、内容变），总哈希会让每轮都判"有变化"，快照名额被例行
+            // 改写耗尽（见 DESIGN-NOTES.md §6）。
             //
-            // ⚠ 截断到 16 个十六进制字符（64 bit）是**有意的**，且只能用于"变了没有"
-            // 这个判断，绝不能当成完整性校验：
-            //   • 用途极窄——只比"这一轮和上一轮是不是同一份"，不比"对不对"。
-            //   • 64 bit 的碰撞概率在这台机器的全部快照轮次里可以忽略（生日界约
-            //     50 亿次才有一半概率），而 SHA-256 全文会让清单大出 60 倍。
-            //   • 万一碰撞，后果是"少拍一份快照"（NeedsSnapshot 判成没变），
-            //     而绝不会把损坏的内容当成好的——恢复动作读的是盘上的真实文件。
+            // 截断到 64 bit 是**有意的**，且只能用于"变了没有"这个判断，绝不能当成
+            // 完整性校验：碰撞的后果只是"少拍一份快照"，绝不会把损坏内容当好——
+            // 恢复读的是盘上的真实文件。
             var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var rel in files)
             {
@@ -171,12 +153,9 @@ internal static class ConfigBackup
                 catch { /* 读取失败：hashes 不含该项，下面复制也会跳过它 */ }
             }
 
-            // 读取失败的文件**不能**往 hashes 里塞占位符再照常落 manifest：
-            // 占位符会被当成"该文件的哈希"写进 last-hashes.txt，此后每次启动真实哈希
-            // 都与它不等 → NeedsSnapshot 恒为 true → 每轮重拍一份，8 个名额被无意义
-            // 快照轮流挤掉。改成"读取失败即跳过复制"：该文件本轮不在 hashes 里，
-            // manifest 也只写确实复制成功的项（见下面 copied 的记账），于是下一轮
-            // NeedsSnapshot 按"键缺席"判为要拍，自动重试——与复制失败的语义完全一致。
+            // 读取失败的文件不能塞占位符进 manifest：占位哈希会让 NeedsSnapshot
+            // 恒为真、每轮重拍挤掉名额。跳过复制、不进 manifest，下轮按"键缺席"
+            // 自动重试（与复制失败同一语义）。
 
             Directory.CreateDirectory(BackupRoot);
             var manifestPath = Path.Combine(BackupRoot, "last-hashes.txt");
@@ -229,13 +208,9 @@ internal static class ConfigBackup
                 target = Path.Combine(BackupRoot, $"{stamp}-{n}");
             Directory.CreateDirectory(target);
 
-            // 逐文件记复制成败。此前失败只是静默跳过，manifest 却仍按完整 hashes
-            // 落盘——快照目录里没有这个文件，清单却说"已备份"；只要源文件内容
-            // 不再变，NeedsSnapshot 永远判"不用拍"，这个文件就再也不会被重试备份。
-            // 现在 manifest 只写**确实复制成功**的文件：失败项在清单里缺席，
-            // 下一轮 NeedsSnapshot 按"键集合变化"判为要拍，自动重试。
-            // （若某文件永久复制失败——权限被撤/磁盘满——每轮都会重拍一份，
-            // 但 backup-info 每份都列着失败清单，是可见信号而非静默缺口。）
+            // manifest 只写**确实复制成功**的文件：失败项缺席 → 下轮按"键集合变化"
+            // 自动重试。永久失败（权限/磁盘满）会每轮重拍，但 backup-info 列着
+            // 失败清单，是可见信号而非静默缺口。
             var copied = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var failedCopies = new List<string>();
             foreach (var rel in files)
@@ -317,11 +292,8 @@ internal static class ConfigBackup
                 info.ToString(),
                 new UTF8Encoding(false));
 
-            // 清单**必须**原子写：它是整个去重机制的唯一依据，却是原地覆写
-            // （File.WriteAllText）。写到一半被杀 → 半截内容 → 读侧把没有制表符的行
-            // 静默丢弃 → 那些键"缺席" → NeedsSnapshot 每轮都判要拍，
-            // 8 个快照名额被无意义的快照轮流挤掉，而用户真正需要的那份反而没了。
-            // 同卷 Move 在 NTFS 上是原子的，与快照内容、Restore 走同一条纪律。
+            // 清单**必须**原子写：它是去重机制的唯一依据，半截内容会让"缺席键"
+            // 每轮触发重拍、挤掉名额。同卷 Move 原子——与快照内容、Restore 同一纪律。
             AtomicWrite(manifestPath,
                 Encoding.UTF8.GetBytes(string.Join("\n",
                     copied.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
@@ -394,15 +366,9 @@ internal static class ConfigBackup
     }
 
     /// <summary>
-    /// 快照目录按"新的在前"排序。
-    ///
-    /// 主键是目录的<b>创建时间</b>，目录名只作同刻的次序兜底。原先只按名字排，
-    /// 而名字里的时间戳是<b>本地时钟</b>：NTP 回拨、夏令时跳变、手动改时间都会让
-    /// 排序与真实先后脱钩。后果是具体的两条——
-    ///   • <see cref="LatestSnapshot"/> 可能挑中一份比别的更旧的快照去恢复；
-    ///   • <see cref="PruneOldSnapshots"/> 按名字倒序保留前 N 份，于是可能删掉
-    ///     刚拍的那份、把三天前的留下。用户看到的"最新备份"根本不是最新。
-    /// 名字排序在这里不是"更简单"，只是"更常见地正确"。
+    /// 快照目录按"新的在前"排序：主键是目录**创建时间**（UTC），目录名只作同刻兜底。
+    /// 名字里的时间戳是本地时钟，NTP 回拨/手动改时间会让它与真实先后脱钩——
+    /// 恢复会挑到旧快照、清理会删掉刚拍的那份。
     /// </summary>
     private static IOrderedEnumerable<DirectoryInfo> OrderByNewestFirst(this IEnumerable<DirectoryInfo> dirs) =>
         dirs.OrderByDescending(d => { try { return d.CreationTimeUtc; } catch { return DateTime.MinValue; } })

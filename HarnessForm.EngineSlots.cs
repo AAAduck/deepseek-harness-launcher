@@ -91,20 +91,10 @@ internal sealed partial class HarnessForm : Form
     }
 
     /// <summary>
-    /// 把升级后留下的 engine.old 提升为一个正式的版本槽。
-    /// 升级流程仍然用 engine.old 作中转（改名失败可以靠它恢复），
-    /// 这里在下次启动时把它归档成 engine.&lt;版本号&gt;，于是旧版本不会被动丢掉了。
-    ///
-    /// 跨进程互斥不靠锁文件，靠的是**同卷上的目录改名是原子的**：
-    /// 先 engine.old → engine.migrating，抢到的人才继续做"删同名槽 + 归档"。
-    /// 同机两个登录会话各跑一个启动器时（互斥体是 Local\，管不到别的会话），
-    /// 只有一个能抢到，另一个直接跳过本轮。
-    ///
-    /// 这不只是省一次重复劳动。原先两个进程都会执行
-    /// 「ForceDeleteDirectory(slot) + Move」，交错起来是这一种：P1 刚把 engine.old
-    /// 归档成 engine.&lt;版本&gt;，P2 随后把**同一个槽**递归删掉、自己的 Move 再因
-    /// 源已不在而失败——上一版本就此丢失（engine.old 没了，槽也没了，要重下 214 MB）。
-    /// 认领把"删"这个破坏性动作关进了只有一个人能进的临界区。
+    /// 把升级后留下的 engine.old 归档成 engine.&lt;版本号&gt; 槽。
+    /// 跨进程互斥不靠锁文件，靠**同卷目录改名的原子性**认领：抢到的人才许做
+    /// "删同名槽 + 归档"，把"删"这个破坏性动作关进只有一个人能进的临界区
+    /// （两个执行者交错曾把上一版本整份丢掉，见 DESIGN-NOTES.md §4）。
     /// </summary>
     private static void MigrateEngineOldToSlot()
     {
@@ -135,21 +125,15 @@ internal sealed partial class HarnessForm : Form
                 if (!plan.ClaimOld || !Directory.Exists(engineOldDir)) return;
                 try
                 {
-                    // 认领直接落**私有名**（engine.migrating.<guid>），不再借道共享的
-                    // engine.migrating。共享名会被另一会话的收尾路（ClaimMigratingDir）
-                    // 当"无主残留"无条件抢走——抢的人不知道本进程正拿着它删槽/搬移，
-                    // 最坏交错（本进程刚 ForceDelete 掉同版本槽、还没 Move 顶上）会把
-                    // 对方刚填好的槽再整棵删掉：engine.old、engine.migrating、槽三者皆空，
-                    // 上一版本丢失。私有名只有本进程知道落点，而认领副本（ClaimDirs）
-                    // 的三个读取方——版本槽列举排除、RecoverEngineSwap 恢复源、
-                    // RestoreStaleClaims 陈旧回收——全都已按认领副本语义处理它，
-                    // 无需任何新分支。
+                    // 认领直接落**私有名**（engine.migrating.<guid>）：共享名会被另一
+                    // 会话的收尾路当"无主残留"无条件抢走，最坏交错把对方刚填好的槽
+                    // 再整棵删掉（三者皆空、上一版本丢失）。认领副本的三个读取方
+                    // （版本槽列举排除、RecoverEngineSwap 恢复源、RestoreStaleClaims）
+                    // 都已按认领副本语义处理它。
                     var claimed = Path.Combine(LocalAppDir, EngineClaimPrefix + Guid.NewGuid().ToString("N")[..8]);
                     Directory.Move(engineOldDir, claimed);
-                    // NTFS 同卷改名**保留**目录的创建时间（=当初安装引擎的时刻），
-                    // 而 RestoreStaleClaims 用创建时间判"认领是否陈旧"——不改写的话
-                    // 每个刚创建的活认领都会立刻被判成陈旧、可能被另一会话挪走，
-                    // 30 分钟守卫从未真正生效过。改名成功立刻刷新，判定从此有意义。
+                    // NTFS 同卷改名**保留**目录的创建时间，而陈旧判定用的正是创建时间
+                    // ——改名后必须刷新，否则 30 分钟守卫从未真正生效。
                     try { Directory.SetCreationTimeUtc(claimed, DateTime.UtcNow); } catch { }
                     if (ArchiveClaimedDir(claimed)) return;
                     // 归档没成：挪回共享名 engine.migrating，让下一轮收尾路立即重试——
@@ -175,17 +159,9 @@ internal sealed partial class HarnessForm : Form
     private static readonly SemaphoreSlim migrateGate = new(1, 1);
 
     /// <summary>
-    /// engine.migrating 的收尾入口：**先原子改名认领，抢到才动**。
-    ///
-    /// 收尾这条路此前根本没有认领动作——它直接对 engine.migrating 做
-    /// 「删同名槽 + Move」。两个执行者并跑时：T1 归档成功（engine.migrating 已被搬走），
-    /// T2 紧接着的 <see cref="ForceDeleteDirectory"/>(slot) 正好把**刚归档好的那一槽**
-    /// 整棵删掉，自己那句 Move 再因源已不在而失败被吞——engine.old 与 engine.migrating
-    /// 双双消失，上一版本就此丢失。这正是 <see cref="PlanEngineOldArchive"/> 的注释
-    /// 声称已经用"认领"修死的事故，收尾路把它重新开了一条缝。
-    ///
-    /// 现在改成：engine.migrating → engine.migrating.&lt;guid&gt;（原子的，只有一个人抢得到），
-    /// 抢到者独占归档，别人直接空转一轮。
+    /// engine.migrating 的收尾入口：**先原子改名认领（私有名），抢到才动**。
+    /// 不认领的话，两个执行者并跑时后到者的 ForceDeleteDirectory 会把先到者
+    /// 刚归档好的槽整棵删掉（时间线见 DESIGN-NOTES.md §4）。
     /// </summary>
     private static void ArchiveMigratingLeftover()
     {
@@ -289,15 +265,10 @@ internal sealed partial class HarnessForm : Form
 
     /// <summary>
     /// 为一次"占用 engine.tmp"做准备：把上一轮留在那里的东西清干净。
-    ///
-    /// 不能无条件 ForceDeleteDirectory：engine.tmp 是 <see cref="RecoverEngineSwap"/>
-    /// 的最后恢复源，**进程死在「切换版本」两次改名之间时**，它装着的正是切换前的
-    /// 完整活动引擎——而目标槽原样健在、engine 目录此刻却是空的。那一刻它是那份
-    /// 数据的唯一副本，无条件删掉就等于把它永久丢掉（要重下 214 MB）。
-    ///
-    /// 所以：里面**是**一份完整引擎就挪进 broken- 槽保住（位置可见、可管理，
-    /// 用户想退回就有得退）；只是半截安装残骸才直接删掉，交给重装路径清理。
-    /// 窗口确实极窄，但"删掉唯一副本"是不可逆的，而"多一个 broken- 槽"是可逆的。
+    /// engine.tmp 是 <see cref="RecoverEngineSwap"/> 的最后恢复源——进程死在
+    /// 「切换版本」两次改名之间时，它装着切换前完整活动引擎的唯一副本。
+    /// 所以：完整引擎挪 broken- 槽保住（可逆），半截安装残骸才删——不可逆的
+    /// 只能是"删掉唯一副本"，不能是"多一个 broken- 槽"。
     /// </summary>
     private static void PreserveOrDiscardStagedEngine()
     {
@@ -465,28 +436,15 @@ internal sealed partial class HarnessForm : Form
     }
 
     /// <summary>
-    /// 上次替换若在两步之间被打断（engine 已改名、staging 还没顶上），
-    /// 这里把 engine.old 改回来，避免出现"引擎凭空消失"。
-    /// 注意顺序：必须先跑这个，再让 MigrateEngineOldToSlot 把 engine.old 归档成版本槽，
-    /// 否则"活动目录缺失"的中间态会被归档动作掩盖掉。
+    /// 上次替换若在两步之间被打断（engine 已改名、staging 还没顶上），把 engine.old
+    /// 改回来，避免"引擎凭空消失"。必须先于 MigrateEngineOldToSlot 跑，否则
+    /// "活动目录缺失"的中间态会被归档动作掩盖掉。
     ///
-    /// 兜底也要认领中转目录：进程若死在"认领之后、归档之前"，engine.old 已经不在，
-    /// 而 engine.migrating 里装着的正是上一版本。不认它的话，活动引擎缺失时就只剩
-    /// 重装一条路（214 MB），而那份能用的版本就静静躺在旁边。收尾路的私有认领副本
-    /// （engine.migrating.&lt;guid&gt;）同样要认——它就在认领之后那一步，进程死在那儿
-    /// 的话留下的是同一份数据。
-    ///
-    /// engine.tmp 作**最后**恢复源：进程死在「切换版本」的两次改名之间时，
-    /// engine.tmp 里装的是完整的上一活动版本（目标槽原样健在），不认它就等于
-    /// 下次启动重装 214 MB 并把它当残骸删掉。必须验过是**完整引擎**才认
-    /// （见 <see cref="IsCompleteEngineInstall"/>）——安装中断留下的半截 staging
-    /// 保持原状，交还重装路径清理。
-    ///
-    /// 这道完整性检查对<b>所有</b>恢复源一视同仁，不只 engine.tmp：engine.old /
-    /// engine.migrating / 认领副本同样可能是一份被提升上来的半截安装。放行它的后果
-    /// 是把"启动永远 Cannot find module、升级说已是最新、版本管理拒绝删除"这个
-    /// UI 内无解的死局一路传下去；而认不了源时，下游
-    /// <see cref="EnsureEngineAsync"/> 本来就会走重装路径自愈——代价只是一次安装。
+    /// 兜底按 engine.old → engine.migrating → 陈旧的认领副本 → engine.tmp（最后）
+    /// 的顺序认领恢复源：不认的话，活动引擎缺失时只剩重装一条路（214 MB），而
+    /// 那份能用的版本正躺在旁边。所有恢复源一视同仁地过完整性检查——放行半截
+    /// 安装会把 UI 内无解的死局一路传下去；认不了源时 EnsureEngineAsync 本来
+    /// 就会走重装自愈（代价只是一次安装）。
     /// </summary>
     private void RecoverEngineSwap()
     {
@@ -536,18 +494,12 @@ internal sealed partial class HarnessForm : Form
                 "应为纯版本号（如 0.1.5-rc.2）或 latest，不能含空白、引号或路径分隔符。");
 
         var npm = ResolveNpmPath(node);
-        // 走后台线程：首装/重试时这是一次 2.5 万文件的递归删除（还要先全树清只读属性），
-        // 留在 UI 线程上就是一次"未响应"幻窗——与 RunStartAsync 里那句纪律同源。
-        // 与「切换版本」入口同一处置：engine.tmp 里若是**完整**引擎就挪进 broken- 槽保住，
-        // 而不是直接删（它是"死在两次改名之间"的上一活动版本，可能是唯一副本）。
-        //
-        // staging 的清点、建目录、写 package.json **全程持 migrateGate**：后台「切换
-        // 版本」的持闸临界区会把旧活动引擎整体改名进 engine.tmp（此刻它是唯一副本），
-        // 这些写点若无闸，轻则把切换刚填进去的引擎挪进 broken- 槽（切换的告警指向
-        // 落空的位置），重则与之互踩出半截目录。npm 本体（可能跑几分钟）刻意放在
-        // 闸外：闸只保护目录级的原子操作，不值得把临界区拉长到分钟级；安装中途
-        // engine.tmp 被切换动过的残余，由替换前的持闸复查（expectedActiveVersion）兜住。
-        // 取消路径的清理（下方 OCE catch）同样持闸——理由见那里。
+        // 后台线程：首装/重试时这是一次 2.5 万文件的递归删除。staging 的清点、
+        // 建目录、写 package.json **全程持 migrateGate**：与「切换版本」的持闸
+        // 临界区互踩会互毁出半截目录/丢唯一副本。npm 本体（可能跑几分钟）刻意
+        // 放在闸外——闸只保护目录级原子操作，不值得拉长到分钟级；安装期间
+        // engine.tmp 被切换动过的残余由替换前的持闸复查兜住。取消路径的清理
+        // 同样持闸（见下方 OCE catch）。
         await migrateGate.WaitAsync(CancellationToken.None);
         try
         {
@@ -655,17 +607,10 @@ internal sealed partial class HarnessForm : Form
                     (missingDeps.Count > 5 ? " 等）" : "）") +
                     "，已放弃替换（当前引擎未受影响）。\n" + RecentOutputSummary());
 
-            // 替换三步全程持 migrateGate。切版本（ActivateEngineVersionAsync）、删槽
-            // （DeleteEngineVersionAsync）、归档 engine.old（MigrateEngineOldToSlot）
-            // 改的都是同一批目录，唯独安装替换此前是裸奔的：它与归档轮交错时，
-            // 归档刚把 engine.old 收走、安装这边又去删 engine.old / 改 engine，
-            // 轻则 Move 失败报"切换失败"，重则产生"升级假成功"——
-            // 旧引擎被顶上去了，界面却报"已就绪：新版本"。
-            //
-            // 持闸后再复查一次活动版本（expectedActiveVersion 为 null 表示不校验）：
-            // migrateGate 只管本进程，跨会话靠这道比对兜住——另一会话的启动器在
-            // 我们安装的这几分钟里换了引擎，就不该再拿陈旧的判断去覆盖它。
-            // 与 ActivateEngineVersionAsync 持闸后复查同一纪律。
+            // 替换三步全程持 migrateGate：切版本/删槽/归档改的都是同一批目录，
+            // 交错轻则 Move 失败、重则"升级假成功"（旧引擎被顶上、界面报已就绪）。
+            // 持闸后再复查活动版本（null = 不校验）：migrateGate 只管本进程，
+            // 跨会话靠这道比对兜住。与 ActivateEngineVersionAsync 持闸后复查同一纪律。
             await migrateGate.WaitAsync(ct);
             try
             {

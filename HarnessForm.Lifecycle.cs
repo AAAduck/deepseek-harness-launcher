@@ -31,33 +31,19 @@ internal sealed partial class HarnessForm : Form
         startCts = cts;
         EnterBusy(active, busyText, cts);
 
-        // 插件开关只在这里读一次。原来是读两次：UpdatePluginsAfterStartAsync 在创建时
-        // 读一次，本方法在 await startTask（最长十几秒）之后又读一次——而复选框在这期间
-        // 一直可点（EnterBusy 没禁它）。用户中途取消勾选，第二次读就会走到
-        // "跳过 AwaitQuietlyAsync" 那条路，把一个还在跑 pnpm 的任务丢在身后。
+        // 插件开关只在这里读一次：启动等待最长十几秒，两次读到不同的值会把
+        // 一个还在跑 pnpm 的任务丢在身后。
         var autoUpdate = autoUpdateCheckbox.Checked;
 
-        // 在动任何东西之前先给配置拍一份快照。实测 DSH 的 settings 迁移会丢掉
-        // 不匹配 profile 条目 id 的配置段（jet-hub 账号、llm-pi-ai 供应商都中过招），
-        // 备份必须发生在"可能被改写"之前，事后再备份就晚了。
-        // 内容没变化时不会重复生成，所以正常启动几乎零成本。
-        // 放后台线程：哈希 + 复制是真实磁盘 I/O，%USERPROFILE% 落在漫游配置/网络盘
-        // 时并不便宜（FoldersForm 对同类 I/O 同一条纪律），不能挂在 UI 线程上。
+        // 在动任何东西之前先给配置拍一份快照：备份必须发生在"可能被改写"之前，
+        // 事后再备份就晚了（DSH settings 迁移丢段的事故见 DESIGN-NOTES.md §6）。
+        // 放后台线程：哈希 + 复制是真实磁盘 I/O，不挂 UI 线程。
         await Task.Run(() => ConfigBackup.CreateSnapshot(reuseExisting ? "启动前" : "重启前"));
 
-        // engine.old 的归档放在这里，而不是"打开版本管理窗口"时。
-        //
-        // 为什么不在"列举版本"里做：归档是改名 +（同名槽时）递归删除，是**写操作**；
-        // 列举版本是只读操作。写操作挂在只读路径上，一旦对话框被重复打开就会有两个
-        // 后台扫描同时对同一个 engine.<版本> 槽"删除 + 改名"。
-        //
-        // 为什么必须在 reuseExisting 早退**之前**：1.3.0 起引擎随启动器退出而存活，
-        // 所以"引擎还活着"是常态，RunStartAsync 会在探到可用的 web-url.txt 后直接
-        // 复用并 return，根本走不到 StartHarnessAsync。挂在引擎安装路径上等于
-        // "只有引擎没起来时才归档"——那 README 承诺的"下次启动归档"就是假的。
-        // 这里只碰 engine.old 与 engine.<版本>，**不碰 engine**，所以引擎在跑也安全。
-        // 放在 EnterBusy 之后：busy 已禁用「版本」，不会与版本管理的扫描并发。
-        // 放后台线程：同名槽的清理是 2.5 万文件的递归删除，不能挂在 UI 线程上。
+        // engine.old 的归档放在这里（启动路径、reuseExisting 早退之前、EnterBusy 之后）：
+        // 归档是写操作，不能挂在只读的"列举版本"上；复用路径是常态，挂在安装路径上
+        // 等于"只有引擎没起来才归档"。只碰 engine.old 与 engine.<版本>、不碰 engine，
+        // 引擎在跑也安全。后台线程：同名槽清理是 2.5 万文件的递归删除。
         try { await Task.Run(MigrateEngineOldToSlot); } catch (Exception ex) { Swallow.Quiet(ex, "migrate-engine-old"); }
 
         Task? pluginTask = null;
@@ -79,15 +65,10 @@ internal sealed partial class HarnessForm : Form
             await WaitForPortToCloseAsync(DefaultPort, TimeSpan.FromSeconds(5), cts.Token);
             if (cts.IsCancellationRequested) return;
 
-            // 顺序很重要：先把引擎拉起来、把浏览器打开，再更新插件。
-            // 此前是「pnpm update → 等它跑完 → 才启动引擎」，于是启动被硬生生推迟
-            // 一整个 pnpm 往返（本机实测热 store 3.2 秒、GitHub 依赖超时 24 秒、
-            // 首次拉依赖 3 分 37 秒），而这段时间用户盯着的只是一个没有任何进展的窗口。
-            // 两个 Task 仍然同时创建，但插件更新在内部先等引擎启动收敛才动
-            // profiles\node_modules：引擎引导时会重建 profile 的模块链接（用
-            // node_modules.lock 串行化），pnpm update 不认那个锁、直接写同一棵树，
-            // 首启/刚升级时重建窗口最长，并发就是真实的踩踏风险。
-            // 插件的生效时机本就是「下次启动」，这里没有语义损失。
+            // 顺序很重要：先把引擎拉起来、把浏览器打开，再更新插件——插件更新在内部
+            // 先等引擎启动收敛才动 profiles\node_modules（引擎引导会用
+            // node_modules.lock 重建模块链接，pnpm update 不认那把锁，并发就是
+            // 真实的踩踏风险）。插件的生效时机本就是「下次启动」，这里没有语义损失。
             var startTask = StartHarnessAsync(cts.Token);
             pluginTask = UpdatePluginsAfterStartAsync(startTask, cts.Token, autoUpdate);
             await startTask;
@@ -300,18 +281,14 @@ internal sealed partial class HarnessForm : Form
                 (hint is null ? string.Empty : "\n\n" + hint));
         }
 
-        // 引擎 stdio 文件化：经 cmd 把 stdout/stderr 追加重定向进 engine-stdio.log。
-        // 不再用管道的理由见字段区注释（启动器死亡 → 断管 → 引擎陪葬，实测 ~1 秒）。
-        // 复用路径到不了这里；只有真拉新引擎才截断日志并换代游标。
+        // 引擎 stdio 文件化：经 cmd 把 stdout/stderr 追加重定向进 engine-stdio.log
+        // （为什么不用管道见字段区注释）。复用路径到不了这里；只有真拉新引擎才
+        // 截断日志并换代游标。
         //
         // 顺序刻意是：换令牌 → 截断 → 以**截断后的文件末尾**为起点建新游标 → 起跑。
-        // 游标不能再从 0 读：日志是 cmd `>>` 追加、历史仍在盘上（只有超过 8 MB 才截尾），
-        // 从头读等于把上一个会话整体回放一遍——旧 `?token=` 行会回填 authenticatedUrl、
-        // 弹出死链接标签页、写脏 web-url.txt，等待循环还会在**新引擎就绪之前**
-        // 因 authenticatedUrl != null 提前判成"启动成功"。此前注释与 README 说的
-        // "每次重新拉起时重开"从未被实现过（没有任何删除/清空动作），这条就是那笔债。
-        // 而截断发生在换代之际、旧循环可能正卡在一次 Feed 中间（`Length < Pos`
-        // 会把它复位到 0 拿到整段保留尾部）——所以分发处另有逐行代际守卫，两条路各堵各的。
+        // 游标从 0 起步 = 回放上一会话（旧 token 行回填 authenticatedUrl、弹死链、
+        // 等待循环提前假成功）。截断可能撞上旧循环的一次 Feed 中途——分发处另有
+        // 逐行代际守卫，两条路各堵各的（回放事故时间线见 DESIGN-NOTES.md §2）。
         var tailToken = Interlocked.Increment(ref engineTailToken);
         // 摘要缓冲随引擎换代清空：它喂的是「启动失败」弹窗里的「最后输出」。
         // 不清的话，新引擎零输出即崩时弹窗里躺着的是上一代引擎/上一次 npm install
@@ -334,15 +311,9 @@ internal sealed partial class HarnessForm : Form
         try { cursorStart = File.Exists(engineStdioLog) ? new FileInfo(engineStdioLog).Length : 0; }
         catch { cursorStart = 0; }
         engineLogCursor = new LogCursor(cursorStart);
-        // 游标**在提交任务时**就取出来当参数传进去，不能让后台循环自己去读字段。
-        // 原先是在 EngineTailLoopAsync 函数体第一行 `var cursor = engineLogCursor`：
-        // 那行跑到线程池线程上才执行，而 Task.Run 的执行时机不确定——线程池饥饿
-        // （或关窗/重启期间池紧张）叠加"在这几毫秒里又完成了一次完整启动"时，
-        // 上一代循环会读到**新一代**的游标，于是两代循环共享同一个 LogCursor：
-        // `cursor.Pos += len` 与 `Remainder` 被两个线程同时改写，而这两处**不受
-        // 代际令牌守卫约束**（守卫只管"要不要分发这一行"）。注释里"游标在入口捕获
-        // 一次……每代一个循环、互不共享"承诺的正是不发生这件事——那就必须真的
-        // 在提交时捕获，把"入口"钉在提交那一刻。
+        // 游标**在提交任务时**就取出来当参数传进去，不能让后台循环自己读字段：
+        // Task.Run 的执行时机不定，池紧张时上一代循环会读到新一代的游标、两代
+        // 共享同一 LogCursor 并发改写——而那两处不受代际守卫约束。
         var tailCursor = engineLogCursor;
 
         var psi = new ProcessStartInfo
@@ -511,22 +482,14 @@ internal sealed partial class HarnessForm : Form
             return;
         }
 
-        // 写入前的二次代际核对。DispatchEngineLogText 的逐行守卫通过之后，本方法可能
-        // 被调度延迟到「杀引擎 → RetireEngineTail → 清 authenticatedUrl / 删
-        // web-url.txt」（StopHarnessProcessesAsync 1153-1158 一带）之后才执行——
-        // 那会把刚清掉的死 token 又写回去，重启等待循环随即在**新引擎起跑前**误判
-        // "启动成功"。这正是 1.4.1 修过两次的"authenticatedUrl 复活"失效形状剩下的
-        // 一条 check-then-act 缝：守卫在上游查过一次，不等于写进数据库的那一刻还成立。
-        //
-        // 核对与写入同持 authUrlGate 后，这条缝只剩"锁内核对通过"这一种通过方式：
-        // 停止路径的"退役 + 清字段 + 删文件"在另一侧持同一把锁——要么本写先完成
-        //（停止的清理随后覆盖它，终态正确），要么退役先发生（下面的核对失败，
-        // 不再写）。
-        // 同代只认**第一条**：引擎重启内部 web server、请求日志回显带 token 的完整
-        // URL、drain 阶段的尾行，都会再走一遍这里——每条都采纳等于每条都多开一个
-        // 浏览器标签，还可能拿一条过期/陌生 URL 顶掉对的（authenticatedUrl 与
-        // web-url.txt 都是"最后一次写赢"）。跨代不受影响：停止路径清空字段，
-        // 新引擎起跑后第一条照常捕获。
+        // 写入前的二次代际核对（与写入同持 authUrlGate）：DispatchEngineLogText 的
+        // 逐行守卫通过之后，本方法可能被调度延迟到"杀引擎 → 退役 → 清字段/删文件"
+        // 之后才执行——守卫在上游查过一次，不等于写入的那一刻还成立。锁内核对后，
+        // 这条缝只剩"锁内核对通过"一种通过方式（"authenticatedUrl 复活"的时间线
+        // 见 DESIGN-NOTES.md §2）。
+        // 同代只认**第一条**：引擎重启/日志回显/drain 尾行都会再走一遍这里，每条
+        // 都采纳等于多开浏览器标签、还可能拿过期 URL 顶掉对的。跨代不受影响：
+        // 停止路径清空字段，新引擎起跑后第一条照常捕获。
         if (!TailGenerationAlive(token, engineTailToken)) return;
         lock (authUrlGate)
         {

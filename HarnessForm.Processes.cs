@@ -59,12 +59,9 @@ internal sealed partial class HarnessForm : Form
     private void StopHarnessProcessesCore()
     {
         var records = GetProcessRecords();
-        // 读 WMI 取 CreationDate 是"这是不是当初那个进程"的依据，但 WMI 查询本身
-        // 会失败（服务被拦、权限不足、瞬时故障）。GetProcessRecords 拿不到或**残缺**
-        // 时返回 null——不是抛异常。原先空字典直接让下面整个杀进程循环空转：
-        // 一个都杀不掉、界面回到"未运行"、日志里一个字都没有。这条必须有痕迹：
-        // 它正是"界面说停了、引擎其实还在 3080 上活着"那种故障。残缺同理且更险：
-        // 拿半截快照做定向清扫只会静默漏杀，不如只用句柄那条必中的路。
+        // GetProcessRecords 拿不到或**残缺**时返回 null——不是抛异常。半截快照做
+        // 定向清扫只会静默漏杀，不如只用句柄那条必中的路；空/残缺都要留痕
+        // （"界面说停了、引擎其实还在 3080 上活着"正是无痕迹时查不到的故障）。
         if (records is null)
             AppendStartupLog("进程快照残缺或不可用（WMI 中途故障）：本轮只结束本启动器自己拉起的引擎进程树。");
         else if (records.Count == 0)
@@ -90,11 +87,10 @@ internal sealed partial class HarnessForm : Form
 
         foreach (var id in all.OrderByDescending(x => x))
         {
-            // Process 对象持有内核句柄，用完即收、不等 GC（与 Program.ActivateExistingWindow 同一纪律）。
-            // PID 复用防护：GetProcessById 之后带容差比对 StartTime（见 ProcessMatch.IsSameProcessStart——
-            // 严格相等在 WMI 的微秒精度下连"同一个进程"都判不等，实测单进程命中率仅约 1/5，
-            // 曾经让「停止」大概率空转且不报错）。PID 被复用时创建时间必然相差秒级以上，
-            // 容差比对照样跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
+            // Process 对象持有内核句柄，用完即收、不等 GC。
+            // PID 复用防护：GetProcessById 之后带容差比对 StartTime（见
+            // ProcessMatch.IsSameProcessStart）。宁可漏掉一个残留，也不能误杀
+            // 同 PID 的新进程。
             if (!snapshot.TryGetValue(id, out var expected)) continue;
             // WMI 没给出 CreationDate 时回退成 DateTime.MinValue，于是
             // ProcessMatch.IsSameProcessStart 必然判不等 → 这个进程**永远杀不掉、且无任何痕迹**。
@@ -261,10 +257,8 @@ internal sealed partial class HarnessForm : Form
     /// WMI 查询挂进另一条线程的等待路径。
     /// </summary>
     private static Dictionary<int, ProcessRecord>? processRecordCache;
-    // 缓存时刻存成 **UTC ticks（long）** 而不是 DateTime。理由与本文件对 lastInstallInfoAtTicks
-    // 的处理完全一致：DateTime 是 8 字节结构，跨线程读写**不保证原子**，撕裂读会得到一个
-    // 既不是旧值也不是新值的时刻；Volatile.Read/Write 又只接受引用类型。两头都够不着时，
-    // 唯一的正确做法就是拆成 long 用 Interlocked —— 这里照那条已确立的纪律执行。
+    // 缓存时刻存成 UTC ticks（long）走 Interlocked：8 字节 DateTime 跨线程裸读不保证
+    // 原子，Volatile.Read/Write 又只接受引用类型——本文件对 8 字节跨线程状态的统一纪律。
     private static long processRecordCacheAtTicks;
     /// <summary>
     /// engine.migrating 定时归档的节流器：RefreshStatusAsync 每 1.5 秒跑一次，
@@ -391,14 +385,9 @@ internal sealed partial class HarnessForm : Form
             // 绝大多数启动这里根本没有锁文件：先判存在再决定要不要付出全量进程扫描的代价。
             if (!File.Exists(lockPath)) return;
             var records = GetProcessRecords();
-            // 快照为空（WMI 查询失败/被拦截）或**残缺**（枚举半途失败、个别行被丢弃）
-            // 时**不能**把 Any()==false 当"没有残留进程"：那会删掉一个可能仍被活着的
-            // 引擎持有的锁——删锁正是本方法最不能犯的错（锁没了，并发写者就能同时
-            // 进场）。宁可跳过：锁若真是孤儿，下次启动 WMI 正常时仍会清掉；锁若被
-            // 持有，跳过恰好避免一次真实的踩踏。杀进程两条路径对空/残缺快照早已
-            // 按异常处理并留痕（StopHarnessProcessesCore），这里此前是唯一把"空"
-            // 当"一切正常"的调用方——残缺更是连守卫都没有，半截快照直接流到了
-            // 下面的 File.Delete。
+            // 快照为空或**残缺**时不能把"没看到持锁者"当"没人持锁"：删锁正是本方法
+            // 最不能犯的错（锁没了，并发写者就能同时进场）。宁可跳过——孤儿锁下次
+            // 启动 WMI 正常时仍会被清掉（半截快照事故见 DESIGN-NOTES.md §3）。
             if (records is null)
             {
                 AppendStartupLog("进程快照残缺（WMI 中途故障），跳过孤儿锁清理，避免误删仍被持有的锁。");
@@ -502,10 +491,8 @@ internal sealed partial class HarnessForm : Form
             var text = await RunCmdAsync(
                 "netsh int ipv4 show dynamicport tcp", TimeSpan.FromSeconds(2));
             if (text is null) return null;
-            // 中文 Windows 的 netsh 输出的是「启动端口」，不是「起始端口」——后者是
-            // 几版文档/译文的写法，两者都不是（实测本机两种代码页下 netsh 都直接
-            // 输出英文 "Start Port"）。两个都收：反正匹配到哪个是哪个，
-            // 而只写一个的话真实的那台机器上这条提示永远不会出现。
+            // netsh 的中文标签随版本/代码页在「启动端口」「起始端口」与英文
+            // "Start Port" 之间漂——全部都收，只写一个的话真实机器上永远命不中。
             var startMatch = Regex.Match(text, @"(?:起始|启动)端口\s*:\s*(\d+)|Start Port\s*:\s*(\d+)", RegexOptions.IgnoreCase);
             var countMatch = Regex.Match(text, @"端口数\s*:\s*(\d+)|Number of Ports\s*:\s*(\d+)", RegexOptions.IgnoreCase);
             if (!startMatch.Success || !countMatch.Success) return null;
@@ -524,20 +511,12 @@ internal sealed partial class HarnessForm : Form
 
     /// <summary>
     /// 跑一条命令并取回标准输出，全程异步。超时、启动失败、空输出都返回 null。
-    /// innerCommand 是不含 cmd 前缀的命令本体；外层统一用
-    /// <c>chcp 65001</c> 把控制台代码页切到 UTF-8 再执行——netsh 等命令在中文
-    /// Windows 上默认输出 GBK，而这里按 UTF-8 解码，不切页时中文标签会变乱码，
-    /// 靠中文正则匹配的解析分支就永远命不中。
-    ///
-    /// ⚠ 但实测这台机器上 chcp 65001 之后 netsh **直接输出英文** "Start Port"，
-    /// 中文分支其实一次都没命中过——本条提示一直是靠英文分支救活的。
-    /// 所以调这个命令时不要以为"切页就能命中中文"，两处分支都留着才对。
-    ///
-    /// 为什么不能写成 <c>ReadToEnd() + WaitForExit(ms)</c>：ReadToEnd 会一直阻塞到
-    /// 子进程关闭 stdout 才返回，而它**排在 WaitForExit 前面**——子进程一旦卡住，
-    /// 超时判断根本没机会执行，调用它的 UI 线程就被挂住任意长时间。
-    /// 而 WaitForExitAsync(token) 在超时/取消时同样是**抛 OperationCanceledException**
-    /// 而不是正常返回，所以这里必须显式 catch 并杀掉子进程。
+    /// innerCommand 是不含 cmd 前缀的命令本体；外层先 <c>chcp 65001</c> 切 UTF-8
+    /// （netsh 在中文 Windows 默认输出 GBK，不切页则中文解析分支永远命不中——
+    /// 但别指望切页一定命中中文，英文分支同样要留）。不能写成
+    /// <c>ReadToEnd() + WaitForExit(ms)</c>：ReadToEnd 阻塞到 stdout 关闭且排在
+    /// 超时判断之前，子进程一卡 UI 线程就被无限挂住；WaitForExitAsync 在超时/取消时
+    /// 是抛 OCE 而不是正常返回，必须显式 catch 并杀树。时间线见 DESIGN-NOTES.md §9。
     /// </summary>
     private static async Task<string?> RunCmdAsync(string innerCommand, TimeSpan timeout,
                                                      CancellationToken ct = default)
@@ -562,13 +541,10 @@ internal sealed partial class HarnessForm : Form
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(timeout);
-            // 取消击杀必须挂在**同步执行的取消回调**上（Register 的回调在 Cancel()/
-            // CancelAfter 的触发线程上直接跑），不能只依赖下面 OCE catch 里的那份：
-            // 关窗时 CancelPendingStart 在 WM_CLOSE 分发期间同步 Cancel()，而 catch
-            // 是一条 Post 给 WinForms 上下文的续延——泵在 WM_CLOSE 分发期间不切换，
-            // 关窗后这条续延"可能被分发也可能被丢"，被丢时 cmd 及其子进程就成了
-            // 无人看管的孤儿（孤儿 npm 继续写 engine.tmp，下次升级删不掉临时目录）。
-            // catch 里那份 Kill 保留：它兜注册之前的取消与超时路径，双保险不冲突。
+            // 取消击杀必须挂在**同步执行的取消回调**上（Register 的回调在触发线程上
+            // 直接跑）：关窗期间 Post 的 OCE 续延"可能被分发也可能被丢"，被丢时
+            // cmd 及其子进程就是无人看管的孤儿。catch 里那份 Kill 兜注册前的路径，
+            // 双保险不冲突。
             using var killOnCancel = timeoutCts.Token.Register(() =>
             {
                 try { if (proc is not null && !proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }

@@ -26,17 +26,11 @@ internal sealed partial class HarnessForm : Form
     private const int RecentOutputLines = 10;
     /// <summary>
     /// LOCALAPPDATA 解析为空（受限账户/组策略）时得到的是**相对路径**——后续所有
-    /// Directory.CreateDirectory / File 操作会按当前工作目录解析，把引擎装到不明位置、
-    /// 快照也写到不明位置。宁可直接报出"无法定位数据目录"，也不要静默落到 CWD。
+    /// File 操作会按当前工作目录解析。宁可直接报出"无法定位数据目录"，也不要静默落到 CWD。
     ///
-    /// ⚠ 刻意做成**惰性**的（原为 static readonly 字段，在类型初始化器里求值）。
-    /// 静态字段初始化器会在**任何**静态成员首次被访问时执行——哪怕那个成员只是
-    /// <c>Semver.ParseVersion</c>这样一个纯字符串函数。于是整套单测都经这条路径
-    /// 连带初始化了数据目录解析与三个 GDI+ 字体（见下方三个 Font）：
-    /// 无 GUI 的 Windows Server Core / 容器 CI 上没有这些字体，也常常没有
-    /// LOCALAPPDATA，于是**与被测逻辑毫无关系**的一条 <c>TypeInitializationException</c>
-    /// 让整套测试全红。惰性化之后，只有真正碰文件系统/字体的代码路径才会付这个代价。
-    /// 抛异常的语义一字未变：只是从"类型首次加载时"推迟到"这条路径首次使用时"。
+    /// 惰性求值是刻意的：类型初始化器不得解析路径/字体，否则无 GUI 机器上一次纯函数
+    /// 调用就会炸出与被测逻辑毫无关系的 TypeInitializationException——整套单测的前提
+    /// （见 StaticCouplingTests）。抛异常的语义不变，只是推迟到首次使用。
     /// </summary>
     private static string? localAppDirResolved;
     private static string LocalAppDir =>
@@ -61,12 +55,8 @@ internal sealed partial class HarnessForm : Form
     private static readonly Color IdleColor = Color.FromArgb(88, 94, 104);
 
     // ---- 按钮无障碍名称的**单一真相源** ---------------------------------------
-    // 这几个字面量此前散在三处：构造期的 NewActionButton 实参、ApplyAccessibility、
-    // EndBusy 的恢复赋值。三处各写一份，漂移后没有任何编译期提示，而后果是
-    // 读屏对外自称一个已经不存在的老名字（EndBusy 漏掉某个按钮 → 点一次「重启」
-    // 之后它永久自称"重启中"；ApplyAccessibility 又单独覆盖 upgradeButton，
-    // 于是 EndBusy 恢复的值与构造值不一致时，界面看着正常、读屏却在撒谎）。
-    // 提成常量后，三处引用同一份，改文案只需改一处。
+    // 三处（构造 / ApplyAccessibility / EndBusy 恢复）必须引用同一份常量：
+    // 任何一处漂移都不报编译错，只表现为"读屏对外自称一个不存在的名字"。
     internal const string RestartAccessibleName = "结束当前引擎并重新启动";
     internal const string RefreshAccessibleName = "重新检测引擎状态";
     internal const string EnvAccessibleName = "检测 Node、npm、pnpm、引擎与端口";
@@ -75,16 +65,9 @@ internal sealed partial class HarnessForm : Form
     internal const string UpgradeAccessibleName = "升级 DSH 引擎到 npm 上的最新版本";
     internal const string AutoUpdateAccessibleName = "启动后在后台更新 DSH 插件，改动下次启动生效";
 
-    // 字体与颜色一样是"常量"，用静态字段共享。此前在构造函数和 NewButton 里
-    // 各 new 了一份，同一个窗体里出现 7 个内容完全相同的 Font 对象；
-    // 它们是实例字段，只能等窗体被 GC 才回收（本程序窗体活到进程结束，等于不回收）。
-    // 静态共享把 7 份合成 3 份，且只分配一次。
-    //
-    // ⚠ 同样**惰性化**（原为 static readonly）：Font 构造要过 GDI+ 并按名解析字体，
-    // 无 GUI 的 Server Core / 容器 CI 上这一步会失败，而它由类型初始化器触发——
-    // 也就是任何一次 HarnessForm.X 的纯函数调用都会撞上。理由同 LocalAppDir。
-    // ??= 不是线程安全的，但 Font 构造幂等且句柄分配失败会抛而不是产生坏对象，
-    // 最坏情况是并发构造出两份——与原先"多 new 几份"的代价同量级。
+    // 字体共享三份静态实例、惰性构造：类型初始化器不得过 GDI+（理由同 LocalAppDir，
+    // 见 StaticCouplingTests）。??= 非线程安全可接受——构造幂等、失败会抛，
+    // 最坏并发造出两份。
     private static Font? uiFontResolved;
     private static Font UiFont => uiFontResolved ??= new("Microsoft YaHei UI", 9f);
 
@@ -147,15 +130,9 @@ internal sealed partial class HarnessForm : Form
     private readonly string urlFile = Path.Combine(LocalAppDir, "web-url.txt");
     private readonly string settingsFile = Path.Combine(LocalAppDir, "settings.txt");
     /// <summary>
-    /// 引擎固定安装目录。此前引擎装在 npx 的哈希缓存
-    /// （%LOCALAPPDATA%\npm-cache\_npx\&lt;hash&gt;）里，三个后果都很难受：
-    /// ① 每次启动 npx 都要先向 registry 查一次 @latest，有新版本就整棵静默重装
-    ///   （实测 91 秒、零输出，界面像死住）；
-    /// ② 被中断的半成品无法原地修复（npm 只信 .package-lock.json，不会补半截包），
-    ///   只能整个删掉重下；
-    /// ③ 目录名是哈希，位置不可预测。
-    /// 现在改为：装到固定目录 → 启动直接跑 bin.js（零网络、零重装、不查版本）；
-    /// 升级只在你点「升级引擎」时发生，且先装到 engine.tmp，成功才替换正式目录。
+    /// 引擎固定安装目录：装到固定目录 → 启动直接跑 bin.js（零网络、零重装、不查版本）；
+    /// 升级只在「升级引擎」时发生，且先装到 engine.tmp，成功才替换正式目录。
+    /// （npx 哈希缓存方案的三个害处见 DESIGN-NOTES.md §4。）
     /// </summary>
     /// ⚠ 下面这些路径字段一律惰性求值（原为 static readonly）。它们全都链在
     /// <see cref="LocalAppDir"/> 上，所以哪怕只把 LocalAppDir 惰性化、这几个仍是
@@ -200,18 +177,11 @@ internal sealed partial class HarnessForm : Form
     private Process? dshProcess;
     private CancellationTokenSource? startCts;
     /// <summary>
-    /// busy 态的**所有权标记**，与 <see cref="startCts"/> 刻意分开。
-    ///
-    /// 为什么不能拿 startCts 判所有权：CancelPendingStart 会把 startCts 置 null，
-    /// 而"清空 startCts"恰恰是取消的语义。于是 busy 期间按一次 Esc（正是
-    /// StopClickedAsync 忙碌分支干的第一件事），操作自己的 finally 里
-    /// ReferenceEquals(startCts, cts) 就恒为 false → 跳过 EndBusy →
-    /// busy 全文件再无第二处复位 → 全部按钮永久禁用，只能重启启动器。
-    /// 启动/升级最长 15 分钟，按一次 Esc 就锁死整窗。
-    ///
-    /// 这里用 EnterBusy 时记下的 owner 引用做判定：取消只动 startCts，
-    /// owner 不受影响，"我还是这次忙碌态的主人"因此始终可判。
-    /// 后继操作 EnterBusy 会覆盖它，于是旧操作的 finally 也不会误清后来者的状态。
+    /// busy 态的**所有权标记**，与 <see cref="startCts"/> 刻意分开：拿 startCts 判
+    /// 所有权是错的——取消恰恰要清空 startCts，被 Esc 取消的操作就永远等不到
+    /// EndBusy，busy 再无第二处复位 → 全部按钮永久禁用（启动/升级最长 15 分钟）。
+    /// 用 EnterBusy 记下的 owner 判定：取消只动 startCts；后继操作覆盖 owner，
+    /// 旧操作的 finally 也不会误清后来者的状态。
     /// </summary>
     private object? busyOwner;
     private readonly List<string> recentOutput = new();
@@ -227,12 +197,8 @@ internal sealed partial class HarnessForm : Form
     /// tail 游标（字节偏移 + UTF8 解码器 + 半行尾巴）。刻意是**引用类型并整体替换**：
     /// 新引擎起跑时 UI 线程直接 new 一个新的换上（volatile 写），旧循环在入口捕获的
     /// 旧游标继续自洽地读完退场——两边各持各的状态，不存在共享可变字段。
-    /// 此前 pos/decoder/remainder 是三个散装字段，旧循环在 FeedEngineLogChunk
-    /// 内部一边读一边写，与新启动的复位交错时，旧循环会拿被清零的 pos 续读、
-    /// 把新引擎的日志当旧文件重新分派一遍（窄竞态。整替游标封掉跨代交错；
-    /// 1.4.1 再把代际核对下沉到**逐行分发**——换代瞬间旧循环可能正卡在
-    /// 一次 Feed 中途，刚读进的整段里混着上一会话的 token 行，只在循环顶
-    /// 核对的话整段照发不误）。
+    /// 代际核对必须下沉到**逐行分发**——换代瞬间旧循环可能正卡在一次 Feed 中途，
+    /// 只在循环顶核对的话整段照发不误。（散装字段时代的竞态时间线见 DESIGN-NOTES.md §2。）
     /// </summary>
     private volatile LogCursor engineLogCursor = new(0);
     /// <summary>代际标记：新引擎起跑后旧循环自行退场。volatile——UI 线程 `++`、
@@ -253,16 +219,11 @@ internal sealed partial class HarnessForm : Form
     internal static bool TailGenerationAlive(int loopToken, int currentToken) => loopToken == currentToken;
 
     /// <summary>
-    /// **杀引擎后必须退役当前代际令牌**（两条杀进程路径都要调，见
-    /// <see cref="StopHarnessProcessesAsync"/> 与 <see cref="StopEngineForExit"/>）。
-    ///
-    /// 此前只有"新引擎起跑"会换令牌，于是杀掉引擎到新引擎起跑之间的那段窗口里，
-    /// 旧 tail 循环的退场排空（最多 4×150 ms）仍然拿着当前令牌通过逐行守卫：
-    /// 刚被删掉的 web-url.txt 被重写成**过期 token**、authenticatedUrl 复活，
-    /// 紧接着的等待循环（<c>authenticatedUrl is not null → return</c>）会在
-    /// 新引擎还没输出任何日志时就提前判"启动成功"。
-    ///
-    /// 令牌只增不减、不复用，所以"退役"就是加一：旧循环下一次读就发现自己过期。
+    /// **杀引擎后必须退役当前代际令牌**（两条杀进程路径都要调）：不退役的话，
+    /// 杀掉引擎到新引擎起跑之间的窗口里，旧 tail 循环的退场排空仍拿着当前令牌
+    /// 通过逐行守卫，把刚删掉的 web-url.txt 重写成过期 token、复活 authenticatedUrl，
+    /// 等待循环随即在新引擎起跑前假判"启动成功"。
+    /// 令牌只增不减、不复用，"退役"就是加一：旧循环下一次读就发现自己过期。
     /// </summary>
     private void RetireEngineTail() => Interlocked.Increment(ref engineTailToken);
     // volatile：tail 后台线程写（HandleProcessLine）、UI 线程在 250ms 轮询里读它判
@@ -271,13 +232,12 @@ internal sealed partial class HarnessForm : Form
     // "x86 上恰好没出事"），这两个字段是同一并发形状，执行同一纪律。
     private volatile string? authenticatedUrl;
     /// <summary>
-    /// 认证链接的写入互斥：tail 线程的写入（HandleProcessLine）与停止路径的
-    /// "退役 + 清字段 + 删文件"（StopHarnessProcessesCore、StopClickedAsync）必须
-    /// 同持这一把锁。否则 tail 通过代际核对后被 OS 挂起几秒、恢复后把刚删掉的
-    /// web-url.txt 重写成过期 token 的窄缝始终敞着——正是 HandleProcessLine 注释里
-    /// 自认的那条 check-then-act 缝。锁内最重的动作是一次 DPAPI 落盘（毫秒级），
-    /// UI 线程等它无感；与 migrateGate 不同，它只护这几个字段/文件，不串行化
-    /// 任何目录操作。
+    /// 认证链接的写入互斥：所有写入方（tail 的 HandleProcessLine、停止路径的
+    /// "退役 + 清字段 + 删文件"、复用路径的 ResolveUsableUrlAsync）必须同持这一把锁，
+    /// 否则"通过代际核对后被 OS 挂起几秒、恢复后把刚删掉的 web-url.txt 重写成
+    /// 过期 token"的 check-then-act 缝始终敞着（时间线见 DESIGN-NOTES.md §2）。
+    /// 锁内最重的动作是一次 DPAPI 落盘（毫秒级）；与 migrateGate 不同，它只护
+    /// 这几个字段/文件，不串行化任何目录操作。
     /// </summary>
     private readonly object authUrlGate = new();
     private volatile bool isOn;
@@ -363,17 +323,8 @@ internal sealed partial class HarnessForm : Form
         panel.Controls.Add(autoUpdateCheckbox);
 
         // ── 底部一行：7 个按钮全部同尺寸排成一行 ─────────────────────────────────
-        // 演化过程（每一步都由实测数据推动，不是拍脑袋）：
-        //  ① 最初 6 个主按钮各 94px 挤一行（右边界 524/560），调用频率天差地别的操作占同样宽度；
-        //  ② 加目录/版本/升级后彻底排不下，做过"折叠 + 向下展开"；
-        //  ③ 但那样主按钮只有 2 个字却占了 324px 宽（还用了 10pt），比旁边按钮大 6 倍——
-        //     把主按钮缩到与其余按钮完全一致后，7 个按钮反而能一行放下。
-        // 实测（9pt 粗体）：所有两字按钮文字都是 32px，加 20px 内边距 = 52px；
-        // 8 × 52 + 7 × 8 = 472px，可用 496px。所以折叠机制被整个删掉了——
-        // 能一行放下就不需要它，少一个交互状态也少一处出错的地方。
-        //
-        // 尺寸统一是刻意的：主按钮不再特殊，同高（BottomRowHeight）、同字体、同宽。
-
+        // 尺寸统一是刻意的（同高、同字体、同宽，宽度按文字实测——见 LayoutBottomRow）：
+        // 主按钮不再特殊，一行放得下，折叠机制也就整个删掉了。
         // 主按钮随状态切换语义（未运行→启动，运行中→停止，见 ApplyPrimaryActionLabel），
         // 所以不再有独立的「停止」按钮——之前两套设计叠加，运行中一行出现两个红色「停止」。
         // 「重启」保持独立：它在两种状态下都有意义（清残留后拉起）。

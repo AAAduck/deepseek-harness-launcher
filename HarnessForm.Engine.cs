@@ -102,21 +102,11 @@ internal sealed partial class HarnessForm : Form
 
     /// <summary>
     /// 目录里是不是一份<b>能用</b>的引擎：入口脚本在、版本读得出、
-    /// 且 dsh 声明的直接依赖都已落地。
-    ///
-    /// 为什么必须多查依赖：此前"可用"的判据只有"版本可读 + bin.js 在"，而这两条都只
-    /// 覆盖 <c>@deepseek-ai/dsh</c> 这<b>一个</b>包。npm 是逐包解包、没有事务性的，
-    /// 强杀 / 断电 / 磁盘满都可能留下"dsh 本体在、直接依赖缺一部分"的半截目录。
-    /// 这样的目录会被两处当成好引擎：
-    ///   • <see cref="RecoverEngineSwap"/> 把它从 engine.tmp 提升为活动引擎；
-    ///   • <see cref="EnsureEngineAsync"/> 据此判定"已安装"、跳过安装。
-    /// 结果是一个 UI 内无解的死局：启动永远 Cannot find module、「升级」查到的最新版与
-    /// 它读到的版本号一致于是说"已是最新"、「版本管理」又按"使用中"拒绝删除——
-    /// 只能让用户自己去资源管理器删目录。
-    ///
-    /// 这是一次纯本地检查：不联网、不执行代码、不看退出码，比"跑一次 bin.js"便宜得多，
-    /// 足以挡住中断安装留下的绝大多数半截目录。误判成"不完整"的代价只是重装一次
-    /// （自愈），误判成"完整"的代价是上面那个死局——方向显然该偏向前者。
+    /// 且 dsh 声明的直接依赖都已落地。npm 逐包解包没有事务性，强杀/断电会留下
+    /// "本体在、依赖缺一半"的半截目录——只查"版本 + bin.js"时它会一路晋升成
+    /// 活动引擎，造成 UI 内无解的死局（时间线见 DESIGN-NOTES.md §4）。
+    /// 纯本地检查（不联网/不执行代码）；误判"不完整"只是重装一次（自愈），
+    /// 误判"完整"是死局——判定方向必须偏向前者。
     /// </summary>
     internal static bool IsCompleteEngineInstall(string dir)
     {
@@ -281,12 +271,8 @@ internal sealed partial class HarnessForm : Form
         total = widths.Sum() + gap * (buttons.Count - 1);
 
         var x = Math.Max(4, (ClientSize.Width - total) / 2);
-        // 贴底留 12px。⚠ 下一行的 Math.Max(120, …) 与上面这句注释**长期不一致**：
-        // 注释说"不设下限"，代码却有个 120 的下限。实害为零——MinimumSize 保证了
-        // 客户区不可能低到 120 之下，于是那个下限**永远不生效**，两句话描述的是同一件事。
-        // 但注释与代码对不上本身就是债：下一个人照注释去"修"这个 Math.Max，
-        // 就会在一个它根本没触发的分支上动手。留着 Math.Max（它是无害的冗余保险），
-        // 把注释改成与代码一致。
+        // 贴底留 12px；Math.Max(120, …) 是无害的冗余保险（MinimumSize 保证客户区
+        // 不会低到触发它），留着防呆。
         var rowY = Math.Max(120, ClientSize.Height - rowHeight - 12);
 
         for (var i = 0; i < buttons.Count; i++)
@@ -441,40 +427,28 @@ internal sealed partial class HarnessForm : Form
             await StopHarnessProcessesAsync();
             await WaitForPortToCloseAsync(DefaultPort, TimeSpan.FromSeconds(8), CancellationToken.None);
 
-            // 交换段全程持 migrateGate：每小时的 MigrateEngineOldToSlot 会对同一批
-            // engine.<版本> 槽做 ForceDelete + Move，而「版本管理」对话框打开期间
-            // 主窗体 busy == false、归档轮照常起跑——此前两路可以交错：轻则 Move
-            // 失败走回滚报"切换失败"，重则归档把刚切走的同版本号陈旧副本又建回槽里。
-            // 串行化之后谁先谁后都得到自洽状态（不影响"改名认领"那层跨进程互斥，
-            // 两者守的是不同粒度的竞态）。
+            // 交换段全程持 migrateGate：与每小时的归档轮/删槽改同一批目录，
+            // 交错轻则 Move 失败、重则陈旧副本被建回槽里（闸管本进程内的竞态，
+            // "改名认领"管跨进程的，两者粒度不同）。
             await migrateGate.WaitAsync();
             string? archiveWarning;
             try
             {
                 archiveWarning = await Task.Run<string?>(() =>
                 {
-                    // 持闸后复查活动版本：上面的 active 是停引擎+等端口（最长 8 秒+）
-                    // 之前读的，而互斥体是 Local\（每个登录会话各一个实例），另一会话的
-                    // 启动器可能正在这个窗口里切换/重装引擎。拿陈旧名字决定"被换下的
-                    // 引擎归档进哪个槽"会把上一版本归进错误的槽/broken- 槽——
-                    // 与 DeleteEngineVersionAsync 的同窗口修法同一纪律。
-                    // 早退判断（active == version）仍留在停引擎之前：它只是省一次
-                    // 无谓的重启，窗口内变化的代价仅是"发现变了就中止"，不产生写动作。
+                    // 持闸后复查活动版本：active 是停引擎+等端口之前读的，另一会话的
+                    // 启动器可能已换过引擎——拿陈旧名字归档会归进错误的槽。
+                    // 早退判断（active == version）留在停引擎之前：只省一次重启，
+                    // 不产生写动作。
                     var confirmed = ReadEngineVersion(engineDir);
                     if (!string.Equals(confirmed, active, StringComparison.OrdinalIgnoreCase))
                         throw new InvalidOperationException(
                             "等待期间活动引擎已被其他启动器改动，请重新打开「版本管理」再试。");
 
-                    // **持闸后再复核目标槽本身是否还完整**。上面那次 bin.js 检查是在
-                    // 停引擎 + 等端口（最长 8 秒+）**之前**做的，而 migrateGate 只管
-                    // 本进程——同机另一登录会话的启动器在这几秒里完全可以判定该槽非活动
-                    // 并把它递归删掉。此时 Directory.Move(slot, engineDir) 在一个
-                    // 已被掏空（或已消失）的目录上**仍可能成功**（同卷改名只要求源存在），
-                    // 结果是一份残缺目录成为活动引擎：下次启动 bin.js 缺失 → 强制重装
-                    // 214 MB，而用户看到的只是"切换成功"。
-                    // 跨进程的完整互斥要靠改名认领协议（engine.old 那套），代价大得多；
-                    // 这里先补上这道**闸内复核**——它把最坏结果从"静默装上残缺引擎"
-                    // 变成"切换中止 + 明确报错"。
+                    // **持闸后再复核目标槽是否仍完整**：上面的 bin.js 检查在停引擎+
+                    // 等端口之前做的，另一会话这几秒里可以删掉该槽；被掏空目录上的
+                    // Move 仍可能成功（同卷改名只要求源存在），残缺目录就成了活动引擎。
+                    // 闸内复核把最坏结果从"静默装上残缺引擎"变成"切换中止 + 明确报错"。
                     if (!IsCompleteEngineInstall(slot))
                         throw new InvalidOperationException(
                             $"等待期间版本 {version} 的目录已被其他启动器改动或删除（不再完整），" +
@@ -496,18 +470,12 @@ internal sealed partial class HarnessForm : Form
                         try { if (Directory.Exists(engineStageDir)) Directory.Move(engineStageDir, engineDir); } catch { }
                         throw;
                     }
-                    // 原活动版本搬到它的版本槽。
-                    // ⚠ 此处曾写着"这步失败就把新版本退回去"，那是**过期**的说法：
-                    // 真实行为是挪进 broken-<时间戳> 槽，或（连它也失败时）原样保留
-                    // 在 engine.tmp 里并把位置报给用户。原因是 1.4.3 修 H-2 时改的——
-                    // 那时发现"归档失败就删掉 engine.tmp"会删掉唯一的回退副本。
-                    // 现在的语义见下面 catch 里那两条分支，不要按旧注释理解。
-                    // 活动目录存在但版本读不出（active 为 null）时不能把这份文件留在
-                    // engine.tmp 里等下次安装无感删掉——归档成 broken-<时间戳> 槽，
-                    // 至少位置可见、可管理。
-                    // active 同样来自 package.json（可能被篡改/损坏），拼进槽目录名前必须过
-                    // IsSafeVersionToken（与 ArchiveClaimedDir 同一道闸）；不合法时走 broken- 槽
-                    // ——槽名由本程序生成、不含外部输入，这份旧版本仍然可见、可管理。
+                    // 原活动版本搬到它的版本槽。归档失败也不删副本：挪进 broken-<时间戳>
+                    // 槽，或原样保留在 engine.tmp 并把位置报给用户——那是切换前唯一回退
+                    // 副本（"归档失败就删 engine.tmp"的旧语义丢过唯一回退，见
+                    // DESIGN-NOTES.md §4）。active 来自 package.json（可能被篡改），
+                    // 拼进槽目录名前必须过 IsSafeVersionToken；不合法走 broken- 槽
+                    // （槽名由本程序生成，仍可见、可管理）。
                     try
                     {
                         if (active is not null && IsSafeVersionToken(active))
@@ -541,19 +509,11 @@ internal sealed partial class HarnessForm : Form
                             }
                         }
                         catch { }
-                        // 已在后台线程，不再需要 Task.Run（锁内也不允许 await）。
-                        //
-                        // ⚠ 此前这里 `if (saved) return null;`——直接报"完全成功"。
-                        // 但旧版本此刻**没有**进它该进的 engine.<版本> 槽，而是被挪进了
-                        // 一个叫 broken-<时间戳> 的槽。用户看到的是"切换完成"，而
-                        // 「版本管理」里那个他记得的旧版本条目不见了、取而代之的是一个
-                        // 看着像垃圾的名字——真实情况只有 startup-log 里有一行。
-                        // 切换本身确实成功了（新版本已顶上），所以用带警告前缀的返回值，
-                        // 而不是谎称失败让用户去重试一次已经成功的操作。
-                        //
-                        // broken 槽名**必须在 Move 之前取一次并复用**：BrokenSlotDirFor
-                        // 带时间戳且会为同秒冲突加序号，消息里再调一次得到的是**另一个**
-                        // 目录——报出来的位置根本不存在，用户照着找会扑空。
+                        // 已在后台线程（锁内不允许 await）。saved 时用带警告前缀的返回值
+                        // 而非谎称完全成功：旧版本没进自己的槽、只在 broken- 槽里可见，
+                        // 只报成功会让用户以为可管理的条目凭空消失。
+                        // broken 槽名必须在 Move 之前取一次并复用：BrokenSlotDirFor
+                        // 带时间戳且同秒加序号，消息里再调一次得到的是不存在的另一个目录。
                         if (saved) return ActivateSwitchedWithWarningPrefix +
                             $"，但旧版本（{active}）没能归档进它自己的版本槽，" +
                             $"已挪到「版本管理」里可管理的备用槽：\n{brokenDir}\n\n" +

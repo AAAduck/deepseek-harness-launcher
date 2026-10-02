@@ -199,4 +199,6 @@ dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
 | `.github\workflows\ci.yml` | CI：windows-latest 上构建并跑全部单测 |
 | `更新启动器-更新到<版本>.bat` | 启动器本体的更新脚本 |
 
-每个类的注释里写清了**它守着什么判据、那个判据此前错在哪、失效时是什么表现**——改这些函数前先读注释。
+代码注释只保留**不变量与失手方向**（"这段守着什么判据、失效时是什么表现"）；
+"此前怎么错、实测如何、为什么改成现在这样"的演进时间线集中在 [DESIGN-NOTES.md](DESIGN-NOTES.md)，
+按子系统分节——改这些函数前先读对应小节。
