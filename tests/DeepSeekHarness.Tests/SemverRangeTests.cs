@@ -195,4 +195,107 @@ public class SemverRangeTests
     {
         Assert.Equal(expected, HarnessForm.IsDshVersionedPackage(package));
     }
+
+    // ======================================================================
+    // 下面这组是为**比较器 op 映射**补的覆盖。
+    //
+    // ComparatorOps 把 (">=",1) ("<=",2) (">",3) ("<",4) ("=",0) 映射到
+    // cmp >= 0 / cmp <= 0 / cmp > 0 / cmp < 0 / cmp == 0 这五个开关。映射一旦被
+    // 写错（例如 ">=" 与 "<=" 互换），现有 200+ 条用例**全绿**：因为 >= 与 <= 在
+    // 已有数据里从来没有各自单独出现过边界不等的样本——">=" 配 0.2.0 与 ">=0.1.7"
+    // 都成立，"<=" 也同理，互换后结果一样。
+    //
+    // 这几条每条都必须让 cmp 与基准**不等**，才能分辨方向；把 op 映射整体旋转
+    // （1↔2、3↔4）后下面每一条都会红。
+    // ======================================================================
+
+    [Theory]
+    // ">"：严格大于。等于基准时必须 false（这是它与 ">=" 唯一可分辨之处）。
+    [InlineData("0.2.0", ">0.1.5", true)]
+    [InlineData("0.1.5", ">0.1.5", false)]       // ← ">=" 若被写成 ">" 这里会红
+    [InlineData("0.1.4", ">0.1.5", false)]
+    [InlineData("0.1.5-rc.1", ">0.1.5", false)]  // 预发布 < 同数字段正式版
+    public void 严格大于比较器(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
+    // "<="：小于等于。等于基准时必须 true（这是它与 "<" 唯一可分辨之处）。
+    [InlineData("0.1.5", "<=0.1.5", true)]      // ← "<" 若被写成 "<=" 这里会红
+    [InlineData("0.1.4", "<=0.1.5", true)]
+    [InlineData("0.1.6", "<=0.1.5", false)]
+    [InlineData("0.1.5", "<=0.1.5-rc.1", false)] // 正式版 > 同数字段预发布基准
+    public void 小于等于比较器(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
+    // "="：显式精确。与裸版本号同语义，但它走的是比较器分支（op = 0 → cmp == 0），
+    // 与"裸版本号"那条 path 是两条代码——后者此前有覆盖，前者一条都没有。
+    [InlineData("0.1.5", "=0.1.5", true)]
+    [InlineData("0.1.6", "=0.1.5", false)]       // ← 把 "=" 当成 ">=" 或 ">=" 都会红
+    [InlineData("0.1.4", "=0.1.5", false)]       // ← 把 "=" 当成 "<=" 或 "<" 都会红
+    [InlineData("0.1.5-rc.1", "=0.1.5", false)]
+    [InlineData("0.1.5-rc.1", "=0.1.5-rc.1", true)]
+    public void 显式精确比较器(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
+    // 组合区间里的方向也可分辨：">=0.1.5 <0.3.0" 与 "<=0.1.5 >=0.0.1" 是两条不同的区间。
+    [InlineData("0.2.0", ">=0.1.5 <0.3.0", true)]
+    [InlineData("0.3.0", ">=0.1.5 <0.3.0", false)]
+    [InlineData("0.1.5", ">=0.1.5 <0.3.0", true)]   // 左端含
+    [InlineData("0.1.5", "<=0.1.5 >=0.0.1", true)]   // 右端含
+    [InlineData("0.1.6", "<=0.1.5 >=0.0.1", false)]
+    public void 组合区间的开闭端点(string candidate, string range, bool? expected)
+    {
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Theory]
+    // —— 空白候选项（"A || " / "||  B" / "A || || B"）——
+    // 空段一个 token 都没有，循环体从不执行，allSatisfied 停在初值 true，
+    // 于是整条范围被判成"恒满足"。npm 语义下空段确实匹配一切，可本工具的三态
+    // 纪律是"拿不准就说拿不准"——把一段根本没读懂的声明判成满足，方向恰是**误报**
+    // （护栏漏警），与"判不满足"（凭空报警）相比危害更大。
+    // 这几条期望 null：把 tokenCount == 0 那道守卫删掉，下面每一条都会翻成 true。
+    //
+    // 注意**不能**收 ">=0.1.5 || " 这种首个候选项已满足的形状：任一候选项满足
+    // 即整条满足，这是既有语义（同 ">=0.1.5 || *" → true 那条），空白段轮不到。
+    [InlineData("0.1.5", ">=2.0.0 || ")]
+    [InlineData("0.1.5", "|| ")]
+    [InlineData("0.1.5", "  ||  >=2.0.0")]         // 前导空白段
+    [InlineData("0.1.5", ">=2.0.0 || || >=2.0.0")] // 中间那个空段
+    public void 空白候选项判不出来(string candidate, string range)
+    {
+        Assert.Null(HarnessForm.SatisfiesRange(candidate, range));
+    }
+
+    [Fact]
+    public void 首个候选项已满足时_空白候选项不影响结果()
+    {
+        // 与既有的 ">=0.1.5 || *" → true 同一条纪律：任一候选项满足即整条满足。
+        // 这条钉住"空白候选项"那组修复没有顺手把短路语义也改掉。
+        Assert.True(HarnessForm.SatisfiesRange("0.1.5", ">=0.1.5 ||   "));
+    }
+
+    [Theory]
+    // 基准带 **build 元数据**里的连字符不是预发布。"^1.2.3+b-1" 在 npm 下有明确答案
+    // （1.5.0 满足它），而旧实现用 basis.Contains('-') 判"基准带预发布"，
+    // 于是整条范围恒为"无法判定"。方向安全（不会误判成满足），但白白丢能力，
+    // 而且报出来的是"未能判定"这种用户没法排查的话。
+    [InlineData("1.5.0", "^1.2.3+b-1", true)]
+    [InlineData("2.0.0", "^1.2.3+b-1", false)]
+    [InlineData("1.2.9", "~1.2.3+b-1", true)]
+    [InlineData("1.3.0", "~1.2.3+b-1", false)]
+    // 真正的预发布基准仍然必须"无法判定"——这两条是上面那个修复的边界，
+    // 防止"干脆去掉判断"这种改法把真预发布也放进来。
+    [InlineData("1.5.0", "^1.2.3-rc.1", null)]
+    [InlineData("1.5.0", "~1.2.3-rc.1", null)]
+    public void 基准的build段不算预发布(string candidate, string range, bool? expected) =>
+        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
 }

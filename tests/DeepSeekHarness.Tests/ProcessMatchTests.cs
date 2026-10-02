@@ -70,6 +70,43 @@ public class ProcessMatchTests
     }
 
     [Fact]
+    public void desktop_host排除项_独立钉住_不含app_asar()
+    {
+        // ⚠ 上一条用例**测不到** dsh-desktop-host 那条排除：它的命令行同时含
+        // app.asar，两条排除里 app.asar 先命中。所以把 desktop-host 的排除整行删掉，
+        // 上一条照样绿——套件自述的"删掉任何排除项必须红"在这条上是假的。
+        // 这条刻意**不含 app.asar**，进程名也换成 node.exe（客户端宿主确实是 node），
+        // 于是命中与否只由 dsh-desktop-host 那一条决定。
+        // 这条形状是真实的：pnpm 布局下 @deepseek-ai/dsh-desktop-host 可能被链接到
+        // profile 自己的 node_modules，路径里就没有 app.asar 了。
+        Assert.False(Match("node.exe",
+            $@"""{UserHome}\.dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js"" web --port {Port}"));
+        // 反向钉住：去掉 desktop-host 这段标识后，同一条命令行**必须命中**——
+        // 否则说明上面那条是靠别的排除项蒙对的，这条测试什么也没钉住。
+        Assert.True(Match("node.exe",
+            $@"""{UserHome}\.dsh\node_modules\@deepseek-ai\dsh-plain\lib\index.js"" web --port {Port}"));
+    }
+
+    [Fact]
+    public void app_asar排除项_独立钉住_不含desktop_host()
+    {
+        // 与上一条对称：这条只由 app.asar 决定（不含 dsh-desktop-host 字样）。
+        Assert.False(Match("node.exe",
+            $@"""C:\Users\me\AppData\Roaming\DeepSeek Harness\resources\app.asar\dsh\lib\bootstrap.js"" web --port {Port}"));
+    }
+
+    [Fact]
+    public void 引擎包目录精确匹配_早于端口收窄_这条语义本身要钉住()
+    {
+        // 既定语义：命令行里带着**本启动器引擎内**的 dsh 包目录，就是确定性证据，
+        // 不再要求命令行提到本启动器端口。它早于端口收窄 return true，是有意为之
+        // （端口收窄是给"宽松匹配"兜底的）。写一条显式用例钉住这个次序：
+        // 免得后人把两道闸调换，误伤"用户自定义 --port 启动本启动器引擎"这一档。
+        Assert.True(Match("node.exe",
+            $@"""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"" web --port 9999"));
+    }
+
+    [Fact]
     public void dsh_subprocess_不命中()
     {
         Assert.False(Match("node.exe",

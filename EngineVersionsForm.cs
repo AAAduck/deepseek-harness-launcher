@@ -36,6 +36,17 @@ internal sealed class EngineVersionsForm : Form
     private readonly Func<string, Task<string?>> deleteVersion;
     /// <summary>正在跑一个异步操作（读取/切换/删除）。防重入，同时统一管按钮可用性。</summary>
     private bool busy;
+    /// <summary>
+    /// busy **只是 UI 层防重入**，不是并发互斥。
+    ///
+    /// 真正的互斥在数据层：<c>activateVersion</c> / <c>deleteVersion</c> 两个委托
+    /// 最终都进 HarnessForm 的 <c>migrateGate</c>（同一把 SemaphoreSlim，切版本 / 删槽 /
+    /// 归档 / 安装替换共用）。必须记住这一点，否则很容易以为"关窗后重开一个对话框"是
+    /// 安全的——它<b>不是</b>：本窗体的 <c>busy</c> 只管住这一个实例，新实例照样能发起
+    /// 破坏性操作。两个操作在闸上排队，顺序由闸决定，而不是由用户的确认框决定。
+    ///
+    /// 本窗还把「列举」也纳入了同一把闸，所以读到的列表与磁盘状态自洽。
+    /// </summary>
     /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"——这两件事完全不同。</summary>
     private bool closing;
     /// <summary>
@@ -55,7 +66,12 @@ internal sealed class EngineVersionsForm : Form
         this.activateVersion = activateVersion;
         this.deleteVersion = deleteVersion;
 
-        AutoScaleMode = AutoScaleMode.Dpi;
+        // AutoScaleMode.Dpi 在**没有** AutoScaleDimensions、也没有 PerformAutoScale 的
+        // 情况下是空操作：WinForms 按默认的 96/96 算缩放因子，在 120/144 DPI 上得到的
+        // 仍是 1.0，于是本文件里所有布局常量（34/30/16/8/14…）其实全是 96-DPI 像素。
+        // 这里明确关掉自动缩放、自己按 DeviceDpi 换算——与 FoldersForm、主窗体同一纪律：
+        // 一套机制，全部常量从 <see cref="DpiScale"/> 派生，不与 WinForms 的自动缩放打架。
+        AutoScaleMode = AutoScaleMode.None;
         Text = "引擎版本管理";
         // 初始尺寸按"通常只有 1–3 个版本"来定：列表留 86px（表头 + 约 3 行），再多滚动。
         // 但窗口是**可缩放**的，所以下面用 ApplyResponsiveLayout 让内容跟着变：
@@ -210,8 +226,30 @@ internal sealed class EngineVersionsForm : Form
     private const int BottomPad = 14;
     private const int Gap = 8;
     private const int ListTop = 34;
-    /// <summary>四个按钮的实测文字宽度，构造后第一次布局时算一次即可（见 LayoutButtons）。</summary>
+    /// <summary>四个按钮的实测文字宽度，按 <see cref="measuredAtDpi"/> 那个 DPI 量一次即可。</summary>
     private int[]? buttonWidths;
+    /// <summary>上面那份宽度是在哪个 DPI 下量的。DPI 变了必须重量（GDI 量的是设备像素）。</summary>
+    private int measuredAtDpi = -1;
+
+    // ---- DPI 换算 ----------------------------------------------------------
+
+    /// <summary>
+    /// 96-DPI 设计值 → 本机实际像素。<see cref="DeviceDpi"/> 在句柄创建前还报设计值，
+    /// 句柄建好之后（Load / 首次 Resize）才是真值——所以布局常量**不能**在字段
+    /// 初始化器里算死，必须每次布局时现算（ApplyResponsiveLayout 已经如此）。
+    /// </summary>
+    private double DpiScale => Math.Max(1.0, DeviceDpi / 96.0);
+
+    /// <summary>按 <see cref="DpiScale"/> 把 96-DPI 的设计像素换算成实际像素（向上取整）。</summary>
+    private int Px(double designValue) => (int)Math.Ceiling(designValue * DpiScale);
+
+    /// <summary>由 <see cref="DpiScale"/> 换算出来的几个布局常量（96-DPI 设计值见上面的常量声明）。</summary>
+    private int ScaledButtonHeight => Px(ButtonHeight);
+    private int ScaledHintHeight => Px(HintHeight);
+    private int ScaledSidePad => Px(SidePad);
+    private int ScaledBottomPad => Px(BottomPad);
+    private int ScaledGap => Px(Gap);
+    private int ScaledListTop => Px(ListTop);
 
     /// <summary>
     /// 让内容跟着窗口尺寸走。
@@ -227,62 +265,104 @@ internal sealed class EngineVersionsForm : Form
         // 提示与按钮行都从客户区**底边反推**，不再依赖 list.Bottom：
         // 列表高度有下限保护，窗口被压到 MinimumSize 时它会被撑大，
         // 若提示的 y 取自 list.Bottom 就会和按钮行叠在一起。
-        var rowY = ClientSize.Height - ButtonHeight - BottomPad;
-        var hintY = rowY - Gap - HintHeight;
+        var buttonHeight = ScaledButtonHeight;
+        var hintHeight = ScaledHintHeight;
+        var bottomPad = ScaledBottomPad;
+        var sidePad = ScaledSidePad;
+        var gap = ScaledGap;
+        var listTop = ScaledListTop;
 
-        // 列表吃掉中间的剩余高度；上限同样由底边决定，保证不盖住提示。
-        var maxList = Math.Max(40, hintY - Gap - ListTop);
-        var listHeight = Math.Clamp(
-            ClientSize.Height - ListTop - (HintHeight + Gap + ButtonHeight + BottomPad), 40, maxList);
+        var rowY = ClientSize.Height - buttonHeight - bottomPad;
+        var hintY = rowY - gap - hintHeight;
 
-        list.Location = new Point(SidePad, ListTop);
-        list.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), listHeight);
+        // 列表吃掉中间的剩余高度。**下限不能盖过上限**：
+        // 原实现是 Math.Max(40, hintY - Gap - ListTop) 先给一个 40px 的下限，
+        // 再 Math.Clamp(…, 40, maxList) —— 而 max 自己也带了 Math.Max(40, …)，
+        // 于是"窗口比提示 + 按钮所需还矮"时 maxList 恒为 40，列表底边
+        // （ListTop + 40）就压到 hintY - Gap 之下，与提示零间隙相接甚至重叠，
+        // 正是本方法开头承诺"控件不重叠"要避免的形状。
+        // 现在上限是**真实可用空间**，下限只在它之上生效；空间不够时列表贴住提示，
+        // 宁可压扁也不重叠。MinimumSize 已经保证正常拖拽不会走到这个分支。
+        var available = hintY - gap - listTop;
+        var listHeight = Math.Max(Px(24), Math.Min(
+            available, ClientSize.Height - listTop - (hintHeight + gap + buttonHeight + bottomPad)));
+        if (listHeight > available) listHeight = available;
 
-        hint.Location = new Point(SidePad, hintY);
-        hint.Size = new Size(Math.Max(80, ClientSize.Width - SidePad * 2), HintHeight);
+        list.Location = new Point(sidePad, listTop);
+        list.Size = new Size(Math.Max(Px(80), ClientSize.Width - sidePad * 2), listHeight);
 
-        LayoutButtons(rowY);
+        hint.Location = new Point(sidePad, hintY);
+        hint.Size = new Size(Math.Max(Px(80), ClientSize.Width - sidePad * 2), hintHeight);
+
+        LayoutButtons(rowY, sidePad, gap, buttonHeight);
     }
 
     /// <summary>
     /// 四个按钮在底部均分并居中。宽度按各按钮文字实测，超宽时压缩间隙。
     /// 窗口比"刚好放下"还窄时退化为左对齐贴边，不重叠。
     /// </summary>
-    private void LayoutButtons(int rowY)
+    private void LayoutButtons(int rowY, int sidePad, int gap, int buttonHeight)
     {
-        // 按钮文字与字体在构造期就定死了，宽度**永远不变**，而 Resize 是拖边框时
-        // 每像素触发一次的热路径。TextRenderer.MeasureText 走 GDI，明显比普通标量计算贵，
-        // 外加每次两个数组分配——这些全都不该在 Resize 里重复付。
-        buttonWidths ??= new[] { activateButton, deleteButton, closeButton, refreshButton }
-            .Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        // 文字与字体构造期就定死，宽度本应永远不变——但 **DeviceDpi 不是**：
+        // 构造期窗体句柄还没创建，DeviceDpi 还报着设计值；真正布局时（Load /
+        // 首次 Resize）句柄建好、它才变成真值，而 GDI 量文字用的正是设备上下文，
+        // 125% DPI 下同样一段文字要宽 25%。只按首次结果缓存、之后永不重测，
+        // 高 DPI 上按钮文字就会被 AutoEllipsis 截掉。
+        // 缓存以 DeviceDpi 为键：DPI 变了就重量（每种 DPI 只量一次，
+        // Resize 这条每像素热路径上仍然零 GDI 调用）。
+        if (buttonWidths is null || measuredAtDpi != DeviceDpi)
+        {
+            buttonWidths = new[] { activateButton, deleteButton, closeButton, refreshButton }
+                .Select(b => Math.Max(Px(84), TextRenderer.MeasureText(b.Text, b.Font).Width + Px(24)))
+                .ToArray();
+            measuredAtDpi = DeviceDpi;
+        }
 
         var buttons = new[] { activateButton, deleteButton, closeButton, refreshButton };
         // **必须 Clone**：int[] 是引用类型，直接用 buttonWidths 等于把下面压缩出来的
-        // 宽度写回那份缓存。后果是窗口拉宽后按钮不恢复，反复横拖一路压到 72px 下限
+        // 宽度写回那份缓存。后果是窗口拉宽后按钮不恢复，反复横拖一路压到下限
         // 就再也回不去了。缓存里存的是"文字实测宽度"这个不变量，压缩只是本次布局的
         // 临时结果，两者不能是同一份数据。
         var widths = (int[])buttonWidths!.Clone();
-        var total = widths.Sum() + Gap * (buttons.Length - 1);
-        var available = ClientSize.Width - SidePad * 2;
+        var total = widths.Sum() + gap * (buttons.Length - 1);
+        var available = ClientSize.Width - sidePad * 2;
         if (total > available && buttons.Length > 1)
         {
             var shrink = (int)Math.Ceiling((total - available) / (double)(buttons.Length - 1));
-            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(72, widths[i] - shrink);
-            total = widths.Sum() + Gap * (buttons.Length - 1);
+            var floor = Px(72);
+            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(floor, widths[i] - shrink);
+            total = widths.Sum() + gap * (buttons.Length - 1);
         }
 
-        var x = Math.Max(SidePad, (ClientSize.Width - total) / 2);
+        var x = Math.Max(sidePad, (ClientSize.Width - total) / 2);
         for (var i = 0; i < buttons.Length; i++)
         {
-            buttons[i].Size = new Size(widths[i], ButtonHeight);
+            buttons[i].Size = new Size(widths[i], buttonHeight);
             buttons[i].Location = new Point(x, rowY);
-            x += widths[i] + Gap;
+            x += widths[i] + gap;
         }
     }
 
     /// <summary>供布局自检遍历的控件清单（与 Resize 里记录的是同一组）。</summary>
     internal Control[] DumpControls() =>
         new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
+
+    /// <summary>
+    /// 版本槽大小的人读格式。**纯函数、可单测**。
+    ///
+    /// 原先一律 <c>N0</c>：不足 1 MB 的槽（半截安装、被删到一半的目录、
+    /// 只剩元数据的槽）会显示成 "0 MB"——一个看起来像"这个版本是空的"、
+    /// 实则只是没统计到的结论。1 MB 以下给一位小数、1 MB 以上才取整。
+    /// 统计失败（枚举抛异常）时返回 0，此时显示"—"而不是 "0 MB"。
+    /// </summary>
+    internal static string FormatSize(long bytes)
+    {
+        if (bytes <= 0) return "—";
+        const double mb = 1024.0 * 1024.0;
+        return bytes < mb
+            ? $"{bytes / mb:0.0} MB"
+            : $"{bytes / mb:N0} MB";
+    }
 
     private EngineVersionEntry? Selected =>
         !Gone && list.SelectedItems.Count > 0
@@ -350,7 +430,7 @@ internal sealed class EngineVersionsForm : Form
                 {
                     var item = new ListViewItem(entry.Version);
                     item.SubItems.Add(entry.IsActive ? "● 使用中" : "可切换");
-                    item.SubItems.Add(entry.SizeBytes > 0 ? $"{entry.SizeBytes / 1024.0 / 1024.0:N0} MB" : "—");
+                    item.SubItems.Add(FormatSize(entry.SizeBytes));
                     item.SubItems.Add(entry.InstalledAt.ToString("yyyy-MM-dd HH:mm"));
                     item.Tag = entry;
                     if (entry.IsActive) item.ForeColor = Color.FromArgb(34, 120, 60);
@@ -359,10 +439,13 @@ internal sealed class EngineVersionsForm : Form
             }
             finally { list.EndUpdate(); }
 
-            // 默认选中活动版本，方便一眼看到"现在用的是哪个"
+            // 默认选中活动版本，方便一眼看到"现在用的是哪个"。
+            // Tag 一律按 EngineVersionEntry 强转回去：Tag 是我们**自己**刚放进去的，
+            // 拿不到就说明有别的代码往列表里塞过东西——那一行不能直接崩掉整次刷新。
             if (list.Items.Count > 0)
             {
-                var active = list.Items.Cast<ListViewItem>().FirstOrDefault(i => ((EngineVersionEntry)i.Tag!).IsActive);
+                var active = list.Items.Cast<ListViewItem>()
+                    .FirstOrDefault(i => (i.Tag as EngineVersionEntry)?.IsActive == true);
                 (active ?? list.Items[0]).Selected = true;
             }
 
@@ -439,35 +522,59 @@ internal sealed class EngineVersionsForm : Form
         hint.Text = $"正在切换到 {sel.Version}…（停引擎 + 换目录，可能需要几秒）";
 
         string? error;
-        try { error = await activateVersion(sel.Version); }
-        catch (Exception ex) { error = ex.Message; }
-
-        if (Gone) return;
-
-        SetBusy(false);
-        if (error is not null)
+        // busy 是状态，必须**无条件**复位——与 ReloadAsync 的 finally 同一纪律。
+        // 此前这里是"if (Gone) return;"在 SetBusy(false) 之前：窗体一旦在 await 期间
+        // 被关掉，busy 就被永远留在 true。今天无害（closing/Disposed 都是粘性的，
+        // 窗体随即被 Dispose，busy 再没人读），但它与 ReloadAsync 的纪律自相矛盾：
+        // 只要有人放宽 Gone 的判据（例如改成"句柄没了但对象还在，好把结果交回父窗体弹提示"），
+        // 这条早退就变成一条再也清不掉的 busy。try/finally 让复位与是否还活着无关。
+        try
         {
-            // ActivateEngineVersionAsync 的返回值约定：以 ActivateSwitchedWithWarningPrefix
-            // 开头 = 切换本体已成功、但有警告（旧版本归档失败、副本保留在 engine.tmp）。
-            // 标题与图标据此区分，不能把成功误报成"切换失败"。
-            var switchedWithWarning = error.StartsWith(
-                HarnessForm.ActivateSwitchedWithWarningPrefix, StringComparison.Ordinal);
-            hint.Text = (switchedWithWarning ? "切换完成（有警告）：" : "切换失败：") + error;
-            MessageBox.Show(this, error,
-                switchedWithWarning ? "切换完成（有警告）" : "切换失败",
-                MessageBoxButtons.OK,
-                switchedWithWarning ? MessageBoxIcon.Warning : MessageBoxIcon.Error);
-            // 失败也必须回到磁盘真相：目录交换走到一半才失败的情况（新的顶上失败、
-            // 旧的搬回也失败）会让列表里显示的"使用中"版本与磁盘实际状态不一致，
-            // 而界面上没有任何提示。SetBusy 恢复了「刷新」，但数据没人去重读。
+            try { error = await activateVersion(sel.Version); }
+            catch (Exception ex)
+            {
+                // 类型与堆栈要留痕（见 M10）：只把 Message 交给用户，
+                // "Cannot find a directory" 与 "拒绝访问" 在这里长得一模一样。
+                Swallow.Quiet(ex, $"engine-activate:{sel.Version}");
+                error = ex.Message;
+            }
+
+            if (Gone) return;
+
+            if (error is not null)
+            {
+                // ActivateEngineVersionAsync 的返回值约定：以 ActivateSwitchedWithWarningPrefix
+                // 开头 = 切换本体已成功、但有警告（旧版本归档失败、副本保留在 engine.tmp）。
+                // 标题与图标据此区分，不能把成功误报成"切换失败"。
+                var switchedWithWarning = error.StartsWith(
+                    HarnessForm.ActivateSwitchedWithWarningPrefix, StringComparison.Ordinal);
+                var failureHint = (switchedWithWarning ? "切换完成（有警告）：" : "切换失败：") + error;
+                MessageBox.Show(this, error,
+                    switchedWithWarning ? "切换完成（有警告）" : "切换失败",
+                    MessageBoxButtons.OK,
+                    switchedWithWarning ? MessageBoxIcon.Warning : MessageBoxIcon.Error);
+                // 失败也必须回到磁盘真相：目录交换走到一半才失败的情况（新的顶上失败、
+                // 旧的搬回也失败）会让列表里显示的"使用中"版本与磁盘实际状态不一致，
+                // 而界面上没有任何提示。SetBusy 恢复了「刷新」，但数据没人去重读。
+                //
+                // 提示文案**必须排在 ReloadAsync 之后**再设：ReloadAsync 自己会把 hint
+                // 改成"正在读取…"再改成统计文案，先设后刷的话失败原因当场就被覆盖掉了
+                // ——用户看到列表刷新了一下，错误却消失得无影无踪。
+                await ReloadAsync();
+                if (!Gone) hint.Text = failureHint;
+                return;
+            }
             await ReloadAsync();
-            return;
+            if (Gone) return;
+            MessageBox.Show(this,
+                $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
+                "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
-        await ReloadAsync();
-        if (Gone) return;
-        MessageBox.Show(this,
-            $"已切换到 {sel.Version}。\n\n回到主界面点「启动」以新版本启动。",
-            "切换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        finally
+        {
+            busy = false;
+            if (!Gone) SetBusy(false);
+        }
     }
 
     private void DeleteSelected() => _ = GuardedAsync(DeleteSelectedCore);
@@ -480,7 +587,7 @@ internal sealed class EngineVersionsForm : Form
         var confirm = MessageBox.Show(this,
             $"删除引擎版本 {sel.Version}？\n\n" +
             $"目录：{sel.Path}\n" +
-            (sel.SizeBytes > 0 ? $"大小：约 {sel.SizeBytes / 1024.0 / 1024.0:N0} MB\n" : string.Empty) +
+            (sel.SizeBytes > 0 ? $"大小：约 {sel.SizeBytes / 1024.0 / 1024.0:N1} MB\n" : string.Empty) +
             "\n此操作不可恢复（该版本需要时可重新安装）。",
             "删除引擎版本", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes) return;
@@ -491,20 +598,36 @@ internal sealed class EngineVersionsForm : Form
         hint.Text = $"正在删除 {sel.Version}…（清理上万个文件，可能需要几秒）";
 
         string? error;
-        try { error = await deleteVersion(sel.Version); }
-        catch (Exception ex) { error = ex.Message; }
-
-        if (Gone) return;
-
-        SetBusy(false);
-        if (error is not null)
+        // 与 ActivateSelectedCore 同一纪律：busy 无条件复位（见那里的注释），
+        // 失败异常按类型 + 堆栈留痕，不只留一句 Message。
+        try
         {
-            hint.Text = "删除失败：" + error;
-            MessageBox.Show(this, error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            try { error = await deleteVersion(sel.Version); }
+            catch (Exception ex)
+            {
+                Swallow.Quiet(ex, $"engine-delete:{sel.Version}");
+                error = ex.Message;
+            }
+
+            if (Gone) return;
+
+            if (error is not null)
+            {
+                var failureHint = "删除失败：" + error;
+                MessageBox.Show(this, error, "删除引擎版本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                // 文案排在 ReloadAsync **之后**：ReloadAsync 自己会改 hint，
+                // 先设后刷等于把失败原因当场抹掉。
+                await ReloadAsync();
+                if (!Gone) hint.Text = failureHint;
+                return;
+            }
             await ReloadAsync();
-            return;
         }
-        await ReloadAsync();
+        finally
+        {
+            busy = false;
+            if (!Gone) SetBusy(false);
+        }
     }
 }
 

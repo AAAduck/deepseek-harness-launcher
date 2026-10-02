@@ -26,8 +26,11 @@
 
   <ItemGroup>
     <!-- 版本与本机 NuGet 缓存一致，dotnet restore 可离线完成。
-         PrivateAssets="all" 是必需的：这三个包是测试宿主本身，绝不能顺着
-         ProjectReference 传染给主工程（主工程是 WinExe，被塞进测试 SDK 就跑不起来了）。 -->
+         PrivateAssets="all" 施加于**测试宿主**那两个包（Microsoft.NET.Test.Sdk、
+         xunit.runner.visualstudio）：它们绝不能顺着 ProjectReference 传染给主工程
+         （主工程是 WinExe，被塞进测试 SDK 就跑不起来了）。
+         xunit 是**故意不给** PrivateAssets 的——它是本工程真正编译时要用的
+         xunit.core/xunit.assert，漏了它测试代码就编不过。 -->
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" PrivateAssets="all" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" PrivateAssets="all" />

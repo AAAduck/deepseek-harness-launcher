@@ -34,8 +34,10 @@ internal sealed class FoldersForm : Form
     private bool busy;
     /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"（见 Gone）。</summary>
     private bool closing;
-    /// <summary>四个按钮的实测文字宽度，构造后第一次布局时算一次即可。</summary>
+    /// <summary>四个按钮的实测文字宽度，按 <see cref="measuredAtDpi"/> 那个 DPI 量一次即可。</summary>
     private int[]? buttonWidths;
+    /// <summary>上面那份宽度是在哪个 DPI 下量的。DPI 变了必须重量（GDI 量的是设备像素）。</summary>
+    private int measuredAtDpi = -1;
     /// <summary>正在跑剪贴板重试（最长约 600ms），用来挡住连点。</summary>
     private bool copying;
     /// <summary>
@@ -51,7 +53,19 @@ internal sealed class FoldersForm : Form
 
     internal FoldersForm()
     {
-        AutoScaleMode = AutoScaleMode.Dpi;
+        // AutoScaleMode.Dpi 在**没有** AutoScaleDimensions、也没有 PerformAutoScale
+        // 的情况下是空操作：WinForms 按默认的 96/96 算缩放因子，在 120/144 DPI 上得到的
+        // 仍是 1.0，于是本文件里所有布局常量（36/28/16/8/14…）其实全是 96-DPI 像素——
+        // 高 DPI 下按钮、列表、提示会整体偏小偏挤。
+        //
+        // 两条路：① 补齐 AutoScaleDimensions 并调用 PerformAutoScale，让 WinForms
+        // 自己缩放——但那样 ApplyResponsiveLayout 里按 ClientSize 反推的公式又会被
+        // 二次缩放，两套机制打架（主窗体 SetFixedClientSize 的注释记的就是这个坑）。
+        // ② 明确关掉自动缩放，自己按实际 DeviceDpi 换算——与主窗体同一纪律，
+        // 一套机制，全部常量从 <see cref="Px"/> 派生。
+        // 这里选 ②：布局常量在代码里仍是可读的 96-DPI 设计值，读代码就能看出
+        // "这里是按 96 设计、运行时按 DeviceDpi 换算"。
+        AutoScaleMode = AutoScaleMode.None;
         Text = "DeepSeek Harness 相关目录";
         // 目录列表初始给 168px（表头 + 约 5–6 行）：本机有 17 个真实位置，多露几行实用。
         // 窗口可缩放，尺寸变化由 ApplyResponsiveLayout 接管（列表吃剩余高度，底部锚定）。
@@ -95,6 +109,9 @@ internal sealed class FoldersForm : Form
         // 且被截掉的正是后半句「「凭据」含密钥，分享截图前请留意」这条唯一的安全提醒。
         // 布局自检只看控件 Bounds，看不见文字截断，所以它永远不会报这里。
         hint.Size = new Size(628, 36);
+        // AutoEllipsis 是第三道保险：万一换算后仍放不下，宁可显示"…"，
+        // 也不能让 Label 静默把后半句吃掉（Label 默认是直接裁掉，不留任何痕迹）。
+        hint.AutoEllipsis = true;
         hint.ForeColor = Color.FromArgb(108, 114, 126);
         Controls.Add(hint);
 
@@ -205,38 +222,65 @@ internal sealed class FoldersForm : Form
         // 与「版本管理」同一套公式：提示与按钮行都从客户区**底边反推**，
         // 列表高度上下都夹住。原来 hint 的 y 取自 list.Bottom，而 list 有下限保护，
         // 窗口压到最矮时提示会与按钮行零间隙相接（两个窗体的公式就此对齐）。
-        const int listTop = 36;
-        const int hintHeight = 36;   // 两行：计数 + 凭据提醒（见构造里 hint 的注释）
-        const int buttonHeight = 28;
-        const int bottomPad = 14;
-        const int margin = 16;
-        const int gap = 8;
+        // 所有常量都经 <see cref="Px"/> 换算（DpiScale 的来由见构造函数的注释）。
+        var listTop = Px(36);
+        var hintHeight = Px(36);   // 两行：计数 + 凭据提醒（见构造里 hint 的注释）
+        var buttonHeight = Px(28);
+        var bottomPad = Px(14);
+        var margin = Px(16);
+        var gap = Px(8);
 
         var rowY = ClientSize.Height - buttonHeight - bottomPad;
         var hintY = rowY - gap - hintHeight;
 
-        var maxList = Math.Max(40, hintY - gap - listTop);
-        var listHeight = Math.Clamp(
-            ClientSize.Height - listTop - (hintHeight + gap + buttonHeight + bottomPad), 40, maxList);
+        // 下限**不得盖过上限**（见「版本管理」ApplyResponsiveLayout 的同款注释）：
+        // Math.Max(40, …) 那个下限会让"窗口比提示+按钮所需还矮"时列表压到提示之上，
+        // 与本方法开头承诺的"控件不重叠"直接矛盾。
+        var available = hintY - gap - listTop;
+        var listHeight = Math.Max(Px(24), Math.Min(
+            available, ClientSize.Height - listTop - (hintHeight + gap + buttonHeight + bottomPad)));
+        if (listHeight > available) listHeight = available;
 
         list.Location = new Point(margin, listTop);
-        list.Size = new Size(Math.Max(80, ClientSize.Width - margin * 2), listHeight);
+        list.Size = new Size(Math.Max(Px(80), ClientSize.Width - margin * 2), listHeight);
 
         hint.Location = new Point(margin, hintY);
-        hint.Size = new Size(Math.Max(80, ClientSize.Width - margin * 2), hintHeight);
+        hint.Size = new Size(Math.Max(Px(80), ClientSize.Width - margin * 2), hintHeight);
 
         LayoutButtons(rowY, margin, gap, buttonHeight);
     }
+
+    // ---- DPI 换算 ----------------------------------------------------------
+
+    /// <summary>
+    /// 96-DPI 设计值 → 本机实际像素。<see cref="DeviceDpi"/> 在句柄创建前可能还是
+    /// 设计值，句柄建好之后（Load / 首次 Resize）才是真值——所以布局常量**不能**
+    /// 在字段初始化器里算死，必须每次布局时现算（ApplyResponsiveLayout 已经如此）。
+    /// </summary>
+    private double DpiScale => Math.Max(1.0, DeviceDpi / 96.0);
+
+    /// <summary>按 <see cref="DpiScale"/> 把 96-DPI 的设计像素换算成实际像素（向上取整）。</summary>
+    private int Px(double designValue) => (int)Math.Ceiling(designValue * DpiScale);
 
     /// <summary>
     /// 四个按钮在底部均分并居中；窗口比"刚好放下"还窄时压缩宽度并退化为贴边，不重叠。
     /// </summary>
     private void LayoutButtons(int rowY, int margin, int gap, int buttonHeight)
     {
-        // 文字与字体构造期就定死，宽度永远不变；而 Resize 是拖边框时每像素触发一次的热路径。
-        // TextRenderer.MeasureText 走 GDI，比普通标量计算贵得多，不该在这里重复付。
-        buttonWidths ??= new[] { openButton, copyButton, closeButton, refreshButton }
-            .Select(b => Math.Max(84, TextRenderer.MeasureText(b.Text, b.Font).Width + 24)).ToArray();
+        // 文字与字体构造期就定死，宽度本应永远不变——但 **DeviceDpi 不是**：
+        // 构造期窗体句柄还没创建，DeviceDpi 还报着设计值；等真正布局时（Load /
+        // 首次 Resize）句柄建好、它才变成真值，而 GDI 量文字用的正是设备上下文，
+        // 125% DPI 下同样一段文字要宽 25%。只按首次结果缓存、之后永不重测，
+        // 高 DPI 上按钮文字就会被 AutoEllipsis 截掉。
+        // 缓存以 DeviceDpi 为键：DPI 变了就重量（每种 DPI 只量一次，
+        // Resize 这条每像素热路径上仍然零 GDI 调用）。
+        if (buttonWidths is null || measuredAtDpi != DeviceDpi)
+        {
+            buttonWidths = new[] { openButton, copyButton, closeButton, refreshButton }
+                .Select(b => Math.Max(Px(84), TextRenderer.MeasureText(b.Text, b.Font).Width + Px(24)))
+                .ToArray();
+            measuredAtDpi = DeviceDpi;
+        }
 
         var buttons = new[] { openButton, copyButton, closeButton, refreshButton };
         // **必须 Clone**：int[] 是引用类型，直接用 buttonWidths 等于把下面压缩出来的
@@ -249,7 +293,8 @@ internal sealed class FoldersForm : Form
         if (total > available && buttons.Length > 1)
         {
             var shrink = (int)Math.Ceiling((total - available) / (double)(buttons.Length - 1));
-            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(72, widths[i] - shrink);
+            var floor = Px(72);
+            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(floor, widths[i] - shrink);
             total = widths.Sum() + gap * (buttons.Length - 1);
         }
 
@@ -269,8 +314,8 @@ internal sealed class FoldersForm : Form
     /// <summary>「相关目录」里最多列出的会话项目目录数，超出部分只报个数。</summary>
     private const int MaxSessionProjects = 200;
 
-    /// <summary>收集结果：条目 + 因超过上限而未列出的会话项目数。</summary>
-    private readonly record struct CollectResult(List<Entry> Entries, int SessionOverflow);
+    /// <summary>收集结果：条目 + 因超过上限而未列出的会话项目数 + 看得见但读不了的条目数。</summary>
+    private readonly record struct CollectResult(List<Entry> Entries, int SessionOverflow, int Unreadable);
 
     /// <summary>
     /// 收集所有相关位置。只返回真实存在的，按"常用的排前面"排序。
@@ -285,7 +330,7 @@ internal sealed class FoldersForm : Form
         // 是个**相对路径**——后面的 Exists 会按当前工作目录解析，可能误命中，
         // 并把一个相对路径显示甚至打开给用户。宁可少列几项。
         if (string.IsNullOrWhiteSpace(appData) || string.IsNullOrWhiteSpace(userProfile))
-            return new CollectResult(new List<Entry>(), 0);
+            return new CollectResult(new List<Entry>(), 0, 0);
 
         var appDir = Path.Combine(appData, "DeepSeekHarness");
         var dshHome = Path.Combine(userProfile, ".dsh");
@@ -329,8 +374,10 @@ internal sealed class FoldersForm : Form
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // 整个 sessions 目录读不到（被占用/权限被撤）：主列表照常显示。
-                return new CollectResult(candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList(), 0);
+                // 整个 sessions 目录读不到（被占用/权限被撤）：主列表照常显示，
+                // 并把这一条也计入"存在但读不到"。
+                var main = KeepReadable(candidates, out var unreadable);
+                return new CollectResult(main, 0, unreadable + 1);
             }
             var shown = Math.Min(projects.Count, MaxSessionProjects);
             for (var i = 0; i < shown; i++)
@@ -355,8 +402,47 @@ internal sealed class FoldersForm : Form
             overflow = projects.Count - shown + skipped;
         }
 
-        var visible = candidates.Where(e => File.Exists(e.Path) || Directory.Exists(e.Path)).ToList();
-        return new CollectResult(visible, overflow);
+        var visible = KeepReadable(candidates, out var notReadable);
+        return new CollectResult(visible, overflow, notReadable);
+    }
+
+    /// <summary>
+    /// 候选条目里"确实存在"的那些，以及其中**存在却读不了**的个数。
+    ///
+    /// <c>File.Exists</c> / <c>Directory.Exists</c> 对"无权限访问"一律返回 false
+    /// ——与"不存在"完全无法区分。此前直接用它过滤，于是权限被撤、Defender 锁住、
+    /// OneDrive 占位符没下载这类**最需要排查**的位置，恰恰从这个"排查入口"里消失了：
+    /// 用户看到的是一份干净的列表，根本不知道还有东西存在而自己打不开。
+    ///
+    /// 现在分两步：Exists 先判"存在"（廉价、快），对返回 false 的少数候选项再用
+    /// 会抛的 <c>File.GetAttributes</c> 复核一遍——"到底是不存在，还是存在但读不了"。
+    /// 正常机器上复核几乎不发生，成本可以忽略。
+    /// </summary>
+    private static List<Entry> KeepReadable(List<Entry> candidates, out int unreadable)
+    {
+        unreadable = 0;
+        var kept = new List<Entry>(candidates.Count);
+        foreach (var e in candidates)
+        {
+            if (File.Exists(e.Path) || Directory.Exists(e.Path))
+            {
+                kept.Add(e);
+                continue;
+            }
+            // Exists 说没有、GetAttributes 说有 → 存在却读不了。
+            // 仍然列出来（并在说明里点明），因为"它在那里但你打不开"正是要排查的事。
+            try
+            {
+                File.GetAttributes(e.Path);
+                unreadable++;
+                kept.Add(e with { Note = e.Note + "（存在，但当前账户无权访问）" });
+            }
+            catch
+            {
+                // 真的不存在（或父目录本身就不可达）——按原语义剔除。
+            }
+        }
+        return kept;
     }
 
     private async Task ReloadAsync()
@@ -375,6 +461,7 @@ internal sealed class FoldersForm : Form
             var collected = await Task.Run(Collect);
             var entries = collected.Entries;
             var sessionOverflow = collected.SessionOverflow;
+            var unreadable = collected.Unreadable;
 
             // await 期间用户可能关了窗：主窗体那边是 using var dialog + ShowDialog，
             // 窗口一返回就 Dispose，此后任何控件访问都是 ObjectDisposedException。
@@ -386,6 +473,11 @@ internal sealed class FoldersForm : Form
                 list.Items.Clear();
                 foreach (var entry in entries)
                 {
+                    // 📄 / 📁 是纯装饰，依赖系统的彩色 emoji 字体回退；缺字体时会显示成
+                    // 两个方框。它**不承担任何信息**：文件/目录的区别还由
+                    // item.ForeColor 与 Entry.IsFile 各自独立表达，双击走的也是
+                    // Entry.IsFile 而不是我用哪一个表情。所以字体缺失只是难看，
+                    // 不会误导或阻断任何操作——不必为此把标记换成占宽更大的文字。
                     var item = new ListViewItem(entry.IsFile ? "📄 " + entry.Name : "📁 " + entry.Name);
                     item.SubItems.Add(entry.Path);
                     item.SubItems.Add(entry.Note);
@@ -399,11 +491,12 @@ internal sealed class FoldersForm : Form
             if (list.Items.Count > 0)
             {
                 var restore = list.Items.Cast<ListViewItem>()
-                    .FirstOrDefault(i => ((Entry)i.Tag!).Path == previous);
+                    .FirstOrDefault(i => (i.Tag as Entry)?.Path == previous);
                 (restore ?? list.Items[0]).Selected = true;
             }
 
             hint.Text = $"共 {entries.Count} 项（只显示真实存在的位置）" +
+                        (unreadable > 0 ? $"，其中 {unreadable} 项存在但当前账户无权访问" : string.Empty) +
                         (sessionOverflow > 0 ? $"，另有 {sessionOverflow} 个会话项目未列出" : string.Empty) +
                         "\r\n「凭据」含密钥，分享截图前请留意";
         }
@@ -448,7 +541,8 @@ internal sealed class FoldersForm : Form
         if (busy || Gone) return;
         var sel = Selected;
         openButton.Enabled = sel is not null;
-        copyButton.Enabled = sel is not null;
+        // copying 期间也保持禁用：重试最长 600ms，连点只会撞上"上一次还没结束"。
+        copyButton.Enabled = sel is not null && !copying;
     }
 
     private void OpenSelected()
@@ -497,6 +591,12 @@ internal sealed class FoldersForm : Form
     /// （剪贴板管理器、远程桌面、截图工具）。原先第一次失败就弹窗，于是用户
     /// 点「复制路径」常常要试两三次。这里做有限次退避重试：等待必须离开 UI 线程，
     /// 所以整体做成 async。
+    ///
+    /// 重试条件必须包含 <see cref="ThreadStateException"/>：它在当前线程不是 STA
+    /// （OLE 剪贴板要求 STA）时抛出，属于"换个时机/换个线程也许能成"的同类问题。
+    /// 只认 ExternalException 时它会落进下面的兜底 catch，弹出一句
+    /// "剪贴板可能被其他程序占用，或内容超出限制"——与真实原因毫无关系，
+    /// 把用户引向一个错误的排查方向。
     /// </summary>
     private async Task CopySelectedPathAsync()
     {
@@ -514,7 +614,7 @@ internal sealed class FoldersForm : Form
                     if (!Gone) hint.Text = "已复制：" + sel.Path;
                     return;
                 }
-                catch (ExternalException) when (attempt < 4)
+                catch (Exception ex) when (ex is ExternalException or ThreadStateException && attempt < 4)
                 {
                     await Task.Delay(60 * (attempt + 1));
                     // 刻意不在这里判 Gone：最后一次尝试仍要照做，复制成功就是成功。
@@ -524,7 +624,7 @@ internal sealed class FoldersForm : Form
                 catch (Exception ex)
                 {
                     if (!Gone)
-                        MessageBox.Show(this, $"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。",
+                        MessageBox.Show(this, DescribeCopyFailure(ex),
                             "复制路径", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
@@ -533,9 +633,17 @@ internal sealed class FoldersForm : Form
         finally
         {
             copying = false;
-            // 与 ReloadAsync 的 SetBusy 并发：复制重试最长 600ms，与刷新窗口可重叠——
-            // 无条件下 enable 会在刷新中途把按钮复活，读到的是上一轮的陈旧 Tag。
-            if (!Gone && !busy) copyButton.Enabled = true;
+            // 统一走 UpdateButtons，而不是"无条件下 enable"：那会在刷新中途把按钮复活，
+            // 而读到的还是上一轮的陈旧 Tag。UpdateButtons 同时考虑 busy / Selected /
+            // copying，窄竞态（刷新或选中恰好落在这两行之间）由同一处收口。
+            UpdateButtons();
         }
     }
+
+    /// <summary>复制失败的原因要说到点上——别把 ThreadStateException 说成"内容超出限制"。</summary>
+    private static string DescribeCopyFailure(Exception ex) =>
+        ex is ThreadStateException
+            ? "复制失败：当前线程不是 STA（剪贴板要求单线程单元）。\n\n" +
+              ex.Message + "\n\n这属于程序内部问题，请把详情反馈给开发者。"
+            : $"复制失败：{ex.Message}\n\n剪贴板可能被其他程序占用，或内容超出限制。";
 }

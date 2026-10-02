@@ -93,10 +93,13 @@
        不带前缀的 /assembly/assemblyIdentity/@version 实测匹配为空。
        这么写比字符串匹配更抗改：属性顺序、单双引号、缩进怎么变都照样匹配得到。
        更新启动器.bat 那句 echo 的版本号**可以**机械校验：此前注释说"单纯搜版本号
-       在忘了改 echo 那行时照样通过"只对搜任意版本号成立——定向搜「更新到 $(Version)」
-       即可精确钉住 echo 那一行（.bat 里其余版本号 1.3.0/1.4.0/1.4.1 都出现在
-       注释里、不带"更新到"前缀，不会误命中；忘了改 echo 时构建直接失败，
-       不再依赖人记得同步）。 -->
+       在忘了改 echo 那行时照样通过"只对搜任意版本号成立——定向搜 TARGET_VERSION
+       即可精确钉住那一行（.bat 里其余版本号 1.3.0/1.4.0/1.4.1 都出现在
+       注释里、不会误命中；忘了改时构建直接失败，不再依赖人记得同步）。
+       ⚠ 版本号现在写在**四处**：<Version> / app.manifest / 脚本**文件名** / 脚本内
+       TARGET_VERSION。文件名也带版本是后加的要求（资源管理器里常同时躺着好几份历史
+       脚本，功能完全相同、用户无从分辨该双击哪一个），因此下面的检查相应加了
+       "新名存在 + 旧名已消失"两条。 -->
   <Target Name="VerifyManifestAssemblyVersion" BeforeTargets="PrepareForBuild">
     <!-- &lt;Version&gt; 必须是 x.y.z 三段式：下面的清单校验按 "$(Version).0" 补第四段，
          四段式/预发布（1.4.2.0、1.4.3-rc.1）会拼出不存在的五段版本号，
@@ -111,10 +114,21 @@
            Text="app.manifest 的 assemblyIdentity version 是「@(ManifestAssemblyVersion)」，与本项目的 &lt;Version&gt;$(Version)&lt;/Version&gt; 不一致——清单里应写成 $(Version).0（Windows 只认四段数字）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改；前两处漏改会在这里编不过。" />
     <!-- 第三处（.bat echo）的机械校验，理由见上方注释。 -->
     <PropertyGroup>
-      <_LauncherBatText>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\更新启动器.bat'))</_LauncherBatText>
+      <_LauncherBatName>更新启动器-更新到$(Version).bat</_LauncherBatName>
+      <_LauncherBatText>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\$(_LauncherBatName)'))</_LauncherBatText>
     </PropertyGroup>
-    <Error Condition="!$(_LauncherBatText.Contains('更新到 $(Version)'))"
-           Text="更新启动器.bat 里 echo 给用户看的版本号没有同步成 $(Version)（找不到「更新到 $(Version)」）。版本号写在 csproj / app.manifest / 更新启动器.bat 三处，必须同步改。" />
+    <!-- 文件名也要带着版本号：资源管理器里常同时躺着好几份历史脚本，功能完全相同、
+         差别只在"装的是哪一版"，用户没法从内容上分辨该双击哪一个。名字带版本即可
+         一眼选对；前缀固定是为了让"搜 更新启动器"仍只命中最新那份。
+         这条检查把"改了 <Version> 却忘了改名"从发布事故变成构建失败。 -->
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\$(_LauncherBatName)')"
+           Text="找不到 $(_LauncherBatName)。本项目要求更新脚本的文件名里标明目标版本（更新启动器-更新到$(Version).bat）；发布新版本时要连 csproj 的 &lt;Version&gt;、app.manifest 的 assemblyIdentity version、脚本名与脚本内 echo 一起改。" />
+    <Error Condition="!$(_LauncherBatText.Contains('set &quot;TARGET_VERSION=$(Version)&quot;'))"
+           Text="$(_LauncherBatName) 里的 TARGET_VERSION 没有同步成 $(Version)。版本号写在 csproj / app.manifest / 脚本名 / 脚本内 TARGET_VERSION 四处，必须同步改。" />
+    <!-- 旧名残留会让人双击到上一版：内容与新脚本逐字相同、装的是旧版本。
+         显式报错而不是静默共存——两者的后果完全一样（装错版本），而共存时没人会发现。 -->
+    <Error Condition="Exists('$(MSBuildProjectDirectory)\更新启动器.bat')"
+           Text="还存在旧名「更新启动器.bat」。它与新脚本内容相同但文件名不标明版本，双击它会装错版本。请删除它（改名请用 git mv 以保留历史）。" />
   </Target>
 
   <!-- 单测要直接跑几个 internal 纯函数：进程匹配内核、快照判定、恢复路径守卫、

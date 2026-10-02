@@ -92,8 +92,21 @@ internal static class Program
         }
         finally
         {
+            // 只在**真的持有**且**持有者就是当前线程**时释放。ReleaseMutex 跨线程调用
+            // 抛 ApplicationException——Main 与 Acquire 在同一线程，理论上不会发生，
+            // 但那正是最不该靠"理论上"活着的地方：异常被 catch { } 吞掉之后，
+            // 互斥体会一直挂到进程退出，"上一个实例还在跑"的判断也就失真了。
+            // 无论哪种失败都留痕——单实例保护的状态是排查"为什么开了两个启动器"的
+            // 第一条线索，吞掉它等于把唯一的证据扔了。
             if (ownsSingleInstanceMutex)
-                try { singleInstanceMutex?.ReleaseMutex(); } catch { }
+            {
+                try { singleInstanceMutex?.ReleaseMutex(); }
+                catch (Exception ex)
+                {
+                    HarnessForm.AppendStartupLog(
+                        $"[single-instance] 释放互斥体失败：{ex.GetType().Name}: {ex.Message}");
+                }
+            }
             try { singleInstanceMutex?.Dispose(); } catch { }
         }
     }
@@ -177,9 +190,15 @@ internal static class Program
             ownsSingleInstanceMutex = createdNew;
             return createdNew;
         }
-        catch
+        catch (Exception ex)
         {
-            // 拿不到互斥体不该拦住用户启动。
+            // 拿不到互斥体不该拦住用户启动——但**必须留痕**。原实现是一个
+            // 没有 catch 变量的 `catch { return true; }`：单实例保护在这一刻失效
+            // （两个实例互相杀引擎、抢同一个 web-url.txt 与 3080 端口，
+            // 表现为"莫名其妙就断了"），而日志里一个字都没有，
+            // 事后排查完全无从知道"当时是不是根本没上锁"。
+            HarnessForm.AppendStartupLog(
+                $"[single-instance] 创建互斥体失败，本次按“无单实例保护”启动：{ex.GetType().Name}: {ex.Message}");
             return true;
         }
     }
@@ -190,6 +209,14 @@ internal static class Program
     /// </summary>
     private static void ActivateExistingWindow()
     {
+        // 候选必须是**本程序**：只按进程名找，会把同名的另一个程序（比如从源码树
+        // 跑起来的旧版、或用户自己放在别处的可执行文件）的主窗口提到前台——
+        // 用户看到的是"我双击了 A，结果弹出来的是 B 的窗口"。与 MatchesHarnessCommand
+        // 里"同名但路径不对就不是自己人"是同一条纪律，这里只是用在了自己身上。
+        var self = Environment.ProcessId;
+        var mine = string.Empty;
+        try { mine = Environment.ProcessPath ?? Application.ExecutablePath; } catch { }
+        var activated = false;
         try
         {
             // 首个实例可能还在构造窗口（MainWindowHandle 暂为 0）：只查一次会"找到进程
@@ -204,18 +231,56 @@ internal static class Program
                 {
                     using (process)
                     {
-                        if (process.Id == Environment.ProcessId) continue;
+                        if (process.Id == self) continue;
+                        if (!IsSameExecutable(process, mine)) continue;
                         var handle = process.MainWindowHandle;
                         if (handle == IntPtr.Zero) continue;
                         if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
-                        SetForegroundWindow(handle);
-                        return;
+                        // SetForegroundWindow 可能因前台锁策略被拒（返回 false）。
+                        // 失败不是"提起来了"，别当成功——否则下面的提示不会弹，
+                        // 用户看到的就是纯粹的"双击没反应"。
+                        activated = SetForegroundWindow(handle);
+                        if (activated) return;
                     }
                 }
                 Thread.Sleep(100);
             }
         }
+        catch (Exception ex)
+        {
+            HarnessForm.AppendStartupLog(
+                $"[single-instance] 激活已有窗口失败：{ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        // 3 秒内既没找到窗口、也没提起来：不要静默退出。原来这里是"什么都不做就
+        // return"，用户双击后的体感与"程序崩了"完全一致，而 startup-log 里同样一个字没有。
+        // 弹一句即可：说清是"已有实例在跑但提不起来"，并给出可操作的建议
+        // （任务栏里找 / 任务管理器看是不是卡死了）。
+        try
+        {
+            MessageBox.Show(
+                "检测到已有一个 DeepSeek Harness 正在运行，但没能把它的窗口提到前台。\n\n" +
+                "请在任务栏或 Alt+Tab 里找一下；若那个实例已卡死，用任务管理器结束它再重试。\n\n" +
+                $"（已尝试 {ActivateTimeoutSeconds} 秒；窗口路径：{mine}）",
+                "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
         catch { }
+    }
+
+    private const int ActivateTimeoutSeconds = 3;
+
+    /// <summary>两个进程是不是同一个可执行文件（同路径，比路径字符串）。</summary>
+    private static bool IsSameExecutable(Process process, string mine)
+    {
+        if (string.IsNullOrEmpty(mine)) return true;   // 取不到自己的路径就别拦（宁提错别不提示）
+        try
+        {
+            var path = process.MainModule?.FileName;
+            return !string.IsNullOrEmpty(path) &&
+                   string.Equals(path, mine, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     private const int SW_RESTORE = 9;
@@ -235,24 +300,35 @@ internal static class Program
 
     private static void WriteCrashLog(Exception ex)
     {
-        try
+        // 三个异常钩子可能并发进来（UI 线程 + 任意后台线程 + 未观察任务），
+        // 而它们全都对同一个文件做"读—拼—写"。不加锁时两个写入者会各自读到旧内容、
+        // 各自写回自己那份，其中一条堆栈就此丢失——而崩溃日志丢的恰恰是死因。
+        lock (crashLogGate)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(CrashLogPath)!);
-            var entry = $"=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n{ex}\n\n";
-            var existing = File.Exists(CrashLogPath)
-                ? File.ReadAllText(CrashLogPath, Encoding.UTF8)
-                : string.Empty;
-            var combined = existing + entry;
-            // 崩溃循环会把它无限撑大：超限时从最近一条旧记录的表头切起，
-            // 保留"上一次 + 这一次"（单条本身超限时只能整条留着——与
-            // update-log 的截断策略同一取舍：宁可留超长记录也不留无头片段）。
-            if (Encoding.UTF8.GetByteCount(combined) > 256 * 1024)
+            try
             {
-                var head = existing.LastIndexOf("=== ", StringComparison.Ordinal);
-                combined = head >= 0 ? existing[head..] + entry : entry;
+                Directory.CreateDirectory(Path.GetDirectoryName(CrashLogPath)!);
+                var entry = $"=== {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n{ex}\n\n";
+                var existing = File.Exists(CrashLogPath)
+                    ? File.ReadAllText(CrashLogPath, Encoding.UTF8)
+                    : string.Empty;
+                var combined = existing + entry;
+                // 崩溃循环会把它无限撑大：超限时从最近一条旧记录的表头切起，
+                // 保留"上一次 + 这一次"。**单条记录本身就超限时**，原实现把
+                // head >= 0 判成不可能（上一条前缀怎么也有几百字节）而留下
+                // existing[head..] + entry —— combined 其实一直超限，于是每一轮
+                // 都要把整份文件读进来、拼一次、写一次，而长度不减：
+                // 一个反复抛的大异常（典型是 OOM 或栈溢出）会把"读+写"变成每轮
+                // 上百 MB 的 IO，日志目录先被撑爆，死因反而最先被挤出去。
+                // 现在直接复用 HarnessForm.TrimLogTail——它已经处理了
+                // "单条超长"这条边界（保留尾部而不是返回空串）。
+                var trimmed = HarnessForm.TrimLogTail(combined);
+                File.WriteAllText(CrashLogPath, trimmed, new UTF8Encoding(false));
             }
-            File.WriteAllText(CrashLogPath, combined, new UTF8Encoding(false));
+            catch { }
         }
-        catch { }
     }
+
+    /// <summary>崩溃日志的写互斥（进程内）。见 <see cref="WriteCrashLog"/>。</summary>
+    private static readonly object crashLogGate = new();
 }

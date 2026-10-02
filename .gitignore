@@ -6,5 +6,8 @@ obj/
 # 构建产物：README 中 dotnet publish 可重建，不入库
 DeepSeekHarness.exe
 
+# dotnet test / vstest 的结果目录（每次跑测试都会生成，含本机绝对路径与耗时）
+TestResults/
+
 # 临时备份文件，不入库
 *.bak

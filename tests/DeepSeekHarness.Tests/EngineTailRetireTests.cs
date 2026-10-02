@@ -33,7 +33,10 @@ public class EngineTailRetireTests
     [Fact]
     public void 新引擎起跑后_旧循环下一次读就过期()
     {
-        // 起跑处是 ++engineTailToken。旧循环捕获的是自己那一份（3），
+        // 起跑处是 Interlocked.Increment(ref engineTailToken)——原先写的是 ++engineTailToken，
+        // 与 RetireEngineTail 的 Interlocked.Increment 混用同一个字段。虽都在 UI 线程、
+        // 当前无实竞态，却违背本文件"不靠平台恰好没出事"的纪律，两处写法也迟早漂移。
+        // 旧循环捕获的是自己那一份（3），
         // 之后无论循环顶还是逐行分发，读到的当前令牌都已经是 4。
         Assert.True(HarnessForm.TailGenerationAlive(3, 3));    // 起跑前：同代，照常分发
         Assert.False(HarnessForm.TailGenerationAlive(3, 4));   // 起跑后：立刻退场

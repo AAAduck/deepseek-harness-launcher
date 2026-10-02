@@ -20,7 +20,10 @@ internal static class ConfigBackup
 {
     /// <summary>
     /// 保留的最近快照数。每个快照只有几十 KB，留几份成本极低。
-    /// 注意其中含 .credentials.yaml 的明文副本——backup-info.txt 里已写明"勿外传"。
+    /// 凭据在快照里是 DPAPI 密文（见 <see cref="CredentialBackupName"/>），
+    /// 但它们**跨凭据轮换留存**：轮换 token 是为了吊销旧凭据，而把旧密文再留 8 份
+    /// 会削弱这个意图——密文虽解不开（只对当前用户），可它仍把"存在过一枚有效密钥"
+    /// 这件事记录在盘上。8 份的窗口有限，但值得知情，README 也有对应说明。
     /// </summary>
     private const int KeepSnapshots = 8;
 
@@ -34,7 +37,28 @@ internal static class ConfigBackup
     /// 同名会把本类内的 <c>Volatile.Read(...)</c> 变成 CS0119。
     /// </summary>
     internal static readonly ISet<string> VolatileConfigFiles =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".credentials.yaml" };
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { CredentialFile };
+
+    /// <summary>
+    /// 凭据文件名。提成常量是因为它现在出现在三个地方（备份清单、易变集、加密判定），
+    /// 各自手写字符串迟早会漂移。
+    /// </summary>
+    internal const string CredentialFile = ".credentials.yaml";
+
+    /// <summary>
+    /// 快照里凭据那份的**落盘名**：原名 + <c>.dpapi</c>。
+    ///
+    /// 为什么要在快照里加密：.credentials.yaml 是明文密钥，而快照默认留 8 份、
+    /// 每次配置变更都追加一份。这与本项目"web-url.txt 为什么要 DPAPI"的自身
+    /// 威胁模型直接矛盾——同一个目录里，一个文件为了"别的用户读不出"专门加密，
+    /// 另一个却把同样的密钥原样复制 8 份摊在磁盘上。更糟的是它**跨凭据轮换留存**：
+    /// 用户轮换 token 正是为了吊销旧凭据，可 8 份历史快照把吊销意图原样抵消掉了。
+    ///
+    /// 改名的理由不是"防偷看"（加密才是），而是**可辨识**：一眼就能看出哪份是密文，
+    /// 也保证 <see cref="Restore"/> 的通用拷贝分支绝不会把密文当明文盖回 $DSH_HOME。
+    /// 读旧快照（明文同名）仍然支持，见 Restore 里的解密判定。
+    /// </summary>
+    internal const string CredentialBackupName = CredentialFile + ".dpapi";
 
     internal static string BackupRoot => Path.Combine(LocalAppDir, "config-backups");
 
@@ -52,7 +76,7 @@ internal static class ConfigBackup
     /// </summary>
     private static IEnumerable<string> ConfigFiles()
     {
-        yield return ".credentials.yaml";
+        yield return CredentialFile;
         yield return "settings.yaml";
         yield return "settings.yaml.imported";
 
@@ -109,6 +133,14 @@ internal static class ConfigBackup
             // 字节数常常分毫不差（17051 -> 17051）但内容确实变了。用总哈希判断，
             // 结果就是"每次启动都算配置有变化"，快照名额会被这种例行改写迅速耗尽，
             // 真正需要留住的配置快照反而被挤掉。
+            //
+            // ⚠ 截断到 16 个十六进制字符（64 bit）是**有意的**，且只能用于"变了没有"
+            // 这个判断，绝不能当成完整性校验：
+            //   • 用途极窄——只比"这一轮和上一轮是不是同一份"，不比"对不对"。
+            //   • 64 bit 的碰撞概率在这台机器的全部快照轮次里可以忽略（生日界约
+            //     50 亿次才有一半概率），而 SHA-256 全文会让清单大出 60 倍。
+            //   • 万一碰撞，后果是"少拍一份快照"（NeedsSnapshot 判成没变），
+            //     而绝不会把损坏的内容当成好的——恢复动作读的是盘上的真实文件。
             var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var rel in files)
             {
@@ -139,10 +171,33 @@ internal static class ConfigBackup
             var previous = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (File.Exists(manifestPath))
             {
-                foreach (var line in File.ReadAllLines(manifestPath))
+                string[] lines;
+                try
+                {
+                    lines = File.ReadAllLines(manifestPath);
+                }
+                catch (Exception ex)
+                {
+                    // 读不出清单 ≠ 清单为空，但**效果相同**：NeedsSnapshot 的
+                    // "上一份清单为空 → 要拍"这条规则会把两种情况都导向"重新拍一份"，
+                    // 那正是此刻该做的事。此前是静默跳过——读失败与"首次运行"走同一条路，
+                    // 却连一条日志都没有，用户永远不知道自己那份去重基准已经失灵。
+                    Swallow.Quiet(ex, "config-manifest-read");
+                    lines = Array.Empty<string>();
+                }
+                foreach (var line in lines)
                 {
                     var sep = line.IndexOf('\t');
-                    if (sep > 0) previous[line[..sep]] = line[(sep + 1)..];
+                    // 半截行（写入中途被杀，见下面 manifest 的原子写）没有制表符，
+                    // 此前被静默丢弃——而丢掉的键在 NeedsSnapshot 眼里是"缺席"，
+                    // 于是触发一次多余的快照，8 个名额被无意义快照挤掉。
+                    // 现在显式留痕：静默丢键比快照多拍难查得多。
+                    if (sep <= 0)
+                    {
+                        HarnessForm.AppendStartupLog($"last-hashes.txt 有无法解析的行（缺少制表符），已忽略：{line}");
+                        continue;
+                    }
+                    previous[line[..sep]] = line[(sep + 1)..];
                 }
             }
 
@@ -172,17 +227,49 @@ internal static class ConfigBackup
                 // 抛 KeyNotFoundException，被外层 catch 吞成"整份快照失败"。
                 if (!hashes.TryGetValue(rel, out var hash)) continue;
                 var src = Path.Combine(DshHome, rel);
-                var dst = Path.Combine(target, rel);
+                // 凭据单独走 DPAPI：快照里不能留明文密钥（见 CredentialBackupName 的注释）。
+                // 加密失败就**跳过这个文件**而不是退化成明文——少备份一份凭据，
+                // 远好过在盘上再摊一份明文；跳过项自然不写进 manifest，下轮会重试。
+                var isCredential = rel.Equals(CredentialFile, StringComparison.OrdinalIgnoreCase);
+                var dst = Path.Combine(target, isCredential ? CredentialBackupName : rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
                 try
                 {
-                    File.Copy(src, dst, overwrite: true);
+                    if (isCredential)
+                    {
+                        var plain = File.ReadAllText(src);
+                        if (plain.Trim().Length == 0) continue;
+                        // 源文件本身可能已是 dpapi 格式（用户手工放进去的旧版状态），
+                        // 那就原样搬，不做二次加密——DpapiFile.WriteAllText 期望的是明文。
+                        var alreadyEncrypted = DpapiFile.IsEncryptedFile(src);
+                        DpapiFile.WriteAllText(dst, plain);
+                        if (alreadyEncrypted != DpapiFile.IsEncryptedFile(dst))
+                            throw new InvalidOperationException("凭据快照加密失败（DPAPI 不可用），本次未备份该文件");
+                    }
+                    else
+                    {
+                        File.Copy(src, dst, overwrite: true);
+                    }
                     copied[rel] = hash;
                 }
                 catch (Exception ex)
                 {
                     failedCopies.Add($"{rel}（{ex.GetType().Name}: {ex.Message}）");
                 }
+            }
+
+            // 一个文件都没复制成功时，**不能**返回非 null。
+            // 调用方（"恢复配置"前的留底）把"返回值非 null"当成"留底成功"，
+            // 返回一个空目录会让它以为"当前状态已另存"，于是放心覆盖——
+            // 而那一刻其实什么也没留下，这正是"留底失败即中止"要挡的那一步。
+            // 空目录本身也一并删掉：LatestSnapshot 只认有 backup-info.txt 的目录，
+            // 留着它只是让用户在自己的备份目录里看见一堆没有内容的文件夹。
+            if (copied.Count == 0)
+            {
+                HarnessForm.AppendStartupLog(
+                    $"配置快照一个文件都没复制成功（{failedCopies.Count} 项失败），已放弃并清理空目录");
+                try { Directory.Delete(target, recursive: true); } catch { }
+                return null;
             }
 
             var info = new StringBuilder();
@@ -198,16 +285,23 @@ internal static class ConfigBackup
             info.Append(
                 "恢复方法：把这里的文件按相同相对路径覆盖回 %USERPROFILE%\\.dsh\\ " +
                 "（覆盖前建议先关掉引擎）\n" +
-                "注意：快照内含 .credentials.yaml（明文密钥，且随快照保留多份），" +
+                $"注意：快照内的 {CredentialBackupName} 是 DPAPI 加密的凭据" +
+                "（只有当前 Windows 用户能解开；用「恢复配置」按钮会自动解密还原，\n" +
+                "  手工覆盖回 .credentials.yaml 前需先自行解密）。\n" +
                 "整个 config-backups 目录请勿外传、勿贴进截图。\n");
             File.WriteAllText(Path.Combine(target, "backup-info.txt"),
                 info.ToString(),
                 new UTF8Encoding(false));
 
-            File.WriteAllText(manifestPath,
-                string.Join("\n", copied.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
-                                        .Select(kv => kv.Key + "\t" + kv.Value)),
-                new UTF8Encoding(false));
+            // 清单**必须**原子写：它是整个去重机制的唯一依据，却是原地覆写
+            // （File.WriteAllText）。写到一半被杀 → 半截内容 → 读侧把没有制表符的行
+            // 静默丢弃 → 那些键"缺席" → NeedsSnapshot 每轮都判要拍，
+            // 8 个快照名额被无意义的快照轮流挤掉，而用户真正需要的那份反而没了。
+            // 同卷 Move 在 NTFS 上是原子的，与快照内容、Restore 走同一条纪律。
+            AtomicWrite(manifestPath,
+                Encoding.UTF8.GetBytes(string.Join("\n",
+                    copied.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                           .Select(kv => kv.Key + "\t" + kv.Value))));
             PruneOldSnapshots();
             return target;
         }
@@ -254,6 +348,21 @@ internal static class ConfigBackup
         catch { return "?"; }
     }
 
+    /// <summary>
+    /// 快照目录按"新的在前"排序。
+    ///
+    /// 主键是目录的<b>创建时间</b>，目录名只作同刻的次序兜底。原先只按名字排，
+    /// 而名字里的时间戳是<b>本地时钟</b>：NTP 回拨、夏令时跳变、手动改时间都会让
+    /// 排序与真实先后脱钩。后果是具体的两条——
+    ///   • <see cref="LatestSnapshot"/> 可能挑中一份比别的更旧的快照去恢复；
+    ///   • <see cref="PruneOldSnapshots"/> 按名字倒序保留前 N 份，于是可能删掉
+    ///     刚拍的那份、把三天前的留下。用户看到的"最新备份"根本不是最新。
+    /// 名字排序在这里不是"更简单"，只是"更常见地正确"。
+    /// </summary>
+    private static IOrderedEnumerable<DirectoryInfo> OrderByNewestFirst(this IEnumerable<DirectoryInfo> dirs) =>
+        dirs.OrderByDescending(d => { try { return d.CreationTimeUtc; } catch { return DateTime.MinValue; } })
+            .ThenByDescending(d => d.Name, StringComparer.Ordinal);
+
     private static void PruneOldSnapshots()
     {
         try
@@ -262,7 +371,7 @@ internal static class ConfigBackup
             var dirs = Directory.GetDirectories(BackupRoot)
                 .Select(d => new DirectoryInfo(d))
                 .Where(d => d.Name.Length >= 15 && d.Name[8] == '-')
-                .OrderByDescending(d => d.Name)
+                .OrderByNewestFirst()
                 .ToList();
             foreach (var old in dirs.Skip(KeepSnapshots))
             {
@@ -327,7 +436,113 @@ internal static class ConfigBackup
         return next == Path.DirectorySeparatorChar || next == Path.AltDirectorySeparatorChar;
     }
 
-    /// <summary>最新一份快照的路径，没有则 null。</summary>
+    /// <summary>
+    /// <paramref name="candidateFullPath"/> 到 <paramref name="rootFullPath"/> 的**每一段**
+    /// 上都没有重解析点（junction / 符号链接 / 目录联接）吗？
+    ///
+    /// 这是 <see cref="IsWithinRoot"/> 看不见的那一半：那条防线只做词法比较，
+    /// 而 <c>Path.GetFullPath</c> **不解析重解析点**。于是
+    /// <c>C:\Users\me\.dsh\profiles\web</c> 在 <c>profiles</c> 是个指向
+    /// <c>D:\elsewhere</c> 的 junction 时，路径字符串完全落在 root 之内、
+    /// 防线放行，而实际写入落在 root 之外——"恢复动作唯一的纵深防线"形同虚设。
+    /// 源侧同理：快照里塞一个指向外部的链接文件，枚举出的 src 字符串"合法"，
+    /// <c>File.ReadAllBytes</c> 读到的却是别处的内容。
+    ///
+    /// <b>边界</b>：只查 root <b>之下</b>的段，不查 root 自己。把 <c>$DSH_HOME</c>
+    /// 整个放到别的盘（重定向到 OneDrive / 另一块盘）是用户自己的正当选择，
+    /// 那道 junction 正是他要的，不该被这里判成不安全。root 之下则一律不放行。
+    ///
+    /// 纯函数内核（可单测）：IO 通过 <paramref name="attributesOf"/> 注入。
+    /// 读不到属性一律判 false（不放行）——判不出"安全"时就当不安全。
+    /// </summary>
+    internal static bool IsSafeRestoreTarget(
+        string candidateFullPath, string rootFullPath, Func<string, FileAttributes> attributesOf)
+    {
+        if (string.IsNullOrEmpty(candidateFullPath) || string.IsNullOrEmpty(rootFullPath)) return false;
+        if (attributesOf is null) return false;
+
+        string root, current;
+        try
+        {
+            if (!Path.IsPathFullyQualified(rootFullPath)) return false;
+            root = Path.GetFullPath(rootFullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            current = Path.GetFullPath(candidateFullPath);
+            if (root.Length == 0) return false;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;   // 形状都不对，谈不上安不安全
+        }
+
+        // 必须整体在 root 之内（词法那一半，与 IsWithinRoot 同判据）。
+        if (!string.Equals(current, root, StringComparison.OrdinalIgnoreCase) &&
+            !current.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // 从候选路径逐级往上走到 root 为止，每一段都要不是重解析点。
+        while (current.Length > root.Length)
+        {
+            FileAttributes attr;
+            try { attr = attributesOf(current); }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // **该段还不存在**——这恰恰是首次恢复时目的地的常态。
+                // "不存在"不可能是重解析点（那样 File.Exists/Directory.Exists 会真），
+                // 所以把它当成普通目录继续往上走。
+                // 不这么处理的话，RestoreInto 会对每一个**新写入**的文件返回 false：
+                // 目标文件此刻还不存在，GetAttributes 抛 FileNotFoundException，
+                // 于是整条恢复路径上一件都恢复不了（第一版就踩了这个，
+                // 由 ConfigBackupRestoreTests 的端到端用例抓出来）。
+                attr = FileAttributes.Normal;
+            }
+            catch { return false; }        // 读不到属性 = 判不出来 = 不放行
+            if ((attr & FileAttributes.ReparsePoint) != 0) return false;
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrEmpty(parent) || parent.Length >= current.Length) return false;
+            current = parent;
+        }
+        return string.Equals(current, root, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary><see cref="IsSafeRestoreTarget"/> 的 IO 包装：真的去读文件属性。</summary>
+    internal static bool IsSafeRestoreTarget(string candidateFullPath, string rootFullPath) =>
+        IsSafeRestoreTarget(candidateFullPath, rootFullPath, File.GetAttributes);
+
+    /// <summary>
+    /// 原子覆盖写：先写同目录临时文件，再同卷 Move 覆盖。
+    /// <c>File.Copy(overwrite)</c> / <c>File.WriteAllText</c> 都是原地覆写——进程被杀或
+    /// 断电落在写入中途，.credentials.yaml / settings.yaml 就停在部分写入状态，
+    /// 而这正是备份机制本来要防的损坏。同卷 Move 在 NTFS 上是原子的：任何时刻目标
+    /// 要么是旧的完整内容，要么是新的完整内容。临时文件失败时顺带清掉，不留在配置目录里。
+    /// </summary>
+    private static void AtomicWrite(string full, byte[] contents)
+    {
+        // 临时文件必须是**每次唯一**的：固定名 "x.tmp" 在两个写入者同时落到同一路径时
+        // 会互相覆盖、再互相 Move，最后一次成功把另一次的内容变成孤儿或半份。
+        // CreateSnapshot 并没有全局互斥（"启动前"与"升级引擎前"两条路径都调它，
+        // 还各自包在 Task.Run 里），所以这是真实可能的并发。
+        var tmp = full + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp";
+        try
+        {
+            File.WriteAllBytes(tmp, contents);
+            File.Move(tmp, full, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 最新一份**完整**快照的路径，没有则 null。
+    ///
+    /// "完整"= 有 <c>backup-info.txt</c>。它在 <see cref="CreateSnapshot"/> 里是
+    /// **所有文件都复制完之后**才写的，因此它的存在等价于"内容已全部落盘"。
+    /// 少了这道筛选，一次在复制途中被强杀/断电的**撕裂快照**（目录在、文件半份）
+    /// 会成为 LatestSnapshot —— 而用户点「恢复配置」拿到的就是它。
+    /// 撕裂目录此刻还没有 backup-info.txt，跳过它之后 LatestSnapshot 自然落到
+    /// 上一份完整的；下轮 NeedsSnapshot 因 manifest 未更新还会重拍一次。
+    /// </summary>
     internal static string? LatestSnapshot()
     {
         try
@@ -336,7 +551,8 @@ internal static class ConfigBackup
             return Directory.GetDirectories(BackupRoot)
                 .Select(d => new DirectoryInfo(d))
                 .Where(d => d.Name.Length >= 15 && d.Name[8] == '-')
-                .OrderByDescending(d => d.Name)
+                .Where(d => File.Exists(Path.Combine(d.FullName, "backup-info.txt")))
+                .OrderByNewestFirst()
                 .FirstOrDefault()?.FullName;
         }
         catch { return null; }
@@ -357,7 +573,19 @@ internal static class ConfigBackup
     /// 把一份快照覆盖回 $DSH_HOME。只恢复快照里存在的文件，不动其他任何东西。
     /// 逐文件失败照旧继续（一个文件写不进去不该让其余的都不恢复），但**必须记账**。
     /// </summary>
-    internal static RestoreResult Restore(string snapshotDir)
+    internal static RestoreResult Restore(string snapshotDir) => RestoreInto(snapshotDir, DshHome);
+
+    /// <summary>
+    /// <see cref="Restore"/> 的可测内核：目标根由参数给出。
+    ///
+    /// 为什么要拆出这个重载：Restore 是**全套件唯一一条"覆盖写用户配置"的路径**，
+    /// 数据安全权重最高，却因为硬编码 <see cref="DshHome"/> 而无法用临时目录测——
+    /// 真写测试就等于把开发者自己的 ~/.dsh 覆盖一遍。拆开之后，
+    /// GetRelativePath → Combine → 越界守卫 → 链接守卫 → tmp+Move → 失败记账 →
+    /// 跳过 backup-info.txt / .tmp 这整条链都能在临时目录里钉住，
+    /// 而生产入口的语义一字未变（Restore 就是 RestoreInto(snapshotDir, DshHome)）。
+    /// </summary>
+    internal static RestoreResult RestoreInto(string snapshotDir, string dshHome)
     {
         var failed = new List<string>();
         var restored = 0;
@@ -371,43 +599,69 @@ internal static class ConfigBackup
             // USERPROFILE 解析为空时 DshHome 是相对路径 ".dsh"——GetFullPath 会把它
             // 落到当前工作目录，恢复"成功"却写错了位置、界面还报成功数。必须在这里
             // 挡住，并把原因如实报给用户（与 CreateSnapshot 的同形状护栏成对）。
-            if (!Path.IsPathFullyQualified(DshHome))
+            if (!Path.IsPathFullyQualified(dshHome))
             {
                 failed.Add("USERPROFILE 解析为空，无法定位 .dsh；未做任何改动。");
                 return new RestoreResult(0, failed);
             }
-            var root = Path.GetFullPath(DshHome);
+            var root = Path.GetFullPath(dshHome);
+            var snapshotRoot = Path.GetFullPath(snapshotDir);
             foreach (var src in Directory.GetFiles(snapshotDir, "*", SearchOption.AllDirectories))
             {
                 var rel = Path.GetRelativePath(snapshotDir, src);
                 if (rel.Equals("backup-info.txt", StringComparison.OrdinalIgnoreCase)) continue;
-                var dst = Path.Combine(DshHome, rel);
-                // 纵深防御：恢复是往用户配置目录**覆盖写入**，路径必须仍在 $DSH_HOME 内。
-                // 快照目录由本程序生成、正常不会越界，但一旦目录被外部改动过，
-                // 一个 "../" 就可能写到别处去。
+                // 跳过写入中断留下的 .tmp 残骸。它们不是配置，是某次 AtomicWrite /
+                // File.Copy 写到一半被杀的产物：盖进 $DSH_HOME 只会多出一份垃圾文件，
+                // 而 .credentials.yaml.tmp 这类名字还会让某些读取方按前缀匹配到它。
+                if (rel.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
+                // 快照里的凭据叫 <see cref="CredentialBackupName"/>，落回 $DSH_HOME 时
+                // 必须去掉那个后缀——否则引擎会拿一份没人读的文件当凭据，
+                // 表现为"恢复了却登不上"。
+                var dst = rel.Equals(CredentialBackupName, StringComparison.OrdinalIgnoreCase)
+                    ? Path.Combine(dshHome, CredentialFile)
+                    : Path.Combine(dshHome, rel);
+
+                // 纵深防御，两道：
+                // ① <see cref="IsWithinRoot"/>：路径必须在 $DSH_HOME 内。
+                //    快照目录由本程序生成、正常不会越界，但一旦目录被外部改动过，
+                //    一个 "../" 就可能写到别处去。**它只是词法比较**——
+                //    GetFullPath 只做规范化，不解析重解析点。
+                // ② <see cref="IsSafeRestoreTarget"/>：沿途不得有 junction / 符号链接。
+                //    ①②都过、而 `profiles\web` 本身是个指向别处的 junction 时，
+                //    "路径字符串落在 $DSH_HOME 内"完全成立，**实际写入却在根外**——
+                //    这正是纯字符串防线看不见的那一类。源侧同样要查：快照里放一个
+                //    指向外部的链接文件，枚举出的 src 字符串"合法"，读到的却是别处的内容。
                 var full = Path.GetFullPath(dst);
                 if (!IsWithinRoot(full, root))
                 {
                     failed.Add($"{rel}（越出 $DSH_HOME，已跳过）");
                     continue;
                 }
+                if (!IsSafeRestoreTarget(src, snapshotRoot) || !IsSafeRestoreTarget(full, root))
+                {
+                    failed.Add($"{rel}（路径上有链接/联接点，无法确认写入 $DSH_HOME 之内，已跳过）");
+                    continue;
+                }
                 try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-                    // 原子覆盖：先写临时文件再同卷 Move。File.Copy(overwrite) 是原地
-                    // 覆写——进程被杀/断电落在写一半时，.credentials.yaml / settings.yaml
-                    // 就停在部分写入状态，而这正是备份机制本来要防的损坏。
-                    // 同卷 Move 在 NTFS 上是原子的：任何时刻目标要么是旧的完整内容，
-                    // 要么是新的完整内容。临时文件失败时顺带清掉，不留在配置目录里。
-                    var tmp = full + ".tmp";
-                    try
+                    if (rel.Equals(CredentialBackupName, StringComparison.OrdinalIgnoreCase))
                     {
-                        File.Copy(src, tmp, overwrite: true);
-                        File.Move(tmp, full, overwrite: true);
+                        // 凭据快照是密文，必须解开再写回——.credentials.yaml 只能是明文。
+                        // 解不开（换了用户/换了机器/DPAPI 主密钥被清）就**跳过并记账**：
+                        // 静默盖一份解不开的垃圾进去，引擎下次启动会一直认证失败，
+                        // 而用户看到的却是"已恢复 N 个文件"。
+                        var plain = DpapiFile.ReadAllText(src);
+                        if (plain is null)
+                        {
+                            failed.Add($"{rel}（无法解密：快照由另一个 Windows 用户或另一台机器创建）");
+                            continue;
+                        }
+                        AtomicWrite(full, Encoding.UTF8.GetBytes(plain));
                     }
-                    finally
+                    else
                     {
-                        try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                        AtomicWrite(full, File.ReadAllBytes(src));
                     }
                     restored++;
                 }
