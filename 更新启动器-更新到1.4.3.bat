@@ -3,121 +3,124 @@ chcp 65001 >nul
 setlocal
 rem 用脚本所在目录定位，不硬编码绝对路径——挪目录/拷给别人都能用。
 set "ROOT=%~dp0"
-set "STAGED=%LOCALAPPDATA%\DeepSeekHarness\update-staging\DeepSeekHarness.exe"
+set "STAGE=%LOCALAPPDATA%\DeepSeekHarness\update-staging"
 
-rem ── 目标版本（脚本文件名里也带着它）──────────────────────────────────────
-rem 本脚本改名的规则：**文件名末尾必须写明"更新到哪个版本"**，即
-rem   更新启动器-更新到<版本>.bat
-rem 理由：资源管理器里常常同时躺着好几份历史脚本，功能完全相同、差别只在"装的是
-rem 哪一版"，用户没法从内容上分辨该双击哪一个——名字上写清楚即可一眼选对。
-rem 前缀保持不变，是为了让"搜 更新启动器"仍然只命中最新那份（代价是每次发布
-rem 都要改名，所以 csproj 里加了对照检查，忘了改名构建就失败）。
-rem TARGET_VERSION 与文件名是两处独立书写，所以开头立刻自查一次：名字与 echo
-rem 对不上就当场中止，别等到用户装完才发现装的不是他以为的那一版。
+rem ── 目标版本 ───────────────────────────────────────────────────────────────
+rem 版本号写在四处：csproj <Version> / app.manifest / 本脚本的**文件名** / 下面这行。
+rem 文件名带版本是给发布者/使用者一眼选对用的；真正的"装的是不是这一版"由下面
+rem 对 exe 实际版本号的校验把关，不再靠"文件名对得上"这种自我声明。
+rem csproj 的 VerifyManifestAssemblyVersion 负责在构建期保证这四处同步。
 set "TARGET_VERSION=1.4.3"
-echo %~nx0 | find /i /c "更新到%TARGET_VERSION%" >nul 2>&1
-if errorlevel 1 (
-  echo.
-  echo ✗ 脚本名与目标版本不一致：本脚本叫「%~nx0」，但 TARGET_VERSION 是 %TARGET_VERSION%。
-  echo   本脚本改名的规则是「更新启动器-更新到版本号.bat」，改名与 echo 必须同步。
-  echo   （引擎没被动过，当前一切照旧。）
-  pause
-  exit /b 1
-)
 
-rem ── 本脚本的机制（1.3.0 起，本机实测验证）─────────────────────────────────
-rem 引擎的 stdout/stderr 已从管道改为 engine-stdio.log 文件（启动器 tail 文件捕获
-rem 认证链接与进度），引擎的生死与启动器解耦。所以：
-rem   ① taskkill /f 只按映像名杀 DeepSeekHarness.exe（绝不碰 node.exe）——
-rem      引擎与 3080 上的 Web 会话原样存活；
-rem   ② 新实例起来后探到 web-url.txt 的链接仍可用，直接复用引擎、打开浏览器，
-rem      全程无感（实测：模拟启动器强杀后引擎持续存活写日志）；
-rem   ③ 例外：从管道耦合的旧版跨进 1.3.0 的【首次】更新，旧引擎仍会随断管退出，
-rem      新实例自动走完整重启（十几秒，会话历史在盘上不丢）。这一次之后皆无感。
-echo 即将把启动器更新到 %TARGET_VERSION%（semver 护栏补上比较器的预发布门槛；杀进程匹配收窄到引擎入口；恢复前留底失败即中止；引擎认领与日志 tail 的竞态收口；弹窗一律挂到主窗体上）。
-echo Web 会话不会中断（首次从旧版迁移除外，那会重启一次引擎、历史不丢）。
+rem ── 找新 exe ──────────────────────────────────────────────────────────────
+rem 依次尝试，用第一个找到的：
+rem   1) 第一个命令行参数 ——把 exe 直接拖到本脚本上（最省事，也最不容易装错）
+rem   2) 脚本旁 out\  ——与发布输出的同名目录
+rem   3) 脚本旁 新版本\
+rem   4) 脚本旁 DeepSeekHarness-<版本>.exe ——与旧 exe 同名会撞车，所以带版本号
+rem   5) 上级 out\
+rem   6) update-staging\（旧流程，保留是为了不打断已经在用的人）
+rem
+rem ⚠ **脚本所在目录下的 DeepSeekHarness.exe 绝不作为候选**：那是本脚本的
+rem **目标**（脚本自己就要覆盖它）。把它当来源 = 拿旧版盖旧版，然后报"更新成功"。
+rem
+rem 全部判断都在顶层、不在任何 (...) 块里，因此普通 %VAR% 展开就够用——
+rem 块内 %VAR% 会在块执行前一次性展开成空串，是 cmd 最经典的一类坑（见下方校验块）。
+set "SRC="
+if not "%~1"=="" if exist "%~1" set "SRC=%~1"
+if not defined SRC if exist "%ROOT%out\DeepSeekHarness.exe" set "SRC=%ROOT%out\DeepSeekHarness.exe"
+if not defined SRC if exist "%ROOT%新版本\DeepSeekHarness.exe" set "SRC=%ROOT%新版本\DeepSeekHarness.exe"
+if not defined SRC if exist "%ROOT%DeepSeekHarness-%TARGET_VERSION%.exe" set "SRC=%ROOT%DeepSeekHarness-%TARGET_VERSION%.exe"
+if not defined SRC if exist "%ROOT%..\out\DeepSeekHarness.exe" set "SRC=%ROOT%..\out\DeepSeekHarness.exe"
+if not defined SRC if exist "%STAGE%\DeepSeekHarness.exe" set "SRC=%STAGE%\DeepSeekHarness.exe"
+
+if not defined SRC goto no_source
+
+echo.
+echo   %TARGET_VERSION%   <--   %SRC%
 echo.
 
-if not exist "%STAGED%" (
-  echo 找不到待更新的启动器：
-  echo   %STAGED%
-  echo 请先把新版本 exe 放进 update-staging\ 目录，再运行本脚本。
-  echo （引擎没被动过，当前一切照旧。）
-  pause
-  exit /b 1
-)
+rem ── 对 exe 实际版本号的校验 ────────────────────────────────────────────────
+rem 此前脚本从头到尾只比对"文件名里的字符串"和"脚本里写的字符串"——那是在拿
+rem 自我声明当证据：把任何版本的 exe 放进去，它照样装、照样报成功。
+rem 这里读 exe 自己的版本资源（右键→属性 里显示的那个），对不上才拦。
+rem 读不到（PowerShell 被禁用/精简系统）就跳过——不因缺工具而中止。
+set "SRCVER="
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Item -LiteralPath '%SRC%').VersionInfo.ProductVersion" 2^>nul`) do set "SRCVER=%%v"
+if not defined SRCVER goto skip_version
+rem ProductVersion 常带 "+源码哈希" 后缀（1.4.3+abc1234），先按 '+' 截掉再**全等**比较。
+rem 不用 findstr /b /c:"<版本>" 做前缀匹配：/b 只锚定行首，于是 1.4.30 会被当成 1.4.3 放行
+rem ——而这正是"装错版本"最不能出现的一种错。for /f 按 '+' 切分不需要转义，
+rem 避开了在批处理里拼正则要转义每个 "." 的麻烦（那是另一类引号地狱）。
+set "SRCVER_BASE="
+for /f "tokens=1 delims=+" %%v in ("%SRCVER%") do set "SRCVER_BASE=%%v"
+if /i not "%SRCVER_BASE%"=="%TARGET_VERSION%" goto version_mismatch
 
-rem ── SHA256 完整性校验（防 staging 目录被写坏或替换）──────────────────────
-rem 发布时把 exe 和它的 .sha256 文件一起放进 update-staging\。
-rem 没有 .sha256 文件时跳过校验（兼容旧流程），有则必须比对通过才继续。
+:skip_version
+
+rem ── SHA256 完整性校验（可选）───────────────────────────────────────────────
+rem 旁边有同名 .sha256 才校验，没有就跳过——不要求用户为了跑一次更新而先去
+rem 生成一个校验文件（那才是真正的反人类）。
 rem
-rem ⚠ 1.4.0 修复（务必别退回旧写法）：旧版把比较写在 if (...) 括号块里且用
-rem %VAR% 引用——cmd 对整个括号块做**一次性解析**，块内 %VAR% 在任何一行
-rem 执行前就展开成空串，于是实际比较的是 ""==""，校验**永远通过**
-rem （实测：期望哈希故意写错仍打印"✓ 校验通过"）。必须用 setlocal
-rem enabledelayedexpansion + !VAR! 延迟展开。
-rem 摘要提取也一并修了：不再 findstr /v "hash"（中文系统的 certutil 表头是
-rem "SHA256 的 C:\… 哈希:"，不含小写 "hash"，过滤靠不住），改为只认
-rem 十六进制行。⚠ 1.4.1 两处缺一不可：① 字符类补空格——老式 certutil 按空格
-rem 分隔字节对输出（"ab cd ef"），不含空格的正则会把哈希行整行滤掉、校验在
-rem 老系统上永远中止；空格由下一行 !COMPUTED: =! 去掉。② 必须加 /c:——
-rem findstr /r 会把带空格的引号串**拆成多个模式**（实测表头/提示行反而被误命中），
-rem /c: 才让整串是"一个"正则。
-rem ⚠ 1.4.2 修复：存在性判断必须在 enabledelayedexpansion **之前**做。
-rem %LOCALAPPDATA% 含 "!"（合法用户名，如 C:\Users\yule!）时，延迟展开会把
-rem % 展开结果里的 "!" 当延迟变量标记吃掉，路径被改坏、if exist 恒为假，
-rem 整个校验块被**静默跳过**——fail-open，与上面"有则必须比对通过才继续"的承诺相反。
-rem 所以先在延迟展开未启用的环境里判一次存在性，用 DO_SHA 把结果带进块内；
-rem 块内引用路径一律用 !VAR!（延迟展开的取值结果不会被二次扫描，"!" 安全），
-rem 不能再退回 %VAR% 内联展开。
-set "SHA256FILE=%STAGED%.sha256"
+rem ⚠ 存在性判断必须在 enabledelayedexpansion **之前**做：%LOCALAPPDATA% 含 "!"
+rem （合法用户名，如 C:\Users\yule!）时，延迟展开会把展开结果里的 "!" 当延迟变量
+rem 标记吃掉，路径被改坏、if exist 恒为假，整个校验块被**静默跳过**（fail-open）。
+rem 所以这里先在未启用延迟展开的环境里判一次，用 DO_SHA 把结果带进块内；
+rem 块内一律用 !VAR!（延迟展开的取值结果不会被二次扫描）。
 set "DO_SHA=0"
-if exist "%SHA256FILE%" set "DO_SHA=1"
+if exist "%SRC%.sha256" set "DO_SHA=1"
 
 setlocal enabledelayedexpansion
 if "!DO_SHA!"=="1" (
   set "COMPUTED="
-  for /f "tokens=*" %%a in ('certutil -hashfile "!STAGED!" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
+  for /f "tokens=*" %%a in ('certutil -hashfile "!SRC!" SHA256 2^>nul ^| findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$"') do set "COMPUTED=%%a"
   set "COMPUTED=!COMPUTED: =!"
-  rem .sha256 若用记事本以"UTF-8"保存会带 BOM（EF BB BF），"set /p" 会把这 3 字节
-  rem 读进 EXPECTED 开头，与纯十六进制的 COMPUTED 永不相等 → 校验永远失败且提示误导
-  rem （"文件可能已损坏"）。用 findstr 只认十六进制行读取，天然滤掉 BOM/空白/换行。
+  rem 字符类里那个空格不能少：老式 certutil 按空格分隔字节对输出（"ab cd ef"），
+  rem 不含空格的正则会把哈希行整行滤掉、校验在老系统上永远中止。空格由下一行去掉。
+  rem .sha256 若用记事本以 UTF-8 保存会带 BOM（EF BB BF），"set /p" 会把这 3 字节
+  rem 读进 EXPECTED 开头，与纯十六进制的 COMPUTED 永不相等 → 永远失败且提示误导。
+  rem findstr 只认十六进制行，天然滤掉 BOM/空白/换行。
   set "EXPECTED="
-  for /f "tokens=*" %%a in ('findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$" "!SHA256FILE!"') do set "EXPECTED=%%a"
+  for /f "tokens=*" %%a in ('findstr /r /i /c:"^[0-9a-f][0-9a-f ]*$" "!SRC!.sha256"') do set "EXPECTED=%%a"
   set "EXPECTED=!EXPECTED: =!"
   if not defined COMPUTED (
-    echo.
-    echo ✗ 无法计算 staging 文件的 SHA256（certutil 失败）。
-    echo   请确认文件完整后重试，或删掉 .sha256 文件跳过校验。
+    >&2 echo.
+    >&2 echo   [x] 算不出这个 exe 的 SHA256（certutil 失败），没敢装。
+    >&2 echo       换个目录、关掉占用它的程序后重试；或删掉旁边的 .sha256 跳过校验。
+    >&2 echo.
     pause
     exit /b 1
   )
   if not defined EXPECTED (
-    echo.
-    echo ✗ .sha256 文件是空的，无法校验。
-    echo   请重新生成或删掉 .sha256 文件跳过校验。
+    >&2 echo.
+    >&2 echo   [x] 旁边的 .sha256 是空的，没法校验。
+    >&2 echo       重新生成它，或者删掉它跳过校验。
+    >&2 echo.
     pause
     exit /b 1
   )
   if /i not "!COMPUTED!"=="!EXPECTED!" (
-    echo.
-    echo ✗ SHA256 校验失败，staging 文件可能已损坏或被替换。
-    echo   期望：!EXPECTED!
-    echo   实际：!COMPUTED!
-    echo   请重新放入正确的 DeepSeekHarness.exe 和 .sha256 文件。
+    >&2 echo.
+    >&2 echo   [x] SHA256 对不上：这个 exe 多半没复制完整。
+    >&2 echo       把 exe 和它的 .sha256 一起重新复制一份到同一目录再运行。
+    >&2 echo.
     pause
     exit /b 1
   )
-  echo ✓ SHA256 校验通过
 )
-endlocal & rem 延迟展开只用于校验块；后续按普通展开继续（保持脚本其余部分原样）
+endlocal
 
-echo 按任意键开始更新（浏览器里的会话不用关）...
-pause >nul
-rem 只按映像名杀启动器（taskkill 无法按登录会话过滤，可能命中其他会话的启动器实例；
-rem 强杀不走 FormClosing，所以对方的引擎与会话不受影响，重开窗口即可）。
+rem ── 覆盖 ──────────────────────────────────────────────────────────────────
+rem 引擎的 stdout/stderr 已从管道改为 engine-stdio.log 文件，引擎的生死与启动器
+rem 解耦。所以 taskkill /f 只按映像名杀 DeepSeekHarness.exe（**绝不碰 node.exe**）：
+rem 引擎与 3080 上的 Web 会话原样存活，新实例起来后探到 web-url.txt 的链接仍可用，
+rem 直接复用引擎、打开浏览器，全程无感（实测：模拟启动器强杀后引擎持续存活写日志）。
+rem 例外：从管道耦合的旧版跨进 1.3.0 的【首次】更新，旧引擎仍会随断管退出，
+rem 新实例自动走完整重启（十几秒，会话历史在盘上不丢）。这一次之后皆无感。
+
+rem taskkill 无法按登录会话过滤，可能命中其他会话的启动器实例；强杀不走
+rem FormClosing，所以对方的引擎与会话不受影响，重开窗口即可。
 taskkill /im DeepSeekHarness.exe /f >nul 2>&1
-if errorlevel 1 echo （当前没有运行中的启动器，直接更新文件。）
 rem 等进程真的退出（最多 10 秒），比固定 timeout 2 稳——复制失败分支仍在兜底。
 set /a _w=0
 :poll_exit
@@ -128,31 +131,64 @@ timeout /t 1 /nobreak >nul
 set /a _w+=1
 goto poll_exit
 :exited
+
+echo   正在更新（约 10 秒，浏览器里的会话不受影响）...
+
+if exist "%ROOT%bin\Release\net8.0-windows\win-x64\" goto update_bin
+set "TARGET=%ROOT%DeepSeekHarness.exe"
+copy /y "%SRC%" "%TARGET%" >nul
+if errorlevel 1 goto copy_failed
+set "START=%TARGET%"
+goto done
+
+:update_bin
 rem 没有 bin\Release 输出目录（.bat 连 exe 一起分发给别人、或 bin 被清理）时，
 rem 只更新脚本旁边的副本并启动它——不能因为"工程目录不存在"整体失败，
 rem 那会把本可成功的更新变成报错退出（1.4.2 修复：原先连桌面副本都不更新）。
-if exist "%ROOT%bin\Release\net8.0-windows\win-x64\" goto update_bin
-copy /y "%STAGED%" "%ROOT%DeepSeekHarness.exe"
-if errorlevel 1 (
-  echo 更新失败：桌面副本写不进去（可能只读或被占用）。
-  pause
-  exit /b 1
-)
-echo 更新完成，正在启动新版本（会自动接上还在跑的引擎）...
-start "" "%ROOT%DeepSeekHarness.exe"
+set "TARGET=%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
+copy /y "%SRC%" "%TARGET%" >nul
+if errorlevel 1 goto copy_bin_failed
+copy /y "%SRC%" "%ROOT%DeepSeekHarness.exe" >nul 2>&1
+set "START=%TARGET%"
+
+:done
+echo   OK  已更新到 %TARGET_VERSION%
+echo.
+echo   正在启动新版本...
+start "" "%START%"
 exit /b 0
 
-:update_bin
-copy /y "%STAGED%" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
-if errorlevel 1 (
-  echo 复制到 bin\Release 失败：目标 exe 可能仍被占用或只读。
-  echo 旧启动器可能没被杀干净——确认 DeepSeekHarness.exe 已退出后重跑脚本。
-  echo （引擎不受影响，会话不会因此中断。）
-  pause
-  exit /b 1
-)
-copy /y "%STAGED%" "%ROOT%DeepSeekHarness.exe" >nul 2>&1
-if errorlevel 1 echo （提示：脚本旁边的桌面副本没更新成功，不影响本次启动，可之后手动复制。）
-echo 更新完成，正在启动新版本（会自动接上还在跑的引擎）...
-start "" "%ROOT%bin\Release\net8.0-windows\win-x64\DeepSeekHarness.exe"
-exit /b 0
+rem ── 失败出口 ──────────────────────────────────────────────────────────────
+rem 文案一律两行：出了什么事 + 你该干什么。不解释内部机制，也不让人去删安全文件。
+
+:no_source
+echo.
+echo   [x] 没找到要装的新 exe。
+echo       放到本脚本旁边的 out\ 目录，或直接把 DeepSeekHarness.exe 拖到这个脚本上再运行。
+echo.
+pause
+exit /b 1
+
+:version_mismatch
+echo.
+echo   [x] 这个 exe 是 %SRCVER%，不是 %TARGET_VERSION%。
+echo       请把 %TARGET_VERSION% 的 exe 拖到这个脚本上再运行。
+echo.
+pause
+exit /b 1
+
+:copy_bin_failed
+echo.
+echo   [x] 写不进去：%TARGET%
+echo       确认 DeepSeekHarness.exe 已完全退出（任务管理器里没有它）后重跑本脚本。
+echo.
+pause
+exit /b 1
+
+:copy_failed
+echo.
+echo   [x] 写不进去：%TARGET%
+echo       文件可能只读或被别的程序占用，关掉占用它的程序后重跑本脚本。
+echo.
+pause
+exit /b 1
