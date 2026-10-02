@@ -18,7 +18,7 @@ public class ProcessMatchTests
     private const int Port = 3080;
 
     private static bool Match(string name, string commandLine) =>
-        HarnessForm.MatchesHarnessCommand(name, commandLine, EngineDir, UserHome, Port);
+        ProcessMatch.MatchesHarnessCommand(name, commandLine, EngineDir, UserHome, Port);
 
     [Fact]
     public void 本启动器自己装的引擎_命中()
@@ -191,13 +191,13 @@ public class ProcessMatchTests
     [InlineData(@"C:\x\dsh web --port ８", false)]       // 全角数字不是端口（\d 退化为 ASCII）
     public void 端口必须是完整的数字token(string commandLine, bool expected)
     {
-        Assert.Equal(expected, HarnessForm.MentionsLauncherPort(commandLine, Port));
+        Assert.Equal(expected, ProcessMatch.MentionsLauncherPort(commandLine, Port));
     }
 
     [Fact]
     public void 空命令行在端口收窄处也不命中()
     {
-        Assert.False(HarnessForm.MentionsLauncherPort(string.Empty, Port));
+        Assert.False(ProcessMatch.MentionsLauncherPort(string.Empty, Port));
     }
 
     [Fact]
@@ -213,7 +213,7 @@ public class ProcessMatchTests
     {
         // 灾难性的输入：c.Contains("") 恒为 true，于是系统上**每一个**进程
         // 都会被判定成"本启动器装的引擎"并整树杀掉。原实现没有任何防线。
-        Assert.False(HarnessForm.MatchesHarnessCommand("notepad.exe", @"C:\notes\x.txt", string.Empty, UserHome, Port));
+        Assert.False(ProcessMatch.MatchesHarnessCommand("notepad.exe", @"C:\notes\x.txt", string.Empty, UserHome, Port));
     }
 
     [Fact]
@@ -222,7 +222,7 @@ public class ProcessMatchTests
         // 原判断写成 `userHomeDir.Length > 0 && !c.Contains(userHomeDir)`：
         // 空串时这道收窄被**跳过**，恰好把"归属不清就不动手"的既定语义反转成
         // "放行所有用户"。这里钉住的是修正后的语义。
-        Assert.False(HarnessForm.MatchesHarnessCommand("node.exe",
+        Assert.False(ProcessMatch.MatchesHarnessCommand("node.exe",
             @"C:\Users\someone-else\x\node_modules\@deepseek-ai\dsh\lib\bin.js web --port 3080",
             EngineDir, string.Empty, Port));
     }
@@ -236,7 +236,7 @@ public class ProcessMatchTests
         // 引擎目录本身就是确定性的证据。曾经把"userHomeDir 为空就返回 false"
         // 提到函数开头，结果在这类机器上连自己的引擎都杀不掉——残留引擎占住端口、
         // 孤儿 node_modules.lock 永远清不掉。这条用例就是防那个回归再来的。
-        Assert.True(HarnessForm.MatchesHarnessCommand("node.exe",
+        Assert.True(ProcessMatch.MatchesHarnessCommand("node.exe",
             $@"""{EngineDir}\node_modules\@deepseek-ai\dsh\lib\bin.js"" web --no-open --host 127.0.0.1 --port {Port}",
             EngineDir, string.Empty, Port));
     }

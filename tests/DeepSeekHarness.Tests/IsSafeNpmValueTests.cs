@@ -18,7 +18,7 @@ public class IsSafeNpmValueTests
     [InlineData("https://registry.npmmirror.com/")]   // 带尾斜杠的常见写法
     public void 正常的_registry地址_放行(string value)
     {
-        Assert.True(HarnessForm.IsSafeNpmValue(value));
+        Assert.True(CommandGuard.IsSafeNpmValue(value));
     }
 
     [Theory]
@@ -44,14 +44,14 @@ public class IsSafeNpmValueTests
     [InlineData("     ")]                  // 纯空白
     public void 危险或退化的值_拒绝(string value)
     {
-        Assert.False(HarnessForm.IsSafeNpmValue(value));
+        Assert.False(CommandGuard.IsSafeNpmValue(value));
     }
 
     [Fact]
     public void 超长值_拒绝_512是上界()
     {
         // npm 允许很长的 URL，但进命令行的值没有理由这么长；按实现钉住 < 512。
-        Assert.True(HarnessForm.IsSafeNpmValue(new string('a', 511)));
-        Assert.False(HarnessForm.IsSafeNpmValue(new string('a', 512)));
+        Assert.True(CommandGuard.IsSafeNpmValue(new string('a', 511)));
+        Assert.False(CommandGuard.IsSafeNpmValue(new string('a', 512)));
     }
 }

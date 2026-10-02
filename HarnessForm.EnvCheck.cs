@@ -436,8 +436,14 @@ internal sealed partial class HarnessForm : Form
     }
 
     // ── 7897 探测结果缓存（正负分开）──────────────────────────────────────────
-    private static bool? localProxyOpen;        // true=探到了（永久缓存）；false/null=探不到
-    private static DateTime localProxyOpenAt;   // 上次探测时间（负缓存 TTL 用）
+    // 刻意是“引用类型快照 + Volatile”而不是两个散装字段（bool? + DateTime）：
+    // bool? 是 2 字节、DateTime 是 8 字节结构，跨线程裸读都不保证原子；Volatile.Read
+    // 又只接受引用类型。整份快照原子替换后，“open 状态”与“探测时刻”永远成对，
+    // 不会读到“新状态配旧时刻”——与 GetDynamicPortRangeAsync 的
+    // DynamicPortRangeSnapshot 同一形状、同一条纪律。
+    private sealed record LocalProxyProbe(bool Open, long AtUtcTicks);
+
+    private static volatile LocalProxyProbe? localProxyProbe;
     private static readonly TimeSpan NegativeCacheTtl = TimeSpan.FromSeconds(60);
 
     /// <summary>
@@ -446,13 +452,16 @@ internal sealed partial class HarnessForm : Form
     /// </summary>
     private static bool IsLocalProxyOpen()
     {
-        if (localProxyOpen == true) return true;
-        if (localProxyOpen == false && DateTime.UtcNow - localProxyOpenAt < NegativeCacheTtl)
-            return false;
+        var probe = localProxyProbe;
+        if (probe is not null)
+        {
+            if (probe.Open) return true;
+            if (DateTime.UtcNow.Ticks - probe.AtUtcTicks < NegativeCacheTtl.Ticks)
+                return false;
+        }
 
         var open = IsTcpOpen("127.0.0.1", ProxyPort);
-        localProxyOpen = open;
-        localProxyOpenAt = DateTime.UtcNow;
+        localProxyProbe = new LocalProxyProbe(open, DateTime.UtcNow.Ticks);
         return open;
     }
 

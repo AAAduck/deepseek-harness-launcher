@@ -31,7 +31,7 @@ internal sealed partial class HarnessForm : Form
     ///
     /// ⚠ 刻意做成**惰性**的（原为 static readonly 字段，在类型初始化器里求值）。
     /// 静态字段初始化器会在**任何**静态成员首次被访问时执行——哪怕那个成员只是
-    /// <c>HarnessForm.ParseVersion</c>这样一个纯字符串函数。于是整套单测都经这条路径
+    /// <c>Semver.ParseVersion</c>这样一个纯字符串函数。于是整套单测都经这条路径
     /// 连带初始化了数据目录解析与三个 GDI+ 字体（见下方三个 Font）：
     /// 无 GUI 的 Windows Server Core / 容器 CI 上没有这些字体，也常常没有
     /// LOCALAPPDATA，于是**与被测逻辑毫无关系**的一条 <c>TypeInitializationException</c>
@@ -113,40 +113,9 @@ internal sealed partial class HarnessForm : Form
     private static readonly Regex AuthTokenRedactRegex = new(
         "([?&])token=[^\\s\\\"'<>\\x1b]+",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    /// <summary>
-    /// 命令行里"独立的数字 token"。端口收窄专用：必须**整体**等于本启动器的端口才算数。
-    /// 前后都不允许紧邻数字、小数点或任何单词字符，于是 "30801" 被当成一个整体而不是
-    /// "3080"，"3080x" 也不会被截成 "3080"。
-    ///
-    /// <b>ECMAScript 标志不能去掉</b>：.NET 默认的 <c>\w</c>/<c>\d</c> 含 Unicode——
-    /// 实测 <c>\w</c> 匹配「的」、<c>\d</c> 匹配全角「０」。那会让"端口紧邻一个汉字"
-    /// 被判成"没提端口"，也就是**漏杀真残留**：而这条收窄的失手方向不该是这个。
-    /// ECMAScript 下两者退化为 ASCII，端口紧邻汉字照样命中（这才是想要的），
-    /// 真正的分界仍然落在数字与字母上——30801、3080x 都会被放过。
-    /// </summary>
-    private static readonly Regex PortTokenRegex = new(
-        @"(?<![\w.])[0-9]{1,5}(?![\w.])",
-        RegexOptions.Compiled | RegexOptions.ECMAScript);
-    /// <summary>
-    /// 残留进程匹配的两条宽松正则。与 AuthUrlRegex/PortTokenRegex 同一纪律：
-    /// 提为 static readonly + Compiled（每个进程都要过一遍它们，内联字面量
-    /// 每次调用都要重新解析模式）。IgnoreCase 用选项表达，不再用内联 (?i)。
-    /// </summary>
-    private static readonly Regex DshCommandRegex = new(
-        @"(^|[\\/\s])dsh(?:\.cmd)?(?:[\\/](?:lib|bin))?\s+(?:web|--profile\s+web)\b",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex NpxDshCommandRegex = new(
-        @"\bnpx(?:\.cmd)?\b.*\b(?:@deepseek-ai[\\/]dsh|dsh)\b",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    /// <summary>
-    /// `npm view &lt;pkg&gt; version` 的合法输出形态。npm 的 version 字段恒为 semver，
-    /// 必以数字开头（1.2.3 / 1.2.3-rc.2 / 1.2.3+build 都过），
-    /// 而 npm 自己的 warn / notice / ERR! 文本、以及任何错误摘要都过不了这道闸。
-    /// ECMAScript：<c>\d</c> 只认 ASCII，避免全角数字混进来。
-    /// </summary>
-    private static readonly Regex NpmVersionLineRegex = new(
-        @"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.\-+]*)?$",
-        RegexOptions.Compiled | RegexOptions.ECMAScript);
+    // 端口收窄与残留进程匹配的正则（PortTokenRegex / DshCommandRegex / NpxDshCommandRegex）、
+    // `npm view` 输出的形态闸（NpmVersionLineRegex）已随它们的纯函数内核迁到
+    // ProcessMatch / Semver——纯函数住在纯类型里，见这两个类的头部说明。
     /// <summary>
     /// 探针专用 HttpClient。<b>AutomaticDecompression 不可省</b>：DSH 的 web server 带
     /// gzip 中间件（dsh-host-webserver 的 compression 配置，默认 none 但可开），

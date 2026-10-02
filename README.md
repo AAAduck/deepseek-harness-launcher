@@ -184,6 +184,11 @@ dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
 | 文件 | 内容 |
 |---|---|
 | `HarnessForm.cs` + `HarnessForm.{Lifecycle,Status,Processes,Engine,EngineSlots,Semver,Plugins,EnvCheck,Links}.cs` | 主窗体，按功能拆成 10 个 `partial` 文件（共享字段与成员，行为一致） |
+| `Semver.cs` | semver 判定与 npm 版本输出解析（纯函数，可单测） |
+| `ProcessMatch.cs` | 进程匹配内核：杀谁、谁可能持锁（纯函数，可单测） |
+| `CommandGuard.cs` | 外部输入进 `cmd` 命令行的闸门：工具路径与 npm 配置值 |
+| `LogTrim.cs` | 日志按整条记录滚动的截断（startup/update/crash 三份日志共用） |
+| `ResponsiveDialog.cs` | 「目录」「版本管理」两窗共用的自适应布局/忙碌态/关闭收口骨架 |
 | `EngineVersionsForm.cs` | 引擎版本管理窗口（列表 / 切换 / 删除） |
 | `FoldersForm.cs` | 相关目录一览窗口 |
 | `ConfigBackup.cs` | 配置快照与恢复 |
@@ -191,6 +196,7 @@ dotnet test tests\DeepSeekHarness.Tests\DeepSeekHarness.Tests.csproj
 | `Program.cs` | 程序入口、单实例互斥、启动异常兜底 |
 | `LayoutDump.cs` | 布局自检（`DSH_LAYOUT_TEST=1`） |
 | `tests\` | xunit 单测 |
+| `.github\workflows\ci.yml` | CI：windows-latest 上构建并跑全部单测 |
 | `更新启动器-更新到<版本>.bat` | 启动器本体的更新脚本 |
 
 每个类的注释里写清了**它守着什么判据、那个判据此前错在哪、失效时是什么表现**——改这些函数前先读注释。

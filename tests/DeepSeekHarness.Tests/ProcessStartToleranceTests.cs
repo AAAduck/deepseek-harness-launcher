@@ -28,9 +28,9 @@ public class ProcessStartToleranceTests
     [InlineData(10)]     // 正好 1 µs（1 个 tick 不会出现，但边界顺带钉住）
     public void 同一进程的精度差_判同(long deltaTicks)
     {
-        Assert.True(HarnessForm.IsSameProcessStart(Base, Base.AddTicks(deltaTicks)));
-        Assert.True(HarnessForm.IsSameProcessStart(Base.AddTicks(deltaTicks), Base));   // 双向
-        Assert.True(HarnessForm.IsSameProcessStart(Base, Base.AddTicks(-deltaTicks)));  // 负方向
+        Assert.True(ProcessMatch.IsSameProcessStart(Base, Base.AddTicks(deltaTicks)));
+        Assert.True(ProcessMatch.IsSameProcessStart(Base.AddTicks(deltaTicks), Base));   // 双向
+        Assert.True(ProcessMatch.IsSameProcessStart(Base, Base.AddTicks(-deltaTicks)));  // 负方向
     }
 
     [Fact]
@@ -39,7 +39,7 @@ public class ProcessStartToleranceTests
         // 容差取 <=：1ms 正好是"判同"与"判异"的分界（TicksPerMillisecond）。
         // 写成 < 的话，1ms 整的差会被判"异"——而 PID 复用的时间差以秒计，
         // 这 1ms 不影响防护语义，只是边界约定的自我一致。
-        Assert.True(HarnessForm.IsSameProcessStart(Base, Base.AddMilliseconds(1)));
+        Assert.True(ProcessMatch.IsSameProcessStart(Base, Base.AddMilliseconds(1)));
     }
 
     [Theory]
@@ -48,8 +48,8 @@ public class ProcessStartToleranceTests
     [InlineData(1000)]   // 100 ms：远小于 PID 复用的现实时间差，但足以排除"同进程"
     public void 超出容差_判异(long ms)
     {
-        Assert.False(HarnessForm.IsSameProcessStart(Base, Base.AddMilliseconds(ms)));
-        Assert.False(HarnessForm.IsSameProcessStart(Base.AddMilliseconds(ms), Base));
+        Assert.False(ProcessMatch.IsSameProcessStart(Base, Base.AddMilliseconds(ms)));
+        Assert.False(ProcessMatch.IsSameProcessStart(Base.AddMilliseconds(ms), Base));
     }
 
     [Fact]
@@ -57,15 +57,15 @@ public class ProcessStartToleranceTests
     {
         // PID 复用的前提是旧进程完全退出、旧句柄全部关闭——现实时间差以秒/分钟计。
         // 秒级差异必须判"异"，这条是防护语义本体。
-        Assert.False(HarnessForm.IsSameProcessStart(Base, Base.AddSeconds(1)));
-        Assert.False(HarnessForm.IsSameProcessStart(Base, Base.AddMinutes(3)));
+        Assert.False(ProcessMatch.IsSameProcessStart(Base, Base.AddSeconds(1)));
+        Assert.False(ProcessMatch.IsSameProcessStart(Base, Base.AddMinutes(3)));
     }
 
     [Fact]
     public void 严格相等_判同()
     {
         // 没有精度差时的理想形状（少数进程确实如此——实测 21 个里 3 个）。
-        Assert.True(HarnessForm.IsSameProcessStart(Base, Base));
+        Assert.True(ProcessMatch.IsSameProcessStart(Base, Base));
     }
 
     [Fact]
@@ -84,8 +84,8 @@ public class ProcessStartToleranceTests
         // 不报任何错）。钉住"Kind 不参与比较"本身，防止有人把容差改成 Equals。
         var unspecified = DateTime.SpecifyKind(Base, DateTimeKind.Unspecified);
         var local = DateTime.SpecifyKind(Base, DateTimeKind.Local);
-        Assert.True(HarnessForm.IsSameProcessStart(unspecified, local));
+        Assert.True(ProcessMatch.IsSameProcessStart(unspecified, local));
         // 反向也成立，且容差判定用的是 Ticks 差而非时区换算。
-        Assert.True(HarnessForm.IsSameProcessStart(local, unspecified));
+        Assert.True(ProcessMatch.IsSameProcessStart(local, unspecified));
     }
 }

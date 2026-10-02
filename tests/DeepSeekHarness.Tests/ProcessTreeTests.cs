@@ -3,7 +3,7 @@ using Xunit;
 namespace DeepSeekHarness.Tests;
 
 /// <summary>
-/// 杀进程树收集（<see cref="HarnessForm.CollectProcessTreeIds"/>）的单测。
+/// 杀进程树收集（<see cref="ProcessMatch.CollectProcessTreeIds"/>）的单测。
 ///
 /// "杀哪些进程"是整个启动器最贵的判断：命中即连整棵树一起杀，判错的后果不可逆，
 /// 且两种错法都不会报错。种子匹配（MatchesHarnessCommand/IsEngineProcess）已由
@@ -17,14 +17,14 @@ public class ProcessTreeTests
 {
     private static readonly DateTime T0 = new(2026, 10, 2, 10, 0, 0, DateTimeKind.Local);
 
-    private static HarnessForm.ProcessRecord Rec(int id, int parent, DateTime start) =>
+    private static ProcessRecord Rec(int id, int parent, DateTime start) =>
         new(id, parent, "node.exe", "node bin.js", start);
 
-    private static HashSet<int> Collect(params HarnessForm.ProcessRecord[] records)
+    private static HashSet<int> Collect(params ProcessRecord[] records)
     {
         var map = records.ToDictionary(r => r.Id);
         var seeds = new[] { 1 };   // 种子 = 引擎本体（种子匹配由 ProcessMatchTests 钉）
-        return HarnessForm.CollectProcessTreeIds(seeds, map);
+        return ProcessMatch.CollectProcessTreeIds(seeds, map);
     }
 
     [Fact]
@@ -58,7 +58,7 @@ public class ProcessTreeTests
     {
         var all = Collect(
             Rec(1, 0, T0),
-            new HarnessForm.ProcessRecord(60, 1, "node.exe", "node bin.js", DateTime.MinValue));
+            new ProcessRecord(60, 1, "node.exe", "node bin.js", DateTime.MinValue));
 
         Assert.Equal(new HashSet<int> { 1 }, all);
     }

@@ -2,6 +2,7 @@ namespace DeepSeekHarness;
 
 /// <summary>
 /// 已安装引擎版本的列表：查看、切换、删除。
+/// 布局/忙碌态/关闭收口继承自 <see cref="ResponsiveDialog"/>（两窗共用的骨架）。
 ///
 /// 目录约定（与主窗体的升级逻辑共用）：
 ///   活动版本永远是 <c>engine\</c>——启动器只从这一个目录跑 bin.js。
@@ -12,7 +13,7 @@ namespace DeepSeekHarness;
 /// 所以"哪个引擎版本能用"必须以插件为准。版本留在本地、随时能切回去，
 /// 比"升级后出问题再重装"可靠得多。
 /// </summary>
-internal sealed class EngineVersionsForm : Form
+internal sealed class EngineVersionsForm : ResponsiveDialog
 {
     // 字体与主窗体同一个道理：外部 new 的 Font 不随控件释放，四个按钮各 new 一份
     // 就是每次开窗漏四个 GDI 句柄（见 HarnessForm.UiFont 处的注释）。这里共享一份。
@@ -34,28 +35,10 @@ internal sealed class EngineVersionsForm : Form
     private readonly Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions;
     private readonly Func<string, Task<string?>> activateVersion;
     private readonly Func<string, Task<string?>> deleteVersion;
-    /// <summary>正在跑一个异步操作（读取/切换/删除）。防重入，同时统一管按钮可用性。</summary>
-    private bool busy;
-    /// <summary>
-    /// busy **只是 UI 层防重入**，不是并发互斥。
-    ///
-    /// 真正的互斥在数据层：<c>activateVersion</c> / <c>deleteVersion</c> 两个委托
-    /// 最终都进 HarnessForm 的 <c>migrateGate</c>（同一把 SemaphoreSlim，切版本 / 删槽 /
-    /// 归档 / 安装替换共用）。必须记住这一点，否则很容易以为"关窗后重开一个对话框"是
-    /// 安全的——它<b>不是</b>：本窗体的 <c>busy</c> 只管住这一个实例，新实例照样能发起
-    /// 破坏性操作。两个操作在闸上排队，顺序由闸决定，而不是由用户的确认框决定。
-    ///
-    /// 本窗还把「列举」也纳入了同一把闸，所以读到的列表与磁盘状态自洽。
-    /// </summary>
-    /// <summary>窗体正在关闭。用来区分"已经没了"与"还没显示"——这两件事完全不同。</summary>
-    private bool closing;
-    /// <summary>
-    /// 布局自检（Program.RunLayoutSelfTest）的静默关闭开关。编程式 Close() 的
-    /// CloseReason 是 UserClosing（WinForms 文档原文："either programmatically
-    /// or through a user action"），busy 没复位时会命中 ConfirmClose 的确认框——
-    /// 自检进程没有人应答，就挂死在那里。自检关闭必须绕过询问。
-    /// </summary>
-    internal bool QuietClose;
+    // busy / closing / QuietClose / 按钮宽度缓存 收进基类 ResponsiveDialog。
+    // busy 只是 UI 层防重入的语义也一并迁走：真正保护共享数据的互斥在数据层
+    // （activateVersion / deleteVersion 最终进 HarnessForm.migrateGate），本窗的
+    // busy 管不住"关窗后重开一个对话框"——别把它当成并发安全的依据。
 
     internal EngineVersionsForm(
         Func<Task<IReadOnlyList<EngineVersionEntry>>> listVersions,
@@ -66,12 +49,7 @@ internal sealed class EngineVersionsForm : Form
         this.activateVersion = activateVersion;
         this.deleteVersion = deleteVersion;
 
-        // AutoScaleMode.Dpi 在**没有** AutoScaleDimensions、也没有 PerformAutoScale 的
-        // 情况下是空操作：WinForms 按默认的 96/96 算缩放因子，在 120/144 DPI 上得到的
-        // 仍是 1.0，于是本文件里所有布局常量（34/30/16/8/14…）其实全是 96-DPI 像素。
-        // 这里明确关掉自动缩放、自己按 DeviceDpi 换算——与 FoldersForm、主窗体同一纪律：
-        // 一套机制，全部常量从 <see cref="DpiScale"/> 派生，不与 WinForms 的自动缩放打架。
-        AutoScaleMode = AutoScaleMode.None;
+        // AutoScaleMode.None 由基类统一设置（理由见 ResponsiveDialog 构造函数）。
         Text = "引擎版本管理";
         // 初始尺寸按"通常只有 1–3 个版本"来定：列表留 86px（表头 + 约 3 行），再多滚动。
         // 但窗口是**可缩放**的，所以下面用 ApplyResponsiveLayout 让内容跟着变：
@@ -134,16 +112,7 @@ internal sealed class EngineVersionsForm : Form
         AcceptButton = activateButton;
 
         // 真正自适应的布局：列表吃掉中间的剩余高度，提示与按钮锚在底部。
-        Resize += (_, _) =>
-        {
-            ApplyResponsiveLayout();
-            // LayoutDump.Enabled 要在**调用点**先判一次：参数里的插值字符串与 Control[]
-            // 在进入 Capture 之前就已经构造好了，而 Resize 是拖边框时每像素都触发的热路径。
-            // 不判的话，没开自检的普通用户也要为每次 Resize 白付一次字符串 + 数组分配。
-            if (LayoutDump.Enabled)
-                LayoutDump.Capture($"版本管理 {ClientSize.Width}x{ClientSize.Height}", this,
-                    title, list, hint, activateButton, deleteButton, closeButton, refreshButton);
-        };
+        HookResizeLayout();
         ApplyResponsiveLayout();
 
         // 首屏加载挂在 Load，**不是构造函数**。
@@ -155,46 +124,13 @@ internal sealed class EngineVersionsForm : Form
         // 给的正是已完成的 Task.FromResult，所以自检每次跑的都是这条"空列表"分支——
         // 也就是说它量到的布局状态在生产里根本不会出现。Load 时句柄已建，没这个问题。
         Load += async (_, _) => await ReloadAsyncCore();
-        FormClosing += (_, e) => ConfirmClose(e);
+        FormClosing += (_, e) => ConfirmClose(e,
+            "操作进行中",
+            "操作仍在进行中。\n\n现在关闭窗口，操作会继续在后台执行完，但结果不会再显示。\n\n确定要关闭吗？");
     }
 
-    /// <summary>
-    /// 窗体已经不可用了（已释放或正在关闭）。
-    /// **刻意不用 <c>IsHandleCreated</c>**：它表达的是"还没显示"，不是"已经没了"。
-    /// </summary>
-    private bool Gone => IsDisposed || Disposing || closing;
+    // Gone / ConfirmClose 收进基类（忙时确认、系统关机不拦的口径两窗原本就一致）。
 
-    /// <summary>
-    /// 关闭时收口。<paramref name="e.Cancel"/> 被置位时**不能**把 closing 置起来——
-    /// FormClosing 在取消关闭时照样触发，而 closing 是粘性的。一旦被一次"取消"
-    /// 误置，<see cref="Gone"/> 就永远为真：列表永远空、提示永远停在"正在读取…"，
-    /// 而且不报任何错——正是这次改动想消灭的那种静默失败。
-    ///
-    /// 破坏性操作进行到一半时给出确认，而不是把「关闭」按钮禁掉：
-    /// 禁按钮只挡得住鼠标，标题栏 X 与 Alt+F4 照样能关（ControlBox 不受控件
-    /// Enabled 影响），可它同时把 CancelButton 也废了——Button 在 Enabled==false
-    /// 时 CanSelect 为 false，Form.ProcessDialogKey 的 Escape 分支会直接跳过，
-    /// 键盘用户按 Esc 就变成**完全无反应**。与"无声吞掉 Esc"相比，
-    /// "问一句要不要关"把三条关闭路径统一成了同一个有意识的决定。
-    /// </summary>
-    private void ConfirmClose(FormClosingEventArgs e)
-    {
-        // 只有**用户自己点的关闭**才询问。系统关机/注销/任务管理器结束同样会走
-        // FormClosing，而此刻 busy 的概率最高（正在扫 2.5 万文件）：弹模态框 +
-        // e.Cancel = true 就是 Windows 意义上的"此应用阻止关机"，用户只能强杀，
-        // 连日志都留不下。那种场景下"操作会不会跑完"根本不是用户需要做决定的事。
-        if (e.CloseReason != CloseReason.UserClosing) { closing = true; return; }
-        if (QuietClose) { closing = true; return; }   // 布局自检：编程式关闭不询问（见字段注释）
-        if (busy)
-        {
-            var go = MessageBox.Show(this,
-                "操作仍在进行中。\n\n现在关闭窗口，操作会继续在后台执行完，但结果不会再显示。\n\n确定要关闭吗？",
-                "操作进行中", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (go != DialogResult.Yes) { e.Cancel = true; return; }
-        }
-        closing = true;
-    }
 
     /// <summary>
     /// 布局自检不再挂在本窗体的 Shown 上（DSH_LAYOUT_DUMP=1 时那个处理器会直接
@@ -219,132 +155,19 @@ internal sealed class EngineVersionsForm : Form
         return button;
     }
 
-    private const int ButtonHeight = 30;
-    private const int HintHeight = 34;
-    /// <summary>左右留白。刻意不叫 Margin：那是 Form 的继承成员，同名会遮蔽并触发 CS0108。</summary>
-    private const int SidePad = 16;
-    private const int BottomPad = 14;
-    private const int Gap = 8;
-    private const int ListTop = 34;
-    /// <summary>四个按钮的实测文字宽度，按 <see cref="measuredAtDpi"/> 那个 DPI 量一次即可。</summary>
-    private int[]? buttonWidths;
-    /// <summary>上面那份宽度是在哪个 DPI 下量的。DPI 变了必须重量（GDI 量的是设备像素）。</summary>
-    private int measuredAtDpi = -1;
+    // 布局常量、DPI 换算与 ApplyResponsiveLayout / LayoutButtons 收进基类。
+    // 这里只提供本窗的 96-DPI 设计值（SidePad/Gap/BottomPad 两窗一致，已在基类）。
+    protected override int ListTopDesign => 34;
+    protected override int HintHeightDesign => 34;
+    protected override int ButtonHeightDesign => 30;
 
-    // ---- DPI 换算 ----------------------------------------------------------
-
-    /// <summary>
-    /// 96-DPI 设计值 → 本机实际像素。<see cref="DeviceDpi"/> 在句柄创建前还报设计值，
-    /// 句柄建好之后（Load / 首次 Resize）才是真值——所以布局常量**不能**在字段
-    /// 初始化器里算死，必须每次布局时现算（ApplyResponsiveLayout 已经如此）。
-    /// </summary>
-    private double DpiScale => Math.Max(1.0, DeviceDpi / 96.0);
-
-    /// <summary>按 <see cref="DpiScale"/> 把 96-DPI 的设计像素换算成实际像素（向上取整）。</summary>
-    private int Px(double designValue) => (int)Math.Ceiling(designValue * DpiScale);
-
-    /// <summary>由 <see cref="DpiScale"/> 换算出来的几个布局常量（96-DPI 设计值见上面的常量声明）。</summary>
-    private int ScaledButtonHeight => Px(ButtonHeight);
-    private int ScaledHintHeight => Px(HintHeight);
-    private int ScaledSidePad => Px(SidePad);
-    private int ScaledBottomPad => Px(BottomPad);
-    private int ScaledGap => Px(Gap);
-    private int ScaledListTop => Px(ListTop);
-
-    /// <summary>
-    /// 让内容跟着窗口尺寸走。
-    ///
-    /// 只靠 Anchor 不够：ListView 锚 Left|Right 能横向拉伸，但纵向我把它锚成了 Top，
-    /// 于是拉高窗口时列表不动、下方留白；按钮更是只按宽度重算 x，纵向写死常量，
-    /// 所以"上下拉伸没反应"。这里统一按当前 ClientSize 重算：
-    ///   列表高度 = 客户区高 - 列表顶 - 提示与按钮占位（它们锚在底部）
-    ///   提示与按钮的 y 由客户区高反推，永远贴着底边。
-    /// </summary>
-    private void ApplyResponsiveLayout()
-    {
-        // 提示与按钮行都从客户区**底边反推**，不再依赖 list.Bottom：
-        // 列表高度有下限保护，窗口被压到 MinimumSize 时它会被撑大，
-        // 若提示的 y 取自 list.Bottom 就会和按钮行叠在一起。
-        var buttonHeight = ScaledButtonHeight;
-        var hintHeight = ScaledHintHeight;
-        var bottomPad = ScaledBottomPad;
-        var sidePad = ScaledSidePad;
-        var gap = ScaledGap;
-        var listTop = ScaledListTop;
-
-        var rowY = ClientSize.Height - buttonHeight - bottomPad;
-        var hintY = rowY - gap - hintHeight;
-
-        // 列表吃掉中间的剩余高度。**下限不能盖过上限**：
-        // 原实现是 Math.Max(40, hintY - Gap - ListTop) 先给一个 40px 的下限，
-        // 再 Math.Clamp(…, 40, maxList) —— 而 max 自己也带了 Math.Max(40, …)，
-        // 于是"窗口比提示 + 按钮所需还矮"时 maxList 恒为 40，列表底边
-        // （ListTop + 40）就压到 hintY - Gap 之下，与提示零间隙相接甚至重叠，
-        // 正是本方法开头承诺"控件不重叠"要避免的形状。
-        // 现在上限是**真实可用空间**，下限只在它之上生效；空间不够时列表贴住提示，
-        // 宁可压扁也不重叠。MinimumSize 已经保证正常拖拽不会走到这个分支。
-        var available = hintY - gap - listTop;
-        var listHeight = Math.Max(Px(24), Math.Min(
-            available, ClientSize.Height - listTop - (hintHeight + gap + buttonHeight + bottomPad)));
-        if (listHeight > available) listHeight = available;
-
-        list.Location = new Point(sidePad, listTop);
-        list.Size = new Size(Math.Max(Px(80), ClientSize.Width - sidePad * 2), listHeight);
-
-        hint.Location = new Point(sidePad, hintY);
-        hint.Size = new Size(Math.Max(Px(80), ClientSize.Width - sidePad * 2), hintHeight);
-
-        LayoutButtons(rowY, sidePad, gap, buttonHeight);
-    }
-
-    /// <summary>
-    /// 四个按钮在底部均分并居中。宽度按各按钮文字实测，超宽时压缩间隙。
-    /// 窗口比"刚好放下"还窄时退化为左对齐贴边，不重叠。
-    /// </summary>
-    private void LayoutButtons(int rowY, int sidePad, int gap, int buttonHeight)
-    {
-        // 文字与字体构造期就定死，宽度本应永远不变——但 **DeviceDpi 不是**：
-        // 构造期窗体句柄还没创建，DeviceDpi 还报着设计值；真正布局时（Load /
-        // 首次 Resize）句柄建好、它才变成真值，而 GDI 量文字用的正是设备上下文，
-        // 125% DPI 下同样一段文字要宽 25%。只按首次结果缓存、之后永不重测，
-        // 高 DPI 上按钮文字就会被 AutoEllipsis 截掉。
-        // 缓存以 DeviceDpi 为键：DPI 变了就重量（每种 DPI 只量一次，
-        // Resize 这条每像素热路径上仍然零 GDI 调用）。
-        if (buttonWidths is null || measuredAtDpi != DeviceDpi)
-        {
-            buttonWidths = new[] { activateButton, deleteButton, closeButton, refreshButton }
-                .Select(b => Math.Max(Px(84), TextRenderer.MeasureText(b.Text, b.Font).Width + Px(24)))
-                .ToArray();
-            measuredAtDpi = DeviceDpi;
-        }
-
-        var buttons = new[] { activateButton, deleteButton, closeButton, refreshButton };
-        // **必须 Clone**：int[] 是引用类型，直接用 buttonWidths 等于把下面压缩出来的
-        // 宽度写回那份缓存。后果是窗口拉宽后按钮不恢复，反复横拖一路压到下限
-        // 就再也回不去了。缓存里存的是"文字实测宽度"这个不变量，压缩只是本次布局的
-        // 临时结果，两者不能是同一份数据。
-        var widths = (int[])buttonWidths!.Clone();
-        var total = widths.Sum() + gap * (buttons.Length - 1);
-        var available = ClientSize.Width - sidePad * 2;
-        if (total > available && buttons.Length > 1)
-        {
-            var shrink = (int)Math.Ceiling((total - available) / (double)(buttons.Length - 1));
-            var floor = Px(72);
-            for (var i = 0; i < widths.Length; i++) widths[i] = Math.Max(floor, widths[i] - shrink);
-            total = widths.Sum() + gap * (buttons.Length - 1);
-        }
-
-        var x = Math.Max(sidePad, (ClientSize.Width - total) / 2);
-        for (var i = 0; i < buttons.Length; i++)
-        {
-            buttons[i].Size = new Size(widths[i], buttonHeight);
-            buttons[i].Location = new Point(x, rowY);
-            x += widths[i] + gap;
-        }
-    }
-
+    protected override Control ResizableList => list;
+    protected override Control HintLabel => hint;
+    protected override Control[] ButtonRow => new[] { activateButton, deleteButton, closeButton, refreshButton };
+    protected override Control CloseButton => closeButton;
+    protected override string DumpCaption => "版本管理";
     /// <summary>供布局自检遍历的控件清单（与 Resize 里记录的是同一组）。</summary>
-    internal Control[] DumpControls() =>
+    internal override Control[] DumpControls() =>
         new Control[] { title, list, hint, activateButton, deleteButton, closeButton, refreshButton };
 
     // 版本槽大小的人读格式见 HumanSize.FormatSize（**纯函数、可单测**）。它必须
@@ -357,7 +180,7 @@ internal sealed class EngineVersionsForm : Form
             ? list.SelectedItems[0].Tag as EngineVersionEntry
             : null;
 
-    private void UpdateButtons()
+    protected override void UpdateButtons()
     {
         if (busy || Gone) return;
         var sel = Selected;
@@ -365,28 +188,7 @@ internal sealed class EngineVersionsForm : Form
         deleteButton.Enabled = sel is not null && !sel.IsActive;
     }
 
-    /// <summary>
-    /// 统一管理忙碌态下的控件可用性。**「刷新」必须在这里显式恢复**：
-    /// 之前它只出现在"被禁用"的那一行里，点过一次「切换」之后就永久变灰了，
-    /// 而失败分支又不刷新列表，窗口就卡在"切换失败 + 不能刷新"的状态。
-    /// </summary>
-    private void SetBusy(bool value)
-    {
-        // 守卫用 Gone 而不是只判 IsDisposed：父窗体那边是 using var dialog + ShowDialog，
-        // ShowDialog 返回后进入 Dispose(bool) 时 Disposing 已为真而 IsDisposed 仍为假，
-        // 只判后者会放行一串控件写入。ReloadAsync 走的是 async void 事件处理器，
-        // 真抛了就是无人接管的进程崩溃。
-        if (Gone) return;
-        busy = value;
-        // 列表也要禁用：按钮禁用挡不住双击，而并发两次目录交换会抢同一个 engine 目录。
-        list.Enabled = !value;
-        refreshButton.Enabled = !value;
-        activateButton.Enabled = !value;
-        deleteButton.Enabled = !value;
-        // 「关闭」**不**禁用：它是 CancelButton，禁用会连带吞掉 Esc（见 ConfirmClose）。
-        // 需要拦的时候由 ConfirmClose 弹一句确认，三条关闭路径统一收口。
-        if (!value) UpdateButtons();
-    }
+    // SetBusy 收进基类：禁用列表 + 整行按钮（唯独「关闭」不动以保住 Esc）。
 
     /// <summary>
     /// 重新读取列表。列举版本要递归遍历每个引擎目录的 node_modules（本机实测 2.5 万个文件），

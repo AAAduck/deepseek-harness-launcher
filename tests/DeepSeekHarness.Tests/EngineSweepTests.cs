@@ -15,7 +15,7 @@ public class EngineSweepTests
     private const string EngineDir = @"C:\Users\me\AppData\Local\DeepSeekHarness\engine";
 
     private static bool Match(string name, string commandLine, string engineDir = EngineDir) =>
-        HarnessForm.MatchesEngineProcess(name, commandLine, engineDir);
+        ProcessMatch.MatchesEngineProcess(name, commandLine, engineDir);
 
     [Fact]
     public void 本启动器拉起的引擎_命中()

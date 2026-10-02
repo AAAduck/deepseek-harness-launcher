@@ -23,7 +23,7 @@ public class SemverRangeTests
     [InlineData("0.1.5-rc.1", "0.1.5-rc.1", true)]
     public void 裸版本号按精确匹配(string candidate, string range, bool expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -36,7 +36,7 @@ public class SemverRangeTests
     [InlineData("0.2.0", ">=0.1.7-rc.1 <0.3.0-0", true)]
     public void 比较运算符与区间(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -55,7 +55,7 @@ public class SemverRangeTests
     [InlineData("0.1.5-rc.1", "0.1.5-rc.1", true)]               // 裸精确版本也参与集合：同三元组放行
     public void 比较器集合的预发布门槛(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -66,7 +66,7 @@ public class SemverRangeTests
     [InlineData("1.2.3+x-y", "1.2.3", true)]
     public void build段里的连字符不是预发布标识(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -77,7 +77,7 @@ public class SemverRangeTests
     [InlineData("0.1.5", "~0.1", null)]         // 两段基准：拿不准就不判
     public void tilde范围(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -89,7 +89,7 @@ public class SemverRangeTests
     [InlineData("2.0.0", "^1.9.9", false)]
     public void caret范围(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -108,7 +108,7 @@ public class SemverRangeTests
     [InlineData("0.1.4", "^0.1.5", false)]           // 非预发布候选不受门槛影响（回归保护）
     public void 预发布候选必须与范围基准同三元组(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -122,7 +122,7 @@ public class SemverRangeTests
     [InlineData("0.1.5", "* || >=0.1.5", true)]          // 左无法判定、右满足 → 右侧结果就是整条结果
     public void 或组合(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -137,7 +137,7 @@ public class SemverRangeTests
     [InlineData("0.3.0-rc.1", "<0.3.0-0", null)]
     public void 小于下一个正式版写法(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -159,10 +159,10 @@ public class SemverRangeTests
     [InlineData("1.4.1", "~1.4.1-rc.2")]
     public void 范围基准带预发布标识时判不出来(string candidate, string token)
     {
-        Assert.Null(HarnessForm.SatisfiesSingle(candidate, token));
+        Assert.Null(Semver.SatisfiesSingle(candidate, token));
         // 走完整范围路径必须是同一个"未能判定"：用户在「升级引擎」确认框里看到的
         // 是这一层的结果，token 级判对了但组合层猜了，一样是错的结论。
-        Assert.Null(HarnessForm.SatisfiesRange(candidate, token));
+        Assert.Null(Semver.SatisfiesRange(candidate, token));
     }
 
     [Fact]
@@ -172,17 +172,17 @@ public class SemverRangeTests
         // 候选低于基准时（0.1.4 < 0.1.5）比较器给出的是确定答案，此时报"未能判定"
         // 会把一条本来明确的"不满足"降级成"未知"——护栏因此在漏报警方向上出错。
         // 把这两行的期望改成 null 它们就会红：那说明有人把 cmp<0 的收窄挪到了守卫之后。
-        Assert.False(HarnessForm.SatisfiesSingle("0.1.4", "^0.1.5-rc.1"));
-        Assert.False(HarnessForm.SatisfiesSingle("0.1.4", "~0.1.5-rc.1"));
+        Assert.False(Semver.SatisfiesSingle("0.1.4", "^0.1.5-rc.1"));
+        Assert.False(Semver.SatisfiesSingle("0.1.4", "~0.1.5-rc.1"));
     }
 
     [Fact]
     public void 认不出的写法一律返回无法判定_而不是误判满足()
     {
         // x / 通配 / 连字符范围等本工具不支持的写法，方向必须是"判不出来"。
-        Assert.Null(HarnessForm.SatisfiesRange("0.1.5", "*"));
-        Assert.Null(HarnessForm.SatisfiesRange("0.1.5", "x"));
-        Assert.Null(HarnessForm.SatisfiesRange("0.1.5", "workspace:*"));
+        Assert.Null(Semver.SatisfiesRange("0.1.5", "*"));
+        Assert.Null(Semver.SatisfiesRange("0.1.5", "x"));
+        Assert.Null(Semver.SatisfiesRange("0.1.5", "workspace:*"));
     }
 
     [Theory]
@@ -193,7 +193,7 @@ public class SemverRangeTests
     [InlineData("cordis", false)]               // cordis 有自己的版本号，拿引擎版本去比毫无意义
     public void 只有与引擎同版本发布的包才拿引擎版本去比(string package, bool expected)
     {
-        Assert.Equal(expected, HarnessForm.IsDshVersionedPackage(package));
+        Assert.Equal(expected, Semver.IsDshVersionedPackage(package));
     }
 
     // ======================================================================
@@ -217,7 +217,7 @@ public class SemverRangeTests
     [InlineData("0.1.5-rc.1", ">0.1.5", false)]  // 预发布 < 同数字段正式版
     public void 严格大于比较器(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -228,7 +228,7 @@ public class SemverRangeTests
     [InlineData("0.1.5", "<=0.1.5-rc.1", false)] // 正式版 > 同数字段预发布基准
     public void 小于等于比较器(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -241,7 +241,7 @@ public class SemverRangeTests
     [InlineData("0.1.5-rc.1", "=0.1.5-rc.1", true)]
     public void 显式精确比较器(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -253,7 +253,7 @@ public class SemverRangeTests
     [InlineData("0.1.6", "<=0.1.5 >=0.0.1", false)]
     public void 组合区间的开闭端点(string candidate, string range, bool? expected)
     {
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
     }
 
     [Theory]
@@ -272,7 +272,7 @@ public class SemverRangeTests
     [InlineData("0.1.5", ">=2.0.0 || || >=2.0.0")] // 中间那个空段
     public void 空白候选项判不出来(string candidate, string range)
     {
-        Assert.Null(HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Null(Semver.SatisfiesRange(candidate, range));
     }
 
     [Fact]
@@ -280,7 +280,7 @@ public class SemverRangeTests
     {
         // 与既有的 ">=0.1.5 || *" → true 同一条纪律：任一候选项满足即整条满足。
         // 这条钉住"空白候选项"那组修复没有顺手把短路语义也改掉。
-        Assert.True(HarnessForm.SatisfiesRange("0.1.5", ">=0.1.5 ||   "));
+        Assert.True(Semver.SatisfiesRange("0.1.5", ">=0.1.5 ||   "));
     }
 
     [Theory]
@@ -297,5 +297,5 @@ public class SemverRangeTests
     [InlineData("1.5.0", "^1.2.3-rc.1", null)]
     [InlineData("1.5.0", "~1.2.3-rc.1", null)]
     public void 基准的build段不算预发布(string candidate, string range, bool? expected) =>
-        Assert.Equal(expected, HarnessForm.SatisfiesRange(candidate, range));
+        Assert.Equal(expected, Semver.SatisfiesRange(candidate, range));
 }

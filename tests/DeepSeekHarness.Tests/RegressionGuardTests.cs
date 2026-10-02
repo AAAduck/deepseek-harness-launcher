@@ -21,7 +21,7 @@ public class RegressionGuardTests
     public void 超长单行收尾时不得把日志清空()
     {
         var text = "=== 2026-01-01 00:00:00 ===\n" + new string('x', 300_000) + "\n";
-        var result = HarnessForm.TrimLogTail(text);
+        var result = LogTrim.Tail(text);
         Assert.NotEqual(string.Empty, result);
         Assert.True(result.Length > 0, "整份日志被清成了空串");
     }
@@ -32,7 +32,7 @@ public class RegressionGuardTests
     public void 各种超长单行形态下都不得返回空串(bool trailingNewline)
     {
         var text = "=== hdr ===\n" + new string('y', 300_000) + (trailingNewline ? "\n" : "");
-        var result = HarnessForm.TrimLogTail(text);
+        var result = LogTrim.Tail(text);
         Assert.NotEqual(string.Empty, result);
     }
 
@@ -40,7 +40,7 @@ public class RegressionGuardTests
     public void 没有结尾换行的超长行也要被保留()
     {
         var text = "=== hdr ===\n" + new string('z', 300_000);
-        var result = HarnessForm.TrimLogTail(text);
+        var result = LogTrim.Tail(text);
         Assert.NotEqual(string.Empty, result);
         // 兜底分支保留的是尾部，最后一个字符必须在里面——那才是最新内容。
         Assert.Equal('z', result[^1]);
@@ -50,7 +50,7 @@ public class RegressionGuardTests
     public void 未超限的日志原样返回()
     {
         var text = "=== 2026-01-01 ===\nhello\nworld\n";
-        Assert.Same(text, HarnessForm.TrimLogTail(text));
+        Assert.Same(text, LogTrim.Tail(text));
     }
 
     [Fact]
@@ -64,7 +64,7 @@ public class RegressionGuardTests
         var text = sb.ToString();
         Assert.True(System.Text.Encoding.UTF8.GetByteCount(text) > 256 * 1024, "样本没有超过截断阈值");
 
-        var result = HarnessForm.TrimLogTail(text);
+        var result = LogTrim.Tail(text);
         Assert.DoesNotContain("line 0\n", result);   // 头部记录已被滚动掉
         Assert.Contains("line 39999", result);        // 最新记录还在
         Assert.True(System.Text.Encoding.UTF8.GetByteCount(result) <= 128 * 1024 + 64);
@@ -78,7 +78,7 @@ public class RegressionGuardTests
         // npm 失败时 stdout 里也可能有内容（错误摘要/缓存回显），旧写法不看退出码，
         // 会把这段文本当成"最新版"一路带回，直到 IsSafeVersionToken 才失败——
         // 而那已经在"引擎已被停掉"之后了。
-        Assert.Null(HarnessForm.ParseNpmVersionOutput("npm ERR! code E404\n0.2.0", 1));
+        Assert.Null(Semver.ParseNpmVersionOutput("npm ERR! code E404\n0.2.0", 1));
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public class RegressionGuardTests
     {
         // npm 的 warn/notice 走 stderr。旧写法把 stderr 拼进 stdout 再取末行，
         // 于是查询**成功**也会被一条 warn 顶掉。这里确认纯 stdout 形态仍能正确取到版本。
-        Assert.Equal("0.2.0", HarnessForm.ParseNpmVersionOutput("0.2.0\n", 0));
+        Assert.Equal("0.2.0", Semver.ParseNpmVersionOutput("0.2.0\n", 0));
     }
 
     [Theory]
@@ -97,7 +97,7 @@ public class RegressionGuardTests
     [InlineData("０.２.０")]        // 全角数字：ECMAScript 下 \d 只认 ASCII
     public void 非semver形态一律判为查不到(string stdout)
     {
-        Assert.Null(HarnessForm.ParseNpmVersionOutput(stdout, 0));
+        Assert.Null(Semver.ParseNpmVersionOutput(stdout, 0));
     }
 
     [Theory]
@@ -107,15 +107,15 @@ public class RegressionGuardTests
     [InlineData("0.2.0\r\n", "0.2.0")]     // CRLF
     public void 合法semver原样返回(string stdout, string expected)
     {
-        Assert.Equal(expected, HarnessForm.ParseNpmVersionOutput(stdout, 0));
+        Assert.Equal(expected, Semver.ParseNpmVersionOutput(stdout, 0));
     }
 
     [Fact]
     public void 空输出判为查不到()
     {
-        Assert.Null(HarnessForm.ParseNpmVersionOutput("", 0));
-        Assert.Null(HarnessForm.ParseNpmVersionOutput("   \n  ", 0));
-        Assert.Null(HarnessForm.ParseNpmVersionOutput(null!, 0));
+        Assert.Null(Semver.ParseNpmVersionOutput("", 0));
+        Assert.Null(Semver.ParseNpmVersionOutput("   \n  ", 0));
+        Assert.Null(Semver.ParseNpmVersionOutput(null!, 0));
     }
 
     // ---- ContainsPathSegment：用户目录的段级比较 ---------------------------
@@ -131,7 +131,7 @@ public class RegressionGuardTests
     [InlineData(@"--home=C:\Users\Dan\.dsh", @"C:\Users\Dan", true)]
     public void 用户目录必须按段比较而不是子串(string commandLine, string home, bool expected)
     {
-        Assert.Equal(expected, HarnessForm.ContainsPathSegment(commandLine, home));
+        Assert.Equal(expected, ProcessMatch.ContainsPathSegment(commandLine, home));
     }
 
     [Theory]
@@ -141,13 +141,13 @@ public class RegressionGuardTests
     [InlineData(@"C:\Users\Dan", @"\\")]
     public void 脏输入不得被当成命中(string commandLine, string home)
     {
-        Assert.False(HarnessForm.ContainsPathSegment(commandLine, home));
+        Assert.False(ProcessMatch.ContainsPathSegment(commandLine, home));
     }
 
     [Fact]
     public void 用户目录尾部分隔符不影响判定()
     {
-        Assert.True(HarnessForm.ContainsPathSegment(@"C:\Users\Dan\AppData\node.exe", @"C:\Users\Dan\"));
+        Assert.True(ProcessMatch.ContainsPathSegment(@"C:\Users\Dan\AppData\node.exe", @"C:\Users\Dan\"));
     }
 
     [Fact]
@@ -164,9 +164,9 @@ public class RegressionGuardTests
             @"cmd /d /s /c ""C:\Users\Daniel\AppData\Roaming\npm\npx.cmd"" -y @deepseek-ai/dsh web --port 3080";
         const string danEngine = @"C:\Users\Dan\AppData\Local\DeepSeekHarness\engine";
 
-        Assert.False(HarnessForm.MatchesHarnessCommand("cmd.exe", someoneElses, danEngine, @"C:\Users\Dan", 3080));
+        Assert.False(ProcessMatch.MatchesHarnessCommand("cmd.exe", someoneElses, danEngine, @"C:\Users\Dan", 3080));
         // 同一个命令行对它**自己**的用户仍然命中——这道收窄只收紧不得放宽。
-        Assert.True(HarnessForm.MatchesHarnessCommand("cmd.exe", someoneElses, danEngine, @"C:\Users\Daniel", 3080));
+        Assert.True(ProcessMatch.MatchesHarnessCommand("cmd.exe", someoneElses, danEngine, @"C:\Users\Daniel", 3080));
     }
 
     // ---- MayHoldProfileLock：孤儿锁清理的判据 -------------------------------
@@ -182,9 +182,9 @@ public class RegressionGuardTests
         const string cmd =
             @"""C:\Program Files\DeepSeek Harness\DeepSeek Harness.exe"" --expose-internals " +
             @"""C:\Users\Dan\AppData\Local\Programs\DeepSeek Harness\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh\lib\index.js""";
-        Assert.False(HarnessForm.MatchesHarnessCommand("DeepSeek Harness.exe", cmd,
+        Assert.False(ProcessMatch.MatchesHarnessCommand("DeepSeek Harness.exe", cmd,
             @"C:\Users\Dan\AppData\Local\DeepSeekHarness\engine", Home, 3080));   // 仍然不杀
-        Assert.True(HarnessForm.MayHoldProfileLock("DeepSeek Harness.exe", cmd, Home));  // 但要看作持锁
+        Assert.True(ProcessMatch.MayHoldProfileLock("DeepSeek Harness.exe", cmd, Home));  // 但要看作持锁
     }
 
     [Theory]
@@ -192,7 +192,7 @@ public class RegressionGuardTests
     [InlineData(@"""C:\Users\Dan\.dsh\profiles\web\cordis.yml""", "cmd.exe")]
     public void 本启动器自己的引擎同样算作可能持锁(string commandLine, string name)
     {
-        Assert.True(HarnessForm.MayHoldProfileLock(name, commandLine, Home));
+        Assert.True(ProcessMatch.MayHoldProfileLock(name, commandLine, Home));
     }
 
     [Theory]
@@ -202,15 +202,15 @@ public class RegressionGuardTests
     [InlineData("node.exe", @"C:\Users\Daniel\.dsh\profiles\web\cordis.yml")]   // 前缀绕过
     public void 不可能持锁的进程一律排除(string name, string commandLine)
     {
-        Assert.False(HarnessForm.MayHoldProfileLock(name, commandLine, Home));
+        Assert.False(ProcessMatch.MayHoldProfileLock(name, commandLine, Home));
     }
 
     [Fact]
     public void 归属不清时一律当作可能持锁()
     {
         // 与本文件其余判据相反的方向：这里漏认 = 删掉活锁，是唯一不可逆的错误。
-        Assert.False(HarnessForm.MayHoldProfileLock("", "", Home));
-        Assert.False(HarnessForm.MayHoldProfileLock("node.exe", @"C:\Users\Dan\node.exe", ""));  // 无 USERPROFILE
+        Assert.False(ProcessMatch.MayHoldProfileLock("", "", Home));
+        Assert.False(ProcessMatch.MayHoldProfileLock("node.exe", @"C:\Users\Dan\node.exe", ""));  // 无 USERPROFILE
     }
 
     // ---- IsSafeToolPath：cmd 的 %VAR% 展开 ---------------------------------
@@ -224,14 +224,14 @@ public class RegressionGuardTests
     [InlineData("", false)]
     public void 工具路径不得含百分号或引号(string path, bool expected)
     {
-        Assert.Equal(expected, HarnessForm.IsSafeToolPath(path));
+        Assert.Equal(expected, CommandGuard.IsSafeToolPath(path));
     }
 
     [Fact]
     public void 空工具路径一律拒()
     {
-        Assert.False(HarnessForm.IsSafeToolPath(null));
-        Assert.False(HarnessForm.IsSafeToolPath(""));
+        Assert.False(CommandGuard.IsSafeToolPath(null));
+        Assert.False(CommandGuard.IsSafeToolPath(""));
     }
 
     // ---- FindMissingEngineDependencies：半截安装 ----------------------------
@@ -394,7 +394,7 @@ public class RegressionGuardTests
     [InlineData("1.2.3-rc.1+build.7", 1, 2, 3, 0)]
     public void 版本解析(string input, int major, int minor, int build, int revision)
     {
-        var v = HarnessForm.ParseVersion(input);
+        var v = Semver.ParseVersion(input);
         Assert.NotNull(v);
         Assert.Equal(new Version(major, minor, build, revision), v);
     }
@@ -413,7 +413,7 @@ public class RegressionGuardTests
     [InlineData("1..2")]
     [InlineData("-1.2.3")]
     public void 解析不了的版本一律返回null(string? input) =>
-        Assert.Null(HarnessForm.ParseVersion(input));
+        Assert.Null(Semver.ParseVersion(input));
 
     [Theory]
     [InlineData("1.0.0", "0.9.9", 1)]
@@ -427,17 +427,17 @@ public class RegressionGuardTests
     [InlineData("0.1.5-rc.2", "0.1.7-rc.1", -1)]
     [InlineData("1.2.3-rc.1", "1.2.3-rc.1", 0)]
     public void 版本比较(string a, string b, int expected) =>
-        Assert.Equal(expected, HarnessForm.CompareVersionStrings(a, b));
+        Assert.Equal(expected, Semver.CompareVersionStrings(a, b));
 
     [Fact]
     public void 数字段相同而预发布标识不同_判不出来而不是猜()
     {
         // 既定取舍（注释里写明）：预发布标识的逐段比较规则繁琐且本工具用不上，
         // 拿不准就说拿不准。方向安全——整体落"无法判定"而不是猜一个满足/不满足。
-        Assert.Null(HarnessForm.CompareVersionStrings("1.2.3-rc.1", "1.2.3-rc.2"));
-        Assert.Null(HarnessForm.CompareVersionStrings("1.2.3-rc.1", "1.2.3-beta"));
+        Assert.Null(Semver.CompareVersionStrings("1.2.3-rc.1", "1.2.3-rc.2"));
+        Assert.Null(Semver.CompareVersionStrings("1.2.3-rc.1", "1.2.3-beta"));
         // 标识大小写不同视为同一个（OrdinalIgnoreCase）。
-        Assert.Equal(0, HarnessForm.CompareVersionStrings("1.2.3-RC.1", "1.2.3-rc.1"));
+        Assert.Equal(0, Semver.CompareVersionStrings("1.2.3-RC.1", "1.2.3-rc.1"));
     }
 
     [Theory]
@@ -446,7 +446,7 @@ public class RegressionGuardTests
     [InlineData("garbage", "nonsense")]
     [InlineData("1.2", "1.0.0")]          // 两段解析不了
     public void 任一边解析不了就判不出来(string a, string b) =>
-        Assert.Null(HarnessForm.CompareVersionStrings(a, b));
+        Assert.Null(Semver.CompareVersionStrings(a, b));
 
     // ---- 预发布门槛：注释自称"要在漏报警方向出过错"，此前无直接测试 ----------
 
@@ -466,7 +466,7 @@ public class RegressionGuardTests
     [InlineData("garbage", 1, 2, 3, true)]        // 解析不了 → 维持原路径，不额外收紧
     public void 范围预发布门槛(string candidate, int major, int minor, int patch, bool expected) =>
         Assert.Equal(expected,
-            HarnessForm.PrereleaseAllowedInRange(candidate, major, minor, patch));
+            Semver.PrereleaseAllowedInRange(candidate, major, minor, patch));
 
     [Theory]
     // 比较器集合级门槛：集合里至少有一个**带预发布**且与候选同三元组的基准才放行。
@@ -480,18 +480,18 @@ public class RegressionGuardTests
             (0, 3, 0, true),    // <0.3.0-rc.1
         };
         Assert.Equal(expected,
-            HarnessForm.PrereleaseAdmittedByComparatorSet(candidate, comparators));
+            Semver.PrereleaseAdmittedByComparatorSet(candidate, comparators));
     }
 
     [Fact]
     public void 集合门槛_非预发布候选与解析不了的候选不受限制()
     {
         var none = new List<(int, int, int, bool)> { (0, 2, 0, false) };
-        Assert.True(HarnessForm.PrereleaseAdmittedByComparatorSet("0.2.5", none));
-        Assert.True(HarnessForm.PrereleaseAdmittedByComparatorSet("0.2.5+b", none));
-        Assert.True(HarnessForm.PrereleaseAdmittedByComparatorSet("garbage", none));
+        Assert.True(Semver.PrereleaseAdmittedByComparatorSet("0.2.5", none));
+        Assert.True(Semver.PrereleaseAdmittedByComparatorSet("0.2.5+b", none));
+        Assert.True(Semver.PrereleaseAdmittedByComparatorSet("garbage", none));
         // 空集合 + 预发布候选 → 无基准可对认 → 拒（这是 npm 语义，不是猜）。
-        Assert.False(HarnessForm.PrereleaseAdmittedByComparatorSet(
+        Assert.False(Semver.PrereleaseAdmittedByComparatorSet(
             "0.2.5-rc.1", Array.Empty<(int, int, int, bool)>()));
     }
 
@@ -502,7 +502,7 @@ public class RegressionGuardTests
     {
         const string engine = @"C:\Users\me\AppData\Local\DeepSeekHarness\engine";
         var expected = Path.Combine(engine, "node_modules", "@deepseek-ai", "dsh");
-        Assert.Equal(expected, HarnessForm.EnginePackageDirUnder(engine));
+        Assert.Equal(expected, ProcessMatch.EnginePackageDirUnder(engine));
         // 必须以分隔符收尾，命令行里 c.Contains(这个) 才不会把
         // "...\engine-old\node_modules\..." 之类的相邻目录误命中。
         Assert.EndsWith("dsh", expected, StringComparison.Ordinal);

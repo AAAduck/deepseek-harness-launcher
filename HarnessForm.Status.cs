@@ -41,8 +41,17 @@ internal sealed partial class HarnessForm : Form
         var results = await Task.WhenAll(probeTasks);
         var winner = results.FirstOrDefault(r => r.ok).url;
         if (winner is null) return null;
-        authenticatedUrl = winner;
-        lastPort = ExtractPort(winner) ?? DefaultPort;
+        // 认证链接的第三个写入方（另两个：tail 的 HandleProcessLine、停止路径的清理）
+        // 也必须持 authUrlGate：探测成功与赋值之间隔着 await，用户可能恰在此刻点了
+        // 「停止」（清理在锁内清空字段）——裸赋值会把刚清掉的旧值写回。与写入方
+        // 同锁之后，要么赋值先完成（停止随后覆盖，终态正确），要么清理先发生。
+        // 这里没有停止路径那种"清完即终"的强约束（引擎刚被杀时探针早已失败），
+        // 但同一把锁不该有两个绕开它的写入方——锁保护的是不变量，不是概率。
+        lock (authUrlGate)
+        {
+            authenticatedUrl = winner;
+            lastPort = ExtractPort(winner) ?? DefaultPort;
+        }
         return winner;
     }
 

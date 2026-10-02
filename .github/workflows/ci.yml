@@ -1,0 +1,27 @@
+# 单测套件的 CI。测试只依赖 xunit 且不需要交互式桌面（纯函数判定），
+# windows-latest 的 hosted agent 即可跑；主工程 TreatWarningsAsErrors 全开，
+# 任何回归在这里直接红。
+#
+# 版本一致性校验（csproj 的 VerifyManifestAssemblyVersion）依赖仓库里的
+# 更新启动器-更新到<版本>.bat，checkout 后就在，无需额外步骤。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build
+        run: dotnet build DeepSeekHarness.csproj -c Debug
+
+      - name: Test
+        run: dotnet test tests/DeepSeekHarness.Tests/DeepSeekHarness.Tests.csproj -c Debug --no-build

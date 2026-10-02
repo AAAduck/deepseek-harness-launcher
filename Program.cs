@@ -211,7 +211,7 @@ internal static class Program
     {
         // 候选必须是**本程序**：只按进程名找，会把同名的另一个程序（比如从源码树
         // 跑起来的旧版、或用户自己放在别处的可执行文件）的主窗口提到前台——
-        // 用户看到的是"我双击了 A，结果弹出来的是 B 的窗口"。与 MatchesHarnessCommand
+        // 用户看到的是"我双击了 A，结果弹出来的是 B 的窗口"。与 ProcessMatch.MatchesHarnessCommand
         // 里"同名但路径不对就不是自己人"是同一条纪律，这里只是用在了自己身上。
         var self = Environment.ProcessId;
         var mine = string.Empty;
@@ -320,9 +320,9 @@ internal static class Program
                 // 都要把整份文件读进来、拼一次、写一次，而长度不减：
                 // 一个反复抛的大异常（典型是 OOM 或栈溢出）会把"读+写"变成每轮
                 // 上百 MB 的 IO，日志目录先被撑爆，死因反而最先被挤出去。
-                // 现在直接复用 HarnessForm.TrimLogTail——它已经处理了
+                // 现在直接复用 LogTrim.Tail——它已经处理了
                 // "单条超长"这条边界（保留尾部而不是返回空串）。
-                var trimmed = HarnessForm.TrimLogTail(combined);
+                var trimmed = LogTrim.Tail(combined);
                 File.WriteAllText(CrashLogPath, trimmed, new UTF8Encoding(false));
             }
             catch { }

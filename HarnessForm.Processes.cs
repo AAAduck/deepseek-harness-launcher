@@ -86,18 +86,18 @@ internal sealed partial class HarnessForm : Form
         var snapshot = records ?? new Dictionary<int, ProcessRecord>();
         var seeds = snapshot.Values.Where(IsHarnessCommand).Select(x => x.Id).ToHashSet();
         // dshProcess 只在上面读一次（取不在这里用：句柄那条路已经直接杀过了）。
-        var all = CollectProcessTreeIds(seeds, snapshot);
+        var all = ProcessMatch.CollectProcessTreeIds(seeds, snapshot);
 
         foreach (var id in all.OrderByDescending(x => x))
         {
             // Process 对象持有内核句柄，用完即收、不等 GC（与 Program.ActivateExistingWindow 同一纪律）。
-            // PID 复用防护：GetProcessById 之后带容差比对 StartTime（见 IsSameProcessStart——
+            // PID 复用防护：GetProcessById 之后带容差比对 StartTime（见 ProcessMatch.IsSameProcessStart——
             // 严格相等在 WMI 的微秒精度下连"同一个进程"都判不等，实测单进程命中率仅约 1/5，
             // 曾经让「停止」大概率空转且不报错）。PID 被复用时创建时间必然相差秒级以上，
             // 容差比对照样跳过——宁可漏掉一个残留，也不能误杀同 PID 的新进程。
             if (!snapshot.TryGetValue(id, out var expected)) continue;
             // WMI 没给出 CreationDate 时回退成 DateTime.MinValue，于是
-            // IsSameProcessStart 必然判不等 → 这个进程**永远杀不掉、且无任何痕迹**。
+            // ProcessMatch.IsSameProcessStart 必然判不等 → 这个进程**永远杀不掉、且无任何痕迹**。
             // 与其那样，不如在没有对照依据时**跳过并留痕**：PID 刚被系统复用的
             // 概率极低，为此冒误杀一个无关进程不值得；但"杀不掉"必须是可见的。
             if (expected.StartTime == DateTime.MinValue)
@@ -110,7 +110,7 @@ internal sealed partial class HarnessForm : Form
             try
             {
                 using var victim = Process.GetProcessById(id);
-                if (!IsSameProcessStart(victim.StartTime, expected.StartTime))
+                if (!ProcessMatch.IsSameProcessStart(victim.StartTime, expected.StartTime))
                 {
                     // PID 复用：现在占用这个 PID 的是另一个进程。留痕——它每轮都会命中，
                     // 而"杀不掉"若无声无息，用户只会看到「停止」似乎没起作用。
@@ -130,35 +130,7 @@ internal sealed partial class HarnessForm : Form
         // 而且这一步必须能在 WMI 快照不可用时独立生效（见上面那段注释）。
     }
 
-    /// <summary>
-    /// 从种子出发沿 ParentId 边收集整棵进程树（含种子）。**纯函数、可单测**——
-    /// "杀哪些进程"是本项目最贵的判断（会崩掉用户正在用的桌面客户端），
-    /// 而它错了不报错，必须被单测钉住。
-    ///
-    /// **边也要防伪**：Windows 会把已退出进程的 PID 复用给引擎——孤儿进程的
-    /// ParentId 于是指向引擎的 PID，快照里它看起来就像引擎的子进程。此前对边不做
-    /// 任何校验，撞上就把**无关进程连同它的整棵子树**误杀（对每个受害者还开
-    /// entireProcessTree）。真实子进程必然**晚于**父进程创建，所以创建时间不晚于
-    /// 父进程的一律不收编；CreationDate 缺失（MinValue）的没有对照依据，同样不收编。
-    /// 代价只是漏收一个"父 PID 恰好撞上复用"的残留——与本文件"宁可漏掉一个残留，
-    /// 也不能误杀同 PID 的新进程"的信条同向。
-    /// </summary>
-    internal static HashSet<int> CollectProcessTreeIds(
-        IReadOnlyCollection<int> seeds, IReadOnlyDictionary<int, ProcessRecord> records)
-    {
-        var all = new HashSet<int>(seeds);
-        var queue = new Queue<int>(seeds);
-        while (queue.Count > 0)
-        {
-            var parent = queue.Dequeue();
-            if (!records.TryGetValue(parent, out var parentRecord)) continue;
-            foreach (var child in records.Values
-                         .Where(x => x.ParentId == parent && x.StartTime > parentRecord.StartTime)
-                         .Select(x => x.Id))
-                if (all.Add(child)) queue.Enqueue(child);
-        }
-        return all;
-    }
+    // CollectProcessTreeIds 已迁到 ProcessMatch（纯函数内核；树收集的防伪规则见那里）。
 
     /// <summary>
     /// 关窗退出时结束引擎。与「停止」按钮的区别：这里必须**快**，因为它在窗体的
@@ -169,7 +141,7 @@ internal sealed partial class HarnessForm : Form
     /// 击杀（句柄即同一性证明），再扫一遍只是重复回答已知的事：白白把 ~140 ms
     /// 的 WMI 全量查询压进关窗的 UI 线程（WMI 受损的机器上可到数秒）。
     /// 更陌生的残留（别处启动、连复用探针都没对上的）宁可漏掉——下次启动的
-    /// 端口预检会给出明确报错兜住（见 MatchesEngineProcess 的注释）。
+    /// 端口预检会给出明确报错兜住（见 ProcessMatch.MatchesEngineProcess 的注释）。
     ///
     /// ⚠ 但"复用路径"（dshProcess == null）是 1.3.0 起的**常态**，而复用路径下
     /// 这一段会在关窗的 UI 线程上同步跑一次全量 WMI：本机约 140 ms，
@@ -194,7 +166,17 @@ internal sealed partial class HarnessForm : Form
         // 退出路径同样要退役 tail 代际：HandleProcessLine 是在写入 authenticatedUrl
         // 与 web-url.txt **之后**才检查 closing 的，所以引擎临死前最后几行日志里的
         // token 行仍会被这条排空路径吃掉并落盘（下一双击时就是一条死链）。
-        RetireEngineTail();
+        //
+        // 退役必须与停止路径（StopHarnessProcessesAsync）同持 authUrlGate：tail 线程
+        // 可能正持锁在"锁内核对令牌通过之后、写文件完成之前"——此时裸调
+        // Interlocked.Increment 与它并发，写侧锁内的核对看到的仍是旧令牌，
+        // 关窗后盘上就多了一份过期 token 的 web-url.txt。锁内退役后，写侧要么在
+        // 退役前完成（终态是文件被写回，但进程随即退出、下次启动有探针验证兜底），
+        // 要么核对失败不再写——两条杀进程路径的纪律就此一致。
+        lock (authUrlGate)
+        {
+            RetireEngineTail();
+        }
 
         if (!ownEngine)
         {
@@ -249,7 +231,7 @@ internal sealed partial class HarnessForm : Form
                 try
                 {
                     using var victim = Process.GetProcessById(record.Id);
-                    if (!IsSameProcessStart(victim.StartTime, record.StartTime)) continue;
+                    if (!ProcessMatch.IsSameProcessStart(victim.StartTime, record.StartTime)) continue;
                     victim.Kill(entireProcessTree: true);
                 }
                 catch (Exception ex) { Swallow.Quiet(ex, "kill-process"); }
@@ -258,29 +240,9 @@ internal sealed partial class HarnessForm : Form
         catch (Exception ex) { Swallow.Quiet(ex, "kill-engine-sweep"); }
     }
 
-    /// <summary>
-    /// 两个"进程创建时间"读数是否指向同一个进程的启动。纯函数、可单测——
-    /// 它守着两条杀进程路径（「停止」与关窗清扫），判错了不会报错。
-    ///
-    /// 为什么必须带容差而不是严格相等：两个读数的精度不同——
-    /// WMI 的 Win32_Process.CreationDate 是 DMTF 微秒精度（6 位小数），
-    /// 而 Process.StartTime 是 100ns 精度（FILETIME 原值）。同一个进程的
-    /// 两个读数因此恒差 0–0.9 µs（实测本机 21 个进程样本里仅 3 个严格相等，
-    /// 新起 5 个 cmd.exe 仅 1 个命中；差值全落在 0.1–0.9 µs、方向恒为
-    /// StartTime ≥ WMI）。严格相等会把"同一个进程"判成"PID 被复用了"，
-    /// 于是杀进程循环对真正的目标也跳过——「停止」大概率空转且不报错。
-    ///
-    /// ⚠ 两个读数都是**本地挂钟时间**（WMI 侧 Kind=Unspecified 且值带本地偏移，
-    /// Process 侧 Kind=Local），比的是 Ticks 差、**不涉及时区**。别给 WMI 那一侧
-    /// 补 ToUniversalTime()——那会把差值推到 8 小时量级，本函数对每个真正的目标都
-    /// 返回 false，「停止」静默空转。
-    ///
-    /// 容差选 1ms：比最大读数差（0.9 µs）大三个数量级，足以吸收任何精度损失；
-    /// 而 PID 复用后新进程的创建时间必然与旧读数相差秒级以上（复用前提是旧句柄
-    /// 全部关闭、旧进程已完全退出），1ms 与之相比可忽略——防护语义不变。
-    /// </summary>
-    internal static bool IsSameProcessStart(DateTime a, DateTime b) =>
-        Math.Abs((a - b).Ticks) <= TimeSpan.TicksPerMillisecond;
+    // IsSameProcessStart / IsEngineProcessShape / IsElectronProcessShape /
+    // MayHoldProfileLock / EnginePackageDirUnder / MatchesEngineProcess
+    // 已迁到 ProcessMatch（两条杀进程路径共用的判定内核与进程形态收窄，见该类头部说明）。
 
     /// <summary>
     /// 只认「命令行里带本启动器引擎目录」的进程，用于退出清扫。
@@ -288,96 +250,7 @@ internal sealed partial class HarnessForm : Form
     /// 也含 @deepseek-ai/dsh，但那是客户端自己的，不是我们启动的。
     /// </summary>
     private bool IsEngineProcess(ProcessRecord p) =>
-        MatchesEngineProcess(p.Name, p.CommandLine, engineDir);
-
-    /// <summary>
-    /// 引擎进程的镜像名形态：node（引擎本体）、cmd（stdio 重定向到 engine-stdio.log
-    /// 的包装层）、npx（早期残留的启动方式）。其余进程名——编辑器、资源管理器、任何
-    /// GUI 工具——即便命令行里带着引擎目录下的文件路径（用户用编辑器打开了 bin.js
-    /// 是最现实的形状），也不是引擎，绝不能进杀进程名单。两条杀进程路径共用本判定。
-    /// </summary>
-    private static bool IsEngineProcessShape(string name) =>
-        name.Equals("node.exe", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("npx.cmd", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("npx.exe", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Electron 形态：DSH 桌面客户端用它自己的可执行文件跑引擎宿主
-    /// （<c>"…\DeepSeek Harness.exe" --expose-internals …\resources\app.asar\dsh\…</c>），
-    /// 不是 node.exe，所以 <see cref="IsEngineProcessShape"/> 认不出它。
-    /// 这里单独列出，且**只**用于"有没有人可能正持锁"这类只读判断——
-    /// 杀进程路径绝不能因此把客户端卷进来（见 <see cref="MatchesHarnessCommand"/>）。
-    /// </summary>
-    private static bool IsElectronProcessShape(string name) =>
-        name.StartsWith("DeepSeek Harness", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("electron.exe", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// 这个进程**可能**正持有 ~/.dsh/profiles/node_modules.lock（纯函数、可单测）。
-    ///
-    /// 为什么不能借用 <see cref="IsHarnessCommand"/>：那条判据为了"不误杀"而明确排除了
-    /// 桌面客户端（app.asar / dsh-desktop-host / dsh-subprocess 一律出局）。
-    /// 而这把锁**恰恰就是桌面客户端的引擎在引导时持有的**——客户端与本启动器共用同一个
-    /// %USERPROFILE%\.dsh\profiles。客户端正持锁引导时用户双击启动本启动器，
-    /// 借来的判据看不到任何"活着的引擎" → 活锁被删 → 两个引擎并发写同一份 profile，
-    /// 正是这把锁要防的踩踏。
-    ///
-    /// 两条判据的方向因此相反，这里也是：
-    ///   • <see cref="IsHarnessCommand"/> 宁可漏杀（杀错不可逆）；
-    ///   • 本函数宁可多认（漏认 = 删掉活锁，是这里唯一不可逆的错误）——
-    ///     代价仅仅是"这轮不清锁"，而孤儿锁下次启动 WMI 正常时仍会被清掉。
-    /// </summary>
-    internal static bool MayHoldProfileLock(string name, string commandLine, string userHomeDir)
-    {
-        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(commandLine)) return false;
-        // 启动器自己不会持锁（它不跑引擎引导），排除掉免得自己把自己当成"有活锁"。
-        if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
-        if (!IsEngineProcessShape(name) && !IsElectronProcessShape(name)) return false;
-        if (string.IsNullOrEmpty(userHomeDir) || !ContainsPathSegment(commandLine, userHomeDir)) return false;
-        return commandLine.Contains("@deepseek-ai/dsh", StringComparison.OrdinalIgnoreCase) ||
-               commandLine.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase) ||
-               commandLine.Contains(".dsh\\profiles", StringComparison.OrdinalIgnoreCase) ||
-               commandLine.Contains(".dsh/profiles", StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// 引擎目录下 dsh 包的完整路径。命令行里出现它，进程才可能与本引擎有关——
-    /// 这是比"引擎目录"更精确一档的锚点：引擎目录本身会被任何"以该目录下文件为
-    /// 参数"的进程撞上（编辑器、node 跑用户自己放在引擎目录下的脚本……）。
-    /// internal（而非 private）：匹配口径要被单测直接钉住。
-    /// </summary>
-    internal static string EnginePackageDirUnder(string engineDir) =>
-        Path.Combine(engineDir, "node_modules", "@deepseek-ai", "dsh");
-
-    /// <summary>
-    /// 退出清扫的匹配内核（纯函数、可单测）。它与 <see cref="MatchesHarnessCommand"/>
-    /// 是**两条彼此独立的杀进程路径**（这里=关窗，那边=点「停止」），两者只有一条交集：
-    /// 都绝不能碰桌面客户端的引擎宿主。改其中一个时别忘了另一个——它们已经分叉过一次了。
-    ///
-    /// 判据刻意比「停止」那条窄：只认"命令行带引擎内 dsh 包目录"的进程，不做宽松兜底。
-    /// 关窗时宁可漏掉一个陌生残留（下次启动的端口探测会给出明确报错兜住），
-    /// 也不能整树杀掉一个和本启动器毫无关系的进程。
-    ///
-    /// 空串护栏与 <see cref="MatchesHarnessCommand"/> 同源、同样关键：
-    /// <c>commandLine.Contains("")</c> 恒为 true，engineDir 一旦为空，
-    /// **每一个进程**都会在此被判成"我们的引擎"、在关窗时被整树杀掉。
-    /// WMI 取值处已把 null 兜成空串，所以这些是契约护栏而非现实风险——
-    /// 但它护的正是代价最高的那条分支。
-    /// </summary>
-    internal static bool MatchesEngineProcess(string name, string commandLine, string engineDir)
-    {
-        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(commandLine)) return false;
-        if (string.IsNullOrEmpty(engineDir)) return false;
-        if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
-        if (commandLine.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
-        if (commandLine.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
-        // 双重核对：进程形态（node/cmd/npx）+ 命令行里带引擎内的 dsh 包目录。
-        // 此前只认"命令行含引擎目录"的目录子串——编辑器以引擎目录下的文件为参数
-        // 时同样命中，关窗清扫会把它整树带走。
-        if (!IsEngineProcessShape(name)) return false;
-        return commandLine.Contains(EnginePackageDirUnder(engineDir), StringComparison.OrdinalIgnoreCase);
-    }
+        ProcessMatch.MatchesEngineProcess(p.Name, p.CommandLine, engineDir);
 
     /// <summary>
     /// 全进程快照（含命令行）。WMI 带 CommandLine 的全量查询在本机实测约 140 ms，
@@ -441,7 +314,7 @@ internal sealed partial class HarnessForm : Form
                         // 另一侧 Process.StartTime 是 Kind=Local 的本地挂钟时间——
                         // 两边 Ticks 可比靠的是"都是本地挂钟"。
                         // 所以这里**绝对不能**补一句 ToUniversalTime()：那会把它推到
-                        // 差 8 小时的远端，于是 IsSameProcessStart 对每一个真正的目标
+                        // 差 8 小时的远端，于是 ProcessMatch.IsSameProcessStart 对每一个真正的目标
                         // 都返回 false →「停止」静默空转。
                         var startTime = item["CreationDate"] is string creationStr
                             ? ManagementDateTimeConverter.ToDateTime(creationStr)
@@ -484,164 +357,12 @@ internal sealed partial class HarnessForm : Form
     }
 
     private static bool IsHarnessCommand(ProcessRecord p) =>
-        MatchesHarnessCommand(p.Name, p.CommandLine, engineDir, userHomeDir, DefaultPort);
+        ProcessMatch.MatchesHarnessCommand(p.Name, p.CommandLine, engineDir, userHomeDir, DefaultPort);
 
-    /// <summary>
-    /// <see cref="IsHarnessCommand"/> 的纯函数内核：吃参数、不读任何静态状态。
-    /// 单独拆出来只有一个理由——"杀错进程"是本项目最贵的一个判断：会崩掉用户
-    /// 正在用的桌面客户端、会误杀别的登录会话的引擎，而它错了不会报错。
-    /// 这类逻辑必须有单测钉住，不能只靠注释（见 tests/DeepSeekHarness.Tests）。
-    /// 改动时保持与调用点行为完全一致，别顺手"优化"匹配规则。
-    /// </summary>
-    internal static bool MatchesHarnessCommand(
-        string name, string commandLine, string engineDir, string userHomeDir, int port)
-    {
-        // 静态形式而不是 name.Equals(...)/c.Contains(...)：本函数要按契约接受任意输入，
-        // 之前它只在 WMI 取值处被保证非空，于是测试传 null 就直接 NRE——
-        // 纯函数连"脏输入不会炸"都做不到，就更谈不上被钉住。
-        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(commandLine)) return false;
-
-        // 空 engineDir 是灾难性的输入：c.Contains("") 恒为 true，于是**任何进程**都会被
-        // 当成"本启动器装的引擎"而整树杀掉。与其指望调用方永远传对，不如在这里挡住。
-        // 生产上 Path.Combine 几乎不可能给出空串（GetFolderPath 返回空时得到的是相对
-        // 路径 "DeepSeekHarness\engine"），所以这条是**契约护栏**而非现实风险——
-        // 但它保护的是"判错即整树杀进程"这种代价最高的分支，留着不亏。
-        if (string.IsNullOrEmpty(engineDir)) return false;
-
-        if (string.Equals(name, "DeepSeekHarness.exe", StringComparison.OrdinalIgnoreCase)) return false;
-        var c = commandLine;
-
-        // —— 绝不能杀的目标：DSH 桌面客户端（Electron）自己的引擎宿主 ——
-        // 客户端不是 node.exe，而是用它自己的可执行文件跑宿主：
-        //   "…\DeepSeek Harness.exe" --expose-internals
-        //   …\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js
-        // 这条命令行里同时含 `app.asar\dsh` 和 `\dsh\`+空白+web，会被下面的宽泛正则
-        // 误判成"残留的 dsh web 进程"，然后整树杀掉——而宿主下挂着客户端的 renderer，
-        // 于是用户正开着的客户端直接白屏崩溃（实测复现：crash-*-renderer.log 两份）。
-        // 启动器只需要管自己拉起的引擎，客户端的引擎归客户端管。
-        if (c.Contains("app.asar", StringComparison.OrdinalIgnoreCase)) return false;
-        if (c.Contains("dsh-desktop-host", StringComparison.OrdinalIgnoreCase)) return false;
-        if (c.Contains("dsh-subprocess", StringComparison.OrdinalIgnoreCase)) return false;
-
-        // 进程形态收窄：引擎及其包装层只可能是 node / cmd / npx（两条杀进程路径
-        // 共用同一判定）。编辑器、资源管理器等任何其他进程名直接出局——无论命令行
-        // 长什么样。此前这道收窄只挡在宽松匹配前面，"引擎目录精确匹配"对任意进程名
-        // 生效：一个以引擎目录下文件为参数的无关进程（编辑器打开了 bin.js）会被
-        // 整树杀掉——匹配必须同时核对进程类型与实际引擎入口，不能仅凭目录子串。
-        if (!IsEngineProcessShape(name)) return false;
-
-        // 本启动器自己拉起的引擎：命令行里带着**引擎内的 dsh 包目录**——比"引擎
-        // 目录"更精确一档的锚点（目录本身会被任何"以该目录下文件为参数"的进程
-        // 撞上，见 IsEngineProcessShape 处的注释）。与退出清扫同一口径。
-        if (c.Contains(EnginePackageDirUnder(engineDir), StringComparison.OrdinalIgnoreCase)) return true;
-
-        // 宽松匹配只对 node / npx / cmd 生效，进程形态已由 IsEngineProcessShape
-        // 统一收窄（此前这里各算一份 isNode/isNpx，两边迟早漂移）。
-
-        // 宽松匹配只认**本用户**的残留：另一个登录会话里的引擎 / npx 缓存命令行
-        // 同样含 @deepseek-ai/dsh，不加这道限定会把别人会话的进程整树杀掉
-        // （互斥体是 Local\ 每会话一个，管不到别的会话）。一切用户态路径
-        // （LOCALAPPDATA、.dsh、npm 全局目录）都在 %USERPROFILE% 之下。
-        // 误杀别人进程的代价远大于漏杀一个残留——真残留占着端口有启动前报错兜底。
-        //
-        // **这道收窄必须待在这里、不能提到函数开头**。上面那条引擎包目录精确匹配
-        // 不需要 userHomeDir：命令行里带着本启动器的引擎内 dsh 包目录，本身就是
-        // 确定性的证据。
-        // 要是把"userHomeDir 为空就返回 false"提到最前面，在 USERPROFILE 缺失 /
-        // 用户配置文件 hive 未加载 / 受限容器这类机器上（本项目自己的文档就说
-        // GetFolderPath 无法确定时返回空串），就变成**连自己的引擎都杀不掉**：
-        // 残留引擎占住端口、孤儿 node_modules.lock 永远清不掉。
-        //
-        // 空串这里也必须拒：原来的写法是 `userHomeDir.Length > 0 && !c.Contains(...)`，
-        // 空串时这道收窄被**跳过**，恰好把"归属不清就不动手"的既定语义反转成
-        // "放行所有用户"——那正是本函数最不能犯的错。
-        //
-        // 段级比较而不是子串：c.Contains(userHomeDir) 只判"用户目录这段文字出现过"。
-        // C:\Users\Dan 是 C:\Users\Daniel 的**前缀**，Contains 照样通过——同机同时存在
-        // Daniel 与 Dan 两个账户时，Daniel 会话的引擎/npx 残留会被判成本启动器的残留，
-        // 而这一分支连端口都不用匹配（见上），于是直接整树杀掉。以管理员运行时
-        // （UAC 提升后 USERPROFILE 可能指向别的账户）更糟：一整棵别的用户的进程树被清。
-        // ClearOrphanProfileLock 借用的也是这个判定，于是同样会永久拒绝对**活锁**动手。
-        // 拼音用户名前缀极常见（li / liwei、zhang / zhangsan），这不是边缘情形。
-        if (string.IsNullOrEmpty(userHomeDir) ||
-            !ContainsPathSegment(c, userHomeDir)) return false;
-
-        if (c.Contains("@deepseek-ai/dsh", StringComparison.OrdinalIgnoreCase) ||
-            c.Contains("@deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase)) return true;
-
-        // 两条宽松正则只为兜早期 npx / dsh.cmd 时代留下的残留。再收窄一道：
-        // 命令行里必须出现**恰好等于**本启动器端口的独立数字 token，否则一个碰巧
-        // 提到 "dsh" 的 node/cmd 进程也会被整树杀掉——误杀别人进程的代价远大于漏杀
-        // 一个残留（真残留占着端口时，启动前的端口探测会给出明确报错兜住）。
-        //
-        // 这里必须是 token 级匹配而不是子串匹配：子串写法（c.Contains("3080")）会把
-        // "--port 30801" 也算命中——用户在 %USERPROFILE% 下自己装一份 dsh 跑在 30801
-        // 是很正常的形态（路径无空格 → 命令行不加引号 → 宽泛正则照样命中），
-        // 结果就是点一次「停止」把用户自己的进程整树杀掉。这是真实的误杀面。
-        if (!MentionsLauncherPort(c, port)) return false;
-
-        return DshCommandRegex.IsMatch(c) || NpxDshCommandRegex.IsMatch(c);
-    }
-
-    /// <summary>
-    /// 命令行里是否出现了一个**恰好等于** <paramref name="port"/> 的独立数字 token。
-    /// 抽成具名函数是因为"端口收窄"是这个判断里最容易改坏的一环：
-    /// 它必须认得 `--port 3080`、`--port=3080` 与裸 `3080`，但**不能**把 `30801`、
-    /// `0.3080`、或版本号 `0.1.5` 里的数字误当成端口。
-    ///
-    /// 注意这条只**收紧不放宽**：新写法命中的集合是旧子串写法的子集——
-    /// 端口作为独立 token 出现的命令行两边都命中，只有"端口仅以更长数字的一部分
-    /// 出现"（`--port 30801`）才被新写法放过。而那恰恰是旧写法会误杀的那种。
-    /// </summary>
-    internal static bool MentionsLauncherPort(string commandLine, int port)
-    {
-        // 它被单测直接调用、也是 internal 表面，按上面那条同样的纪律自己挡脏输入。
-        if (string.IsNullOrEmpty(commandLine)) return false;
-        var want = port.ToString(CultureInfo.InvariantCulture);
-        foreach (Match m in PortTokenRegex.Matches(commandLine))
-            if (string.Equals(m.Value, want, StringComparison.Ordinal)) return true;
-        return false;
-    }
-
-    /// <summary>
-    /// 命令行里是否出现了 <paramref name="path"/> 这个**完整路径段**（纯函数、可单测）。
-    ///
-    /// 为什么不能用 Contains：<c>C:\Users\Dan</c> 是 <c>C:\Users\Daniel</c> 的前缀。
-    /// 子串写法在同机存在两个相近账户名时必然误判——而误判的方向是
-    /// "把别的用户会话的引擎判成本启动器的残留并整树杀掉"，这条分支甚至不要求
-    /// 端口匹配。以管理员身份运行时更糟（USERPROFILE 可能指向别的账户）。
-    /// 拼音用户名前缀（li / liwei、zhang / zhangsan）非常常见，不是边缘情形。
-    ///
-    /// 判据：命中位置的**后面**必须是分隔符、引号、空白或字符串末尾——
-    /// 这才是能区分 Dan 与 Daniel 的那道边界；前面同样要求一个边界字符，
-    /// 以免把更长路径里的中段当成起点。
-    ///
-    /// 失手方向是安全的：`\\?\C:\Users\Daniel\...` 这类长路径前缀会让"前面有边界"
-    /// 不成立，于是本会话自己的残留可能不被认出——漏杀有启动前的端口探测兜底，
-    /// 误杀没有兜底。
-    /// </summary>
-    internal static bool ContainsPathSegment(string text, string path)
-    {
-        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(path)) return false;
-        // 尾部分隔符会让"后面必须有边界"这道判据失真（后面本来就该是分隔符）。
-        var needle = path.TrimEnd('\\', '/');
-        if (needle.Length == 0) return false;
-        for (var i = text.IndexOf(needle, StringComparison.OrdinalIgnoreCase); i >= 0;
-             i = text.IndexOf(needle, i + 1, StringComparison.OrdinalIgnoreCase))
-        {
-            var after = i + needle.Length;
-            if ((i == 0 || IsPathSegmentBoundary(text[i - 1])) &&
-                (after == text.Length || IsPathSegmentBoundary(text[after])))
-                return true;
-        }
-        return false;
-    }
-
-    /// <summary>路径段边界字符：分隔符、引号、空白、以及命令行里常见的赋值/括号。</summary>
-    private static bool IsPathSegmentBoundary(char ch) =>
-        ch == '\\' || ch == '/' || ch == '"' || ch == '\'' ||
-        char.IsWhiteSpace(ch) || ch == '=' || ch == ';' || ch == ',' ||
-        ch == '(' || ch == ')';
+    // MatchesHarnessCommand / MentionsLauncherPort / ContainsPathSegment / IsPathSegmentBoundary
+    // 已迁到 ProcessMatch（纯函数内核与它的正则住在一起，见该类头部说明）；
+    // 下面的 IsHarnessCommand 只是"补上 engineDir / userHomeDir / DefaultPort 三个
+    // 本机静态值"的薄包装。
 
     /// <summary>
     /// dsh 用独占创建（wx）的 `profiles\node_modules.lock` 串行化共享层修复写入，
@@ -691,7 +412,7 @@ internal sealed partial class HarnessForm : Form
             // 判据必须是 MayHoldProfileLock 而**不是** IsHarnessCommand：后者为了"不误杀"
             // 明确排除了桌面客户端，而桌面客户端的引擎**同样**持这把锁。借它判活锁会被删，
             // 两个引擎于是并发写同一份 profile——正是这把锁存在的理由（见 MayHoldProfileLock）。
-            if (records.Values.Any(p => MayHoldProfileLock(p.Name, p.CommandLine, userHomeDir))) return;
+            if (records.Values.Any(p => ProcessMatch.MayHoldProfileLock(p.Name, p.CommandLine, userHomeDir))) return;
             File.Delete(lockPath);
         }
         catch (Exception ex) { Swallow.Quiet(ex, "clear-orphan-lock"); }
@@ -750,8 +471,12 @@ internal sealed partial class HarnessForm : Form
     private sealed record DynamicPortRangeSnapshot(int Start, int Count);
 
     private static DynamicPortRangeSnapshot? dynamicPortRange;
-    private static bool dynamicPortRangeRead;
-    private static DateTime dynamicPortRangeLastAttempt = DateTime.MinValue;
+    // “已探测过”标志与“上次尝试时刻”跨线程读写（调用方分布在 UI 线程与后台线程）。
+    // bool 可 volatile；8 字节时刻拆成 UTC ticks 走 Interlocked——与本文件
+    // processRecordCacheAtTicks / lastInstallInfoAtTicks 已立的纪律同一形状，
+    // 不裸奔 DateTime（撕裂读会得到一个既不是旧值也不是新值的时刻）。
+    private static volatile bool dynamicPortRangeRead;
+    private static long dynamicPortRangeLastAttemptTicks;
     private static readonly SemaphoreSlim dynamicPortRangeGate = new(1, 1);
 
     private static async Task<(int Start, int Count)?> GetDynamicPortRangeAsync()
@@ -761,7 +486,7 @@ internal sealed partial class HarnessForm : Form
         var cached = Volatile.Read(ref dynamicPortRange);
         if (dynamicPortRangeRead && cached is not null) return (cached.Start, cached.Count);
         if (dynamicPortRangeRead && cached is null &&
-            DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
+            DateTime.UtcNow.Ticks - Interlocked.Read(ref dynamicPortRangeLastAttemptTicks) < TimeSpan.FromSeconds(60).Ticks)
             return null;
         await dynamicPortRangeGate.WaitAsync();
         try
@@ -770,10 +495,10 @@ internal sealed partial class HarnessForm : Form
             cached = Volatile.Read(ref dynamicPortRange);
             if (dynamicPortRangeRead && cached is not null) return (cached.Start, cached.Count);
             if (dynamicPortRangeRead && cached is null &&
-                DateTime.UtcNow - dynamicPortRangeLastAttempt < TimeSpan.FromSeconds(60))
+                DateTime.UtcNow.Ticks - Interlocked.Read(ref dynamicPortRangeLastAttemptTicks) < TimeSpan.FromSeconds(60).Ticks)
                 return null;
             dynamicPortRangeRead = true;
-            dynamicPortRangeLastAttempt = DateTime.UtcNow;
+            Interlocked.Exchange(ref dynamicPortRangeLastAttemptTicks, DateTime.UtcNow.Ticks);
             var text = await RunCmdAsync(
                 "netsh int ipv4 show dynamicport tcp", TimeSpan.FromSeconds(2));
             if (text is null) return null;
@@ -986,13 +711,32 @@ internal sealed partial class HarnessForm : Form
     /// </summary>
     private static async Task<string> ResolveNodeAsync(CancellationToken ct)
     {
-        var candidates = FindAllTools("node.exe", 4);
+        var found = FindAllTools("node.exe", 4);
+        // 与 npm/pnpm/corepack 同一道护栏（见 CommandGuard.IsSafeToolPath）：node 的路径会被拼进
+        // `cmd /d /s /c ""<node>" …"`，含 % 或引号的路径不该继续走。现实中 File.Exists
+        // 不展开 %VAR%，这类候选几乎不可能出现在 FindAllTools 的结果里——这是契约
+        // 护栏而非现实风险，但护栏必须落在"选谁"这一刻，而不是指望调用点记得。
+        // 跳过要留痕：否则"装了 Node 却报未找到"没有任何线索。
+        var candidates = new List<string>(found.Count);
+        foreach (var candidate in found)
+        {
+            if (CommandGuard.IsSafeToolPath(candidate)) candidates.Add(candidate);
+            else AppendStartupLog("node.exe 候选路径含 cmd 会展开的字符（% 或引号），已跳过：" + candidate);
+        }
         if (candidates.Count == 0)
+        {
+            if (found.Count > 0)
+                throw new InvalidOperationException(
+                    $"找到 {found.Count} 个 node.exe，但路径都不能安全地拼进命令行（含 % 或引号）：\n" +
+                    string.Join("\n", found) + "\n" +
+                    "这类路径通常来自 PATH 里未展开的 %变量%。请把 %变量% 改成实际路径后重试，" +
+                    $"或把正确的目录写进：{Path.Combine(LocalAppDir, "node-dir.txt")}");
             throw new FileNotFoundException(
                 "未找到 node.exe。请先安装 Node.js LTS（18 或更高，https://nodejs.org），" +
                 "安装完成后重新打开本程序。\n" +
                 $"若 Node 装在非标准目录，可把该目录写进：{Path.Combine(LocalAppDir, "node-dir.txt")}",
                 "node.exe");
+        }
 
         string? tooOldPath = null;
         string? tooOldVersion = null;
@@ -1020,48 +764,22 @@ internal sealed partial class HarnessForm : Form
     private static string ResolveNpmPath(string? nodePath = null)
     {
         var found = (nodePath is not null ? FindToolBeside(nodePath, "npm.cmd") : null) ?? FindTool("npm.cmd");
-        if (found is not null) return GuardToolPath(found, "npm.cmd");
+        if (found is not null) return CommandGuard.GuardToolPath(found, "npm.cmd");
         throw new FileNotFoundException(
             "未找到 npm.cmd。npm 随 Node.js 一起安装，请重装 Node.js LTS（18 或更高）。", "npm.cmd");
     }
 
     private static string? ResolvePnpmPath(string? nodePath = null) =>
-        GuardToolPath(
+        CommandGuard.GuardToolPath(
             (nodePath is not null ? FindToolBeside(nodePath, "pnpm.cmd") : null) ?? FindTool("pnpm.cmd"),
             "pnpm.cmd");
 
     /// <summary>corepack 是随 Node 附带的包管理 shim（Node ≥ 16.9），没有真实 pnpm 时退到它。</summary>
     private static string? ResolveCorepackPath(string? nodePath = null) =>
-        GuardToolPath(
+        CommandGuard.GuardToolPath(
             (nodePath is not null ? FindToolBeside(nodePath, "corepack.cmd") : null) ?? FindTool("corepack.cmd"),
             "corepack.cmd");
 
-    /// <summary>
-    /// 工具路径的纵深防御护栏（纯函数、可单测）：能被拼进 cmd 命令行的路径必须
-    /// 既不含 <c>%</c> 也不含引号。
-    ///
-    /// <c>%</c> 是真正危险的那个：cmd 会对命令行做 <c>%VAR%</c> 展开，而
-    /// PATH 里出现**未展开**的 <c>%FOO%</c>（配置写错的机器上不罕见）在
-    /// <c>File.Exists</c> 判定下会直接被跳过，可一旦它出现在被引用起来的位置上，
-    /// 展开后的 cmd 就去执行了一个与我们意图完全不同的路径——表现为"node 明明装了
-    /// 却找不到"，且报错完全指不到真正的原因。
-    ///
-    /// 与 <see cref="IsSafeNpmValue"/> 同一条纪律（那是给用户可改的 registry 用的），
-    /// 区别只在于这里**允许**空白：<c>C:\Program Files\nodejs\npm.cmd</c> 是常态，
-    /// 调用点本来就把它整段加了引号。
-    /// </summary>
-    internal static bool IsSafeToolPath(string? path) =>
-        !string.IsNullOrEmpty(path) &&
-        path!.IndexOf('%') < 0 &&
-        path.IndexOf('"') < 0;
-
-    /// <summary>不满足 <see cref="IsSafeToolPath"/> 就给出能照做的报错，而不是让 cmd 去猜。</summary>
-    private static string GuardToolPath(string? path, string toolName)
-    {
-        if (path is null) return null!;
-        if (IsSafeToolPath(path)) return path;
-        throw new InvalidOperationException(
-            $"{toolName} 的路径里含有 cmd 会展开的字符（% 或引号），已中止：\n{path}\n" +
-            "这类路径通常来自 PATH 里未展开的 %变量%。请把 %变量% 改成实际路径后重试。");
-    }
+    // IsSafeToolPath / GuardToolPath 已迁到 CommandGuard（npm/pnpm/corepack 与 node
+    // 候选路径在内，所有要进 cmd 命令行的路径都过同一道闸，见该类头部说明）。
 }

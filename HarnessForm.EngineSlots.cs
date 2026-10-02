@@ -573,7 +573,7 @@ internal sealed partial class HarnessForm : Form
         finally { migrateGate.Release(); }
 
         // 闸门设在拼接点（GuardRegistryForCommandLine 的理由见那里）。
-        registry = GuardRegistryForCommandLine(registry);
+        registry = CommandGuard.GuardRegistryForCommandLine(registry);
         var psi = new ProcessStartInfo
         {
             FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
@@ -785,59 +785,66 @@ internal sealed partial class HarnessForm : Form
     private static string? effectiveRegistry;
     private static readonly SemaphoreSlim registryGate = new(1, 1);
 
+    // 失败负缓存（UTC ticks 走 Interlocked，与 processRecordCacheAtTicks 同一纪律）：
+    // npm 缺失、配置读不出、或配置值不安全时，60 秒内不再重跑 `npm config get registry`。
+    // 一次升级路径上本方法最多被调 3 次（EnsureEngineAsync / GetLatestEngineVersionAsync /
+    // InstallEngineAsync），不缓存失败时同样的失败要付 3 次（每次 5 秒超时预算）；
+    // 成功结果走 effectiveRegistry 永久缓存，互不干扰。
+    private static long registryFailureAtTicks;
+    private static readonly TimeSpan RegistryFailureCacheTtl = TimeSpan.FromSeconds(60);
+
     private static async Task<string> ResolveNpmRegistryAsync(string node, CancellationToken ct)
     {
         var cached = Volatile.Read(ref effectiveRegistry);
         if (cached is not null) return cached;
+        if (DateTime.UtcNow.Ticks - Interlocked.Read(ref registryFailureAtTicks) < RegistryFailureCacheTtl.Ticks)
+            return DefaultRegistry;
 
         await registryGate.WaitAsync();
         try
         {
             cached = Volatile.Read(ref effectiveRegistry);
             if (cached is not null) return cached;
-            // ResolveNpmPath 找不到 npm 时抛 FileNotFoundException：原实现靠 catch 吞掉
-            // 并回落到官方源，这里保持同样的行为。
-            var npm = ResolveNpmPath(node);
-            var text = await RunCmdAsync(
-                $"\"{npm}\" config get registry", TimeSpan.FromSeconds(5), ct);
-            if (text is not null)
+            if (DateTime.UtcNow.Ticks - Interlocked.Read(ref registryFailureAtTicks) < RegistryFailureCacheTtl.Ticks)
+                return DefaultRegistry;
+
+            string? value = null;
+            try
             {
-                var value = text.Trim().Split('\n').Last().Trim();
-                if (IsSafeNpmValue(value)) Volatile.Write(ref effectiveRegistry, value);
+                // ResolveNpmPath 找不到 npm 时抛 FileNotFoundException：行为保持
+                // "回落官方源"，但**必须留痕**——"配了镜像为什么没生效"这类问题
+                // 的唯一线索就在这条日志里，静默降级正是本项目要消灭的形状。
+                var npm = ResolveNpmPath(node);
+                var text = await RunCmdAsync(
+                    $"\"{npm}\" config get registry", TimeSpan.FromSeconds(5), ct);
+                if (text is not null)
+                {
+                    var candidate = text.Trim().Split('\n').Last().Trim();
+                    if (CommandGuard.IsSafeNpmValue(candidate)) value = candidate;
+                    else AppendStartupLog(
+                        "[npm-registry] 用户配置的 registry 不能安全地拼进命令行（含引号/空白/shell 元字符），" +
+                        "本次回落官方源：" + candidate);
+                }
             }
+            catch (Exception ex)
+            {
+                Swallow.Quiet(ex, "npm-registry-resolve");
+            }
+
+            if (value is not null)
+            {
+                Volatile.Write(ref effectiveRegistry, value);
+                return value;
+            }
+            // 失败记入负缓存：60 秒内的后续调用直接回落官方源，不再重跑子进程。
+            Interlocked.Exchange(ref registryFailureAtTicks, DateTime.UtcNow.Ticks);
+            return DefaultRegistry;
         }
-        catch { }
         finally { registryGate.Release(); }
-        return Volatile.Read(ref effectiveRegistry) ?? DefaultRegistry;
     }
 
-    /// <summary>
-    /// 需要拼进 cmd 命令行的值必须校验：含引号/空白/换行都可能把命令行拆坏。
-    /// registry 是用户可改的 npm 配置，不能无条件信任。
-    /// internal（而非 private）是为了被单测直接钉住：它的输出被原样拼进
-    /// <c>cmd /d /s /c "… --registry &lt;这里&gt;"</c>（InstallEngineAsync /
-    /// GetLatestEngineVersionAsync），是"用户可改的 npm 配置拆坏/注入命令行"的
-    /// 唯一闸门；README 明文承诺了"含引号或空白的值不采用"。下面每一条排除项
-    /// 被"顺手整理"掉一个，编译零反馈——由测试兜住。
-    /// </summary>
-    internal static bool IsSafeNpmValue(string value) =>
-        value.Length is > 0 and < 512 &&
-        !value.Any(ch => char.IsWhiteSpace(ch) || ch is '"' or '\'' or '&' or '|' or '<' or '>' or '^' or '%');
-
-    /// <summary>
-    /// 拼进 cmd 命令行**之前**再核一次 registry。闸门必须在拼接点：
-    /// 那个字符串要被塞进 <c>cmd /d /s /c "npm … --registry &lt;这里&gt;"</c>，
-    /// 一个引号或 <c>&amp;</c> 就足以把命令行拆坏、甚至注入出第二条命令。
-    /// 靠"三个调用方都记得先校验"是纪律不是结构——将来多一个调用方就静默失守。
-    /// 抛而不返回 false：registry 来自用户的 ~/.npmrc，不安全就不该继续装/查。
-    /// </summary>
-    internal static string GuardRegistryForCommandLine(string registry)
-    {
-        if (!string.IsNullOrEmpty(registry) && IsSafeNpmValue(registry)) return registry;
-        throw new InvalidOperationException(
-            $"npm registry 的值不能安全地拼进命令行，已中止：{registry}\n" +
-            "它含引号、空白或 shell 元字符。请修正 ~/.npmrc 里的 registry 配置。");
-    }
+    // IsSafeNpmValue / GuardRegistryForCommandLine 已迁到 CommandGuard：
+    // 它们是"外部输入进 cmd 命令行"的通用闸门，不该只属于引擎安装这一域。
 
     /// <summary>
     /// 引擎版本锁。写了这个文件，启动器就只装/只用该版本，永不自动跟进新版——
